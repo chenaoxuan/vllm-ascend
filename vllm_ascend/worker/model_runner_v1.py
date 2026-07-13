@@ -2035,6 +2035,13 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         if not self.num_spec_tokens:
             return
+        # Request-level dynamic DSpark returns ragged per-request draft tokens as
+        # a list[list[int]]: there is no fixed-shape tensor to copy to the CPU
+        # buffer (_get_draft_token_ids_cpu reads the list directly). Record the
+        # request ids so take_draft_token_ids can still emit the drafts.
+        if isinstance(self._draft_token_ids, list):
+            self._draft_token_req_ids = self.input_batch.req_ids.copy()
+            return
         if self.use_async_scheduling and not (
             scheduler_output.has_structured_output_requests
             or self.input_batch.sampling_metadata.output_token_ids

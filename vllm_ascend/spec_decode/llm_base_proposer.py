@@ -42,6 +42,7 @@ from vllm.v1.spec_decode.utils import (
 )
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -55,6 +56,10 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+from vllm_ascend.spec_decode.dspark_confidence import (
+    DSparkScheduleConfig,
+    schedule_verify_lens_topk,
+)
 from vllm_ascend.spec_decode.utils import SlidingWindowAdapter
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled, vllm_version_is
 
@@ -1132,6 +1137,49 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             logits = self.model.compute_logits(hidden_states)
             return greedy_sample(logits)
 
+    def _dspark_dynamic_enabled(self) -> bool:
+        # Request-level dynamic speculation requires eager execution: a full ACL
+        # graph captures a fixed-shape output and cannot return ragged drafts.
+        if not envs_ascend.VLLM_ASCEND_DSPARK_DYNAMIC_SPEC:
+            return False
+        if isinstance(self._runnable, ACLGraphWrapper):
+            return False
+        return getattr(self.model, "compute_confidence", None) is not None
+
+    def _maybe_compute_dspark_confidence(self, last_hidden_states, markov_embed_list, num_blk):
+        # Calibrated per-position acceptance probability [num_blk, gamma], or None
+        # when the confidence head is absent.
+        compute_confidence = getattr(self.model, "compute_confidence", None)
+        if compute_confidence is None or not markov_embed_list:
+            return None
+        gamma = self.num_speculative_tokens
+        hidden_size = last_hidden_states.shape[-1]
+        draft_hidden = last_hidden_states[: num_blk * gamma].view(num_blk, gamma, hidden_size)
+        markov_embed_stack = torch.stack(markov_embed_list, dim=1)
+        return compute_confidence(draft_hidden, markov_embed_stack)
+
+    def _dspark_finalize_draft(self, draft_token_ids, confidence):
+        # draft_token_ids: [num_blk, gamma + 1]; the gamma draft tokens are [:, 1:].
+        draft_tokens = draft_token_ids[:, 1:]
+        if confidence is None or not self._dspark_dynamic_enabled():
+            return draft_tokens
+        gamma = self.num_speculative_tokens
+        max_verify_len = int(envs_ascend.VLLM_ASCEND_DSPARK_MAX_VERIFY_LEN)
+        max_verify_len = gamma if max_verify_len <= 0 else min(max_verify_len, gamma)
+        min_verify_len = max(1, min(int(envs_ascend.VLLM_ASCEND_DSPARK_MIN_VERIFY_LEN), gamma))
+        cfg = DSparkScheduleConfig(
+            min_verify_len=min_verify_len,
+            max_verify_len=max_verify_len,
+        )
+        verify_lens = schedule_verify_lens_topk(
+            confidence=confidence,
+            budget=int(envs_ascend.VLLM_ASCEND_DSPARK_VERIFY_BUDGET),
+            cfg=cfg,
+        )
+        verify_lens_cpu = verify_lens.tolist()
+        draft_list = draft_tokens.tolist()
+        return [row[: verify_lens_cpu[i]] for i, row in enumerate(draft_list)]
+
     def _run_merged_draft(
         self,
         num_input_tokens,
@@ -1233,6 +1281,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
+        dspark_confidence = None
+
         if get_ascend_config().enable_reduce_sample:
             if self.method in ("eagle3", "dflash", "mtp"):
                 draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
@@ -1262,18 +1312,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             if self.method == "dspark":
                 # Dspark speculation requires autoregressive applications of MarkovHead and ConfidenceHead.
-                # The MarkovHead performs bias correction on logits.
-                # The ConfidenceHead predicts the expected acceptance length of tokens(Not yet achieved).
+                # The MarkovHead performs bias correction on logits; the ConfidenceHead
+                # predicts per-position acceptance probabilities that drive the
+                # request-level dynamic verify-length schedule.
                 raw_logits = self.model.compute_logits(last_hidden_states)
                 logits = raw_logits.view(-1, self.num_speculative_tokens, raw_logits.shape[-1])
                 num_blk = logits.shape[0]
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
+                collect_markov = (
+                    getattr(getattr(self.model, "model", None), "confidence_head", None) is not None
+                )
+                markov_embed_list = [] if collect_markov else None
                 for idx in range(self.num_speculative_tokens):
                     markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
+                    if collect_markov:
+                        markov_embed_list.append(markov_emb)
                     logits_bias = self.model.markov_bias(markov_emb)
                     logits[:, idx].add_(logits_bias)
                     draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+                dspark_confidence = self._maybe_compute_dspark_confidence(
+                    last_hidden_states, markov_embed_list, num_blk
+                )
             else:
                 logits = self.model.compute_logits(sample_hidden_states)
                 if lmhead_tp_enable():
@@ -1289,7 +1349,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
             if self.method == "dspark":
-                return draft_token_ids[:, 1:]
+                return self._dspark_finalize_draft(draft_token_ids, dspark_confidence)
             else:
                 # [batch_size, 1]
                 return draft_token_ids.view(-1, self.num_speculative_tokens)

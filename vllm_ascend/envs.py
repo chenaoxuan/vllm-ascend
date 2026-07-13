@@ -110,6 +110,35 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to build and load the DSpark confidence head. When enabled (default)
+    # and the draft checkpoint provides confidence_head.* weights, the head is
+    # loaded and used to compute per-position acceptance probabilities. It has no
+    # effect unless the DSpark draft model is in use.
+    "VLLM_ASCEND_DSPARK_ENABLE_CONFIDENCE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSPARK_ENABLE_CONFIDENCE", "1"))
+    ),
+    # Whether to enable DSpark request-level dynamic speculation. When enabled,
+    # the confidence head's survival probabilities plus VLLM_ASCEND_DSPARK_VERIFY_BUDGET
+    # decide each request's draft/verify length. Requires eager execution (no full
+    # ACL graph) and the confidence head; automatically no-ops otherwise.
+    "VLLM_ASCEND_DSPARK_DYNAMIC_SPEC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSPARK_DYNAMIC_SPEC", "0"))
+    ),
+    # DSpark dynamic-speculation verify budget: the total number of extra verify
+    # slots (above the per-request minimum) distributed across the batch by the
+    # top-k schedule. Replaces sglang's SPS-cost-table budget optimization.
+    "VLLM_ASCEND_DSPARK_VERIFY_BUDGET": lambda: int(
+        os.getenv("VLLM_ASCEND_DSPARK_VERIFY_BUDGET", "0")
+    ),
+    # DSpark dynamic-speculation minimum per-request draft/verify length.
+    "VLLM_ASCEND_DSPARK_MIN_VERIFY_LEN": lambda: int(
+        os.getenv("VLLM_ASCEND_DSPARK_MIN_VERIFY_LEN", "1")
+    ),
+    # DSpark dynamic-speculation maximum per-request draft/verify length.
+    # "0" resolves to the number of speculative tokens (gamma).
+    "VLLM_ASCEND_DSPARK_MAX_VERIFY_LEN": lambda: int(
+        os.getenv("VLLM_ASCEND_DSPARK_MAX_VERIFY_LEN", "0")
+    ),
 }
 
 # end-env-vars-definition

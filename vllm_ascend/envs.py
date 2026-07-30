@@ -100,6 +100,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Enable dynamic draft length for model-runner v2 speculative decoding.
+    # When on, each request keeps a random prefix of draft tokens (length in
+    # [1, num_speculative_tokens]) so only those tokens are scheduled into the
+    # target forward. Use with cudagraph_mode=FULL; FULL_DECODE_ONLY is not
+    # adapted. Default off.
+    "VLLM_ASCEND_DYNAMIC_DRAFT_TOKENS": lambda: bool(int(os.getenv("VLLM_ASCEND_DYNAMIC_DRAFT_TOKENS", "0"))),
 }
 
 # end-env-vars-definition

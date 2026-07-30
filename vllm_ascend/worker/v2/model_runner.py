@@ -51,6 +51,7 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.pcp_manager import maybe_build_ascend_pcp_manager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode.draft_tokens_handler import AscendDraftTokensHandler
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
@@ -69,6 +70,10 @@ class NPUModelRunner(GPUModelRunner):
 
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
+
+        # Replace upstream handler so dynamic draft lengths can be published to
+        # the scheduler (see AscendDraftTokensHandler / VLLM_ASCEND_DYNAMIC_DRAFT_TOKENS).
+        self.draft_tokens_handler = AscendDraftTokensHandler(self.device)
 
         self.use_aclgraph = (
             self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE

@@ -576,6 +576,28 @@
 #       the code path that actually needs ray), so importing the IPC engine no
 #       longer requires the optional ray dependency.
 #
+# ** 22. File: platform/patch_dynamic_draft_tokens.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.async_scheduler.AsyncScheduler._update_after_schedule`
+#   2. `vllm.v1.engine.core.EngineCore.post_step`
+#    Why:
+#       Model-runner v2 dynamic draft length needs the scheduler to see
+#       per-request truncated ``spec_token_ids`` so unused drafts are not
+#       scheduled into the target forward. Upstream async scheduling installs
+#       fixed ``[-1] * N`` placeholders and skips ``update_draft_token_ids``
+#       in ``post_step``, which forces every request to verify ``N`` positions.
+#    How：
+#       When ``VLLM_ASCEND_DYNAMIC_DRAFT_TOKENS=1``, skip fixed async
+#       placeholders and always publish truncated drafts via
+#       ``update_draft_token_ids`` after propose (``AscendDraftTokensHandler``
+#       chooses a random prefix length per request). Intended for
+#       ``cudagraph_mode=FULL`` only; ``FULL_DECODE_ONLY`` is not adapted.
+#    Related PR (if no, explain why):
+#       No, Ascend experiment for variable-length draft scheduling.
+#    Future Plan:
+#       Replace the random length policy with a real acceptance predictor and
+#       upstream a first-class dynamic-draft API if/when vLLM supports it.
+#
 # * Worker Patch:
 # ===============
 # Entries are listed in alphabetical order by file name.

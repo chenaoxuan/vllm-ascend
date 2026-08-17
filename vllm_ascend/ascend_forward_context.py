@@ -72,6 +72,10 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    dflash_verify_rows=(),
+    dflash_mode="baseline",
+    dflash_prefix_k=None,
+    dflash_escape_rank=1,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -91,6 +95,16 @@ def set_ascend_forward_context(
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids
+
+        forward_context.dflash_verify_rows = dflash_verify_rows
+        forward_context.dflash_mode = dflash_mode
+        forward_context.dflash_prefix_k = dflash_prefix_k
+        forward_context.dflash_escape_rank = dflash_escape_rank
+        forward_context.dflash_all_rows = None
+        forward_context.dflash_req_boundaries = None
+        forward_context.dflash_arange = None
+        forward_context.dflash_exposed_global_rows = None
+        forward_context.dflash_union_mask = None
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 

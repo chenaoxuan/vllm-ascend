@@ -16,7 +16,7 @@
 # This file is a part of the vllm-ascend project.
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
-
+from vllm_ascend import envs
 import gc
 import logging
 import math
@@ -2291,6 +2291,40 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        dflash_verify_rows = []
+        if spec_decode_metadata is not None:
+            cumulative_tokens = np.cumsum(num_scheduled_tokens_np, dtype=np.int32)
+            for req_id, draft_token_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                draft_count = len(draft_token_ids)
+                is_decode = (
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                    >= self.input_batch.num_prompt_tokens[req_idx]
+                )
+                if draft_count and is_decode:
+                    segment_start = int(cumulative_tokens[req_idx]) - draft_count - 1
+                    segment_end = segment_start + draft_count
+                    if segment_start < 0 or segment_end >= scheduler_output.total_num_scheduled_tokens:
+                        raise RuntimeError("invalid DFlash verification segment")
+                    rows = torch.arange(
+                        segment_start + 1,
+                        segment_end + 1,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    dflash_verify_rows.append((req_id, rows))
+
+        dflash_mode = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_MODE.strip().lower() or "baseline"
+        dflash_prefix_text = envs.VLLM_ASCEND_DFLASH_MOE_PREFIX_K.strip()
+        dflash_prefix_k = int(dflash_prefix_text) if dflash_prefix_text else None
+        dflash_escape_rank = envs.VLLM_ASCEND_DFLASH_MOE_ESCAPE_RANK
+        if dflash_mode not in {"baseline", "union"}:
+            raise ValueError(f"unsupported DFlash prefix mode: {dflash_mode!r}")
+        if dflash_mode == "union":
+            if dflash_prefix_k is None or dflash_prefix_k < 0:
+                raise ValueError("DFlash prefix k must be non-negative")
+            if dflash_escape_rank < 1:
+                raise ValueError("DFlash escape rank must be positive")
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
@@ -2307,6 +2341,10 @@ class NPUModelRunner(GPUModelRunner):
                 has_sinks=self._has_sinks,
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
+                dflash_verify_rows=tuple(dflash_verify_rows),
+                dflash_mode=dflash_mode,
+                dflash_prefix_k=dflash_prefix_k,
+                dflash_escape_rank=dflash_escape_rank,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,

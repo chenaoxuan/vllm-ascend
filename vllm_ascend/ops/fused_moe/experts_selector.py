@@ -27,6 +27,122 @@ from vllm_ascend.distributed.utils import split_tensor_along_first_dim
 from vllm_ascend.utils import get_weight_prefetch_method
 
 
+def _ensure_dflash_layout(context, device: torch.device) -> bool:
+    """Build once per forward: all_rows, req_boundaries, arange, exposed rows.
+
+    Returns False when there is no suffix draft token to prune.
+    """
+    if getattr(context, "dflash_all_rows", None) is not None:
+        return context.dflash_exposed_global_rows.numel() > 0
+
+    all_rows_list = []
+    req_boundaries = [0]
+    for _req_id, rows in context.dflash_verify_rows:
+        if rows.numel() == 0:
+            continue
+        all_rows_list.append(rows)
+        req_boundaries.append(req_boundaries[-1] + rows.numel())
+
+    if not all_rows_list:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        context.dflash_all_rows = empty
+        context.dflash_req_boundaries = [0]
+        context.dflash_arange = empty
+        context.dflash_exposed_global_rows = empty
+        return False
+
+    all_rows = torch.cat(all_rows_list)
+    arange = torch.arange(all_rows.numel(), dtype=torch.long, device=device)
+    prefix_k = context.dflash_prefix_k
+    exposed_local = []
+    for i in range(len(req_boundaries) - 1):
+        start = req_boundaries[i]
+        end = req_boundaries[i + 1]
+        protected = min(prefix_k, end - start)
+        if protected < end - start:
+            exposed_local.append(arange[start + protected : end])
+
+    context.dflash_all_rows = all_rows
+    context.dflash_req_boundaries = req_boundaries
+    context.dflash_arange = arange
+    if exposed_local:
+        context.dflash_exposed_global_rows = all_rows[torch.cat(exposed_local)]
+    else:
+        context.dflash_exposed_global_rows = torch.empty(0, dtype=torch.long, device=device)
+    return context.dflash_exposed_global_rows.numel() > 0
+
+
+def _get_dflash_union_mask(context, num_experts: int, device: torch.device) -> torch.Tensor:
+    mask = getattr(context, "dflash_union_mask", None)
+    if mask is None or mask.numel() != num_experts or mask.device != device:
+        mask = torch.zeros(num_experts, dtype=torch.bool, device=device)
+        context.dflash_union_mask = mask
+    else:
+        mask.zero_()
+    return mask
+
+
+def _apply_dflash_pruning(
+    router_logits: torch.Tensor,
+    top_k: int,
+    scoring_func: str,
+    use_grouped_topk: bool,
+    custom_routing_function: Callable | None,
+) -> torch.Tensor:
+    context = get_forward_context()
+    mode = getattr(context, "dflash_mode", "baseline")
+    verify_rows = getattr(context, "dflash_verify_rows", ())
+    prefix_k = getattr(context, "dflash_prefix_k", None)
+    escape_rank = getattr(context, "dflash_escape_rank", 1)
+
+    if mode == "baseline" or not verify_rows:
+        return router_logits
+    if mode != "union":
+        raise ValueError(f"unsupported DFlash prefix mode: {mode!r}")
+    if prefix_k is None or prefix_k < 0:
+        raise ValueError("DFlash prefix k must be non-negative")
+    if escape_rank < 1 or escape_rank > top_k:
+        raise ValueError("DFlash escape rank must be in [1, top_k]")
+    if scoring_func != "softmax" or use_grouped_topk or custom_routing_function is not None:
+        return router_logits
+    if router_logits.ndim != 2 or not router_logits.dtype.is_floating_point:
+        return router_logits
+
+    if not _ensure_dflash_layout(context, router_logits.device):
+        return router_logits
+
+    _, num_experts = router_logits.shape
+    selected_k = min(top_k, num_experts)
+    all_rows = context.dflash_all_rows
+    req_boundaries = context.dflash_req_boundaries
+    exposed_global_rows = context.dflash_exposed_global_rows
+    all_topk_ids = torch.topk(router_logits[all_rows], selected_k, dim=-1).indices
+
+    allowed_expert_ids = []
+    for i in range(len(req_boundaries) - 1):
+        start = req_boundaries[i]
+        end = req_boundaries[i + 1]
+        num_rows_in_req = end - start
+        req_ids = all_topk_ids[start:end]
+        protected = min(prefix_k, num_rows_in_req)
+
+        if protected > 0:
+            allowed_expert_ids.append(req_ids[:protected].reshape(-1))
+        if protected < num_rows_in_req:
+            allowed_expert_ids.append(req_ids[protected:, :escape_rank].reshape(-1))
+
+    union_mask = _get_dflash_union_mask(context, num_experts, router_logits.device)
+    union_mask[torch.cat(allowed_expert_ids)] = True
+
+    exposed_logits = router_logits[exposed_global_rows]
+    allowed = union_mask.unsqueeze(0).expand(exposed_logits.shape[0], -1)
+    router_logits[exposed_global_rows] = torch.where(
+        allowed, exposed_logits, torch.finfo(router_logits.dtype).min
+    )
+
+    return router_logits
+
+
 def select_experts(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -68,10 +184,14 @@ def select_experts(
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
-    # prefetch w1_w3_proj.weight preprocess
-    weight_prefetch_method = get_weight_prefetch_method()
-    if weight_prefetch_method:
-        weight_prefetch_method.maybe_prefetch_moe_weight_preprocess(hidden_states, "gate_up")
+    router_logits = _apply_dflash_pruning(
+        router_logits=router_logits,
+        top_k=top_k,
+        scoring_func=scoring_func,
+        use_grouped_topk=use_grouped_topk,
+        custom_routing_function=custom_routing_function,
+    )
+
     is_support_npu_moe_gating_top_k = check_npu_moe_gating_top_k(
         hidden_states=hidden_states,
         top_k=top_k,

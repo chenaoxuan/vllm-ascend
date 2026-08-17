@@ -47,6 +47,7 @@ def _ensure_dflash_layout(context, device: torch.device) -> bool:
         empty = torch.empty(0, dtype=torch.long, device=device)
         context.dflash_all_rows = empty
         context.dflash_req_boundaries = [0]
+        context.dflash_req_boundaries_gpu = torch.zeros(1, dtype=torch.int32, device=device)
         context.dflash_arange = empty
         context.dflash_exposed_global_rows = empty
         return False
@@ -64,6 +65,7 @@ def _ensure_dflash_layout(context, device: torch.device) -> bool:
 
     context.dflash_all_rows = all_rows
     context.dflash_req_boundaries = req_boundaries
+    context.dflash_req_boundaries_gpu = torch.tensor(req_boundaries, dtype=torch.int32, device=device)
     context.dflash_arange = arange
     if exposed_local:
         context.dflash_exposed_global_rows = all_rows[torch.cat(exposed_local)]
@@ -117,7 +119,30 @@ def _apply_dflash_pruning(
     req_boundaries = context.dflash_req_boundaries
     exposed_global_rows = context.dflash_exposed_global_rows
     all_topk_ids = torch.topk(router_logits[all_rows], selected_k, dim=-1).indices
+    apply_dflash_union_mask(
+        router_logits,
+        all_topk_ids,
+        req_boundaries,
+        exposed_global_rows,
+        context,
+        prefix_k,
+        escape_rank,
+        num_experts,
+    )
 
+    return router_logits
+
+
+def _apply_dflash_union_mask_torch(
+    router_logits: torch.Tensor,
+    all_topk_ids: torch.Tensor,
+    req_boundaries: list[int],
+    exposed_global_rows: torch.Tensor,
+    union_mask: torch.Tensor,
+    prefix_k: int,
+    escape_rank: int,
+) -> None:
+    """Native PyTorch stage-2: build union_mask and write -inf on suffix rows."""
     allowed_expert_ids = []
     for i in range(len(req_boundaries) - 1):
         start = req_boundaries[i]
@@ -131,16 +156,59 @@ def _apply_dflash_pruning(
         if protected < num_rows_in_req:
             allowed_expert_ids.append(req_ids[protected:, :escape_rank].reshape(-1))
 
-    union_mask = _get_dflash_union_mask(context, num_experts, router_logits.device)
     union_mask[torch.cat(allowed_expert_ids)] = True
-
     exposed_logits = router_logits[exposed_global_rows]
     allowed = union_mask.unsqueeze(0).expand(exposed_logits.shape[0], -1)
     router_logits[exposed_global_rows] = torch.where(
         allowed, exposed_logits, torch.finfo(router_logits.dtype).min
     )
 
-    return router_logits
+
+def apply_dflash_union_mask(
+    router_logits: torch.Tensor,
+    all_topk_ids: torch.Tensor,
+    req_boundaries: list[int],
+    exposed_global_rows: torch.Tensor,
+    context,
+    prefix_k: int,
+    escape_rank: int,
+    num_experts: int,
+) -> None:
+    """Stage-2 interface. Prefers the fused Triton kernels; native torch is kept."""
+    union_mask = _get_dflash_union_mask(context, num_experts, router_logits.device)
+    from vllm.triton_utils import HAS_TRITON
+
+    if HAS_TRITON:
+        from vllm_ascend.ops.triton.dflash_moe_prune import apply_dflash_union_mask_triton
+
+        bounds = getattr(context, "dflash_req_boundaries_gpu", None)
+        if bounds is None:
+            bounds = torch.tensor(req_boundaries, dtype=torch.int32, device=router_logits.device)
+            context.dflash_req_boundaries_gpu = bounds
+        max_rows = 0
+        for i in range(len(req_boundaries) - 1):
+            max_rows = max(max_rows, req_boundaries[i + 1] - req_boundaries[i])
+        apply_dflash_union_mask_triton(
+            router_logits,
+            all_topk_ids,
+            bounds,
+            exposed_global_rows,
+            union_mask,
+            prefix_k,
+            escape_rank,
+            max_rows,
+        )
+        return
+
+    _apply_dflash_union_mask_torch(
+        router_logits,
+        all_topk_ids,
+        req_boundaries,
+        exposed_global_rows,
+        union_mask,
+        prefix_k,
+        escape_rank,
+    )
 
 
 def select_experts(

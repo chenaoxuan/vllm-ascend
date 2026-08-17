@@ -102,6 +102,7 @@ def set_ascend_forward_context(
         forward_context.dflash_escape_rank = dflash_escape_rank
         forward_context.dflash_all_rows = None
         forward_context.dflash_req_boundaries = None
+        forward_context.dflash_req_boundaries_gpu = None
         forward_context.dflash_arange = None
         forward_context.dflash_exposed_global_rows = None
         forward_context.dflash_union_mask = None

@@ -188,6 +188,8 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
+        self.assertFalse(ascend_config.tree_spec_config.enabled)
+        self.assertIsNone(ascend_config.tree_spec_config.max_nodes)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -249,6 +251,18 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertTrue(ascend_config.xlite_graph_config.full_mode)
         self.assertEqual(ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size, 0)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "tree_spec_config": {"enabled": True, "max_nodes": 8},
+            "refresh": True,
+        }
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertTrue(ascend_config.tree_spec_config.enabled)
+        self.assertEqual(ascend_config.tree_spec_config.max_nodes, 8)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

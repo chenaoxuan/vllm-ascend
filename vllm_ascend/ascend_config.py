@@ -340,6 +340,10 @@ class AscendConfig:
                 "method": null,
                 "method_params": {}
             },
+            "tree_spec_config": {
+                "enabled": false,
+                "max_nodes": null
+            },
             "sparse_kv_offload_config": {
                 "enabled": false,
                 "topk_buffer_size": 4096,
@@ -414,6 +418,7 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    tree_spec_config: TreeSpecConfig = dataclasses.field(default_factory=lambda: TreeSpecConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
 
@@ -848,6 +853,35 @@ class AscendConfig:
         ):
             return "fullmesh_v1"
         return self.mc2_comm_alg
+
+
+@config
+class TreeSpecConfig:
+    """DFlash draft-tree construction from ``additional_config.tree_spec_config``.
+
+    When ``enabled`` is true, the v2 DFlash speculator expands shared depth
+    logits into a draft tree instead of a single linear draft chain. Target
+    tree verify is a follow-up; this flag only selects the tree speculator.
+
+    ``max_nodes`` is the per-request node budget excluding the already-accepted
+    root. ``None`` uses ``num_speculative_tokens``.
+
+    Usage::
+
+        llm = LLM(
+            model,
+            additional_config={"tree_spec_config": {"enabled": True, "max_nodes": 8}},
+        )
+    """
+
+    enabled: bool = False
+    max_nodes: int | None = None
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.max_nodes is not None and self.max_nodes < 0:
+            raise ValueError(f"tree_spec_config.max_nodes must be >= 0, got {self.max_nodes}")
+        return self
 
 
 @config

@@ -25,7 +25,9 @@ def init_speculator(
     device: torch.device,
 ):
     """Override GPU init_speculator for Ascend NPUs.
-    Use AscendEagleSpeculator when eagle is used.
+
+    DFlash uses ``AscendTreeSpeculator`` when
+    ``additional_config.tree_spec_config.enabled`` is true.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -36,6 +38,12 @@ def init_speculator(
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
+        if _dflash_tree_spec_enabled(vllm_config):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
         from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
             AscendDFlashSpeculator,
         )
@@ -56,3 +64,14 @@ def init_speculator(
 
         return AscendEagleSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
+
+
+def _dflash_tree_spec_enabled(vllm_config: VllmConfig) -> bool:
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(get_ascend_config().tree_spec_config.enabled)
+    except RuntimeError:
+        additional_config = vllm_config.additional_config or {}
+        tree_cfg = additional_config.get("tree_spec_config") or {}
+        return bool(tree_cfg.get("enabled", False))

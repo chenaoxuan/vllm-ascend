@@ -342,7 +342,8 @@ class AscendConfig:
             },
             "tree_spec_config": {
                 "enabled": false,
-                "max_nodes": null
+                "budget": null,
+                "topk": null
             },
             "sparse_kv_offload_config": {
                 "enabled": false,
@@ -863,24 +864,38 @@ class TreeSpecConfig:
     logits into a draft tree instead of a single linear draft chain. Target
     tree verify is a follow-up; this flag only selects the tree speculator.
 
-    ``max_nodes`` is the per-request node budget excluding the already-accepted
-    root. ``None`` uses ``num_speculative_tokens``.
+    ``budget`` is the per-request node budget excluding the already-accepted
+    root. ``None`` uses ``num_speculative_tokens``. When set, it must be
+    >= ``num_speculative_tokens``.
+
+    ``topk`` is the per-depth candidate count: how many logits are kept at each
+    mask position before best-first expansion. It is independent of
+    ``budget``. ``None`` keeps the full vocabulary (clamped at runtime).
 
     Usage::
 
         llm = LLM(
             model,
-            additional_config={"tree_spec_config": {"enabled": True, "max_nodes": 8}},
+            additional_config={
+                "tree_spec_config": {
+                    "enabled": True,
+                    "budget": 8,
+                    "topk": 4,
+                }
+            },
         )
     """
 
     enabled: bool = False
-    max_nodes: int | None = None
+    budget: int | None = None
+    topk: int | None = None
 
     @model_validator(mode="after")
     def _validate(self):
-        if self.max_nodes is not None and self.max_nodes < 0:
-            raise ValueError(f"tree_spec_config.max_nodes must be >= 0, got {self.max_nodes}")
+        if self.budget is not None and self.budget < 0:
+            raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
+        if self.topk is not None and self.topk < 1:
+            raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
         return self
 
 

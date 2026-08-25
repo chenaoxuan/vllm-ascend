@@ -214,7 +214,8 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.weight_nz_mode, 1)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 65536)
         self.assertFalse(ascend_config.tree_spec_config.enabled)
-        self.assertIsNone(ascend_config.tree_spec_config.max_nodes)
+        self.assertIsNone(ascend_config.tree_spec_config.budget)
+        self.assertIsNone(ascend_config.tree_spec_config.topk)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -304,12 +305,13 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "max_nodes": 8},
+            "tree_spec_config": {"enabled": True, "budget": 8},
             "refresh": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertTrue(ascend_config.tree_spec_config.enabled)
-        self.assertEqual(ascend_config.tree_spec_config.max_nodes, 8)
+        self.assertEqual(ascend_config.tree_spec_config.budget, 8)
+        self.assertIsNone(ascend_config.tree_spec_config.topk)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

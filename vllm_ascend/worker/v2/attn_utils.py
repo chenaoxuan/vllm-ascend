@@ -214,6 +214,8 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
+    tree_num_nodes: torch.Tensor | None = None,
+    tree_visibility: torch.Tensor | None = None
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -279,6 +281,8 @@ def build_attn_metadata(
             max_seq_len=max_seq_len,
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
+            tree_num_nodes=tree_num_nodes,
+            tree_visibility=tree_visibility,
             **common_attn_metadata_extra_kwargs,
         )
 

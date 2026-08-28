@@ -61,7 +61,7 @@ from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_utils import (
@@ -69,7 +69,11 @@ from vllm_ascend.worker.v2.pp_utils import (
     resolve_spec_pp_support,
     restore_pp_after_upstream_init,
 )
-from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled, init_speculator
+from vllm_ascend.worker.v2.sp_utils import (
+    _all_gather_hidden_states_and_aux,
+    _flashcomm_enabled,
+)
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
@@ -239,6 +243,20 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_draft_tokens()
+        if dflash_tree_spec_enabled(self.vllm_config) and self.speculator is not None:
+            speculative_config = self.vllm_config.speculative_config
+            if speculative_config is not None and speculative_config.use_dflash():
+                input_batch = self.speculator.input_batch
+                tree = self.speculator.get_tree()
+                self.req_states.draft_tokens[input_batch.idx_mapping] = tree.tokens
+                self.req_states.tree_depths[input_batch.idx_mapping] = tree.depths
+                self.req_states.tree_parents[input_batch.idx_mapping] = tree.parents
+                self.req_states.tree_visibility[input_batch.idx_mapping] = tree.tree_visibility
+                if self.num_speculative_steps > 0:
+                    self.draft_tokens_handler.set_draft_tokens(
+                        input_batch,
+                        self.req_states.draft_tokens[input_batch.idx_mapping],
+                    )
         return output
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -430,14 +448,24 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
-        )
+        if dflash_tree_spec_enabled(self.vllm_config):
+            prepare_tree_spec_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.tree_depths,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+            )
+        else:
+            # Prepare positions and seq_lens.
+            prepare_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+            )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
         # Pad for full CUDA graph mode.

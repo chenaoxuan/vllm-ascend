@@ -38,7 +38,7 @@ def init_speculator(
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
-        if _dflash_tree_spec_enabled(vllm_config):
+        if dflash_tree_spec_enabled(vllm_config):
             from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
                 AscendTreeSpeculator,
             )
@@ -66,12 +66,12 @@ def init_speculator(
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
 
 
-def _dflash_tree_spec_enabled(vllm_config: VllmConfig) -> bool:
+def dflash_tree_spec_enabled(vllm_config: VllmConfig=None) -> bool:
     try:
         from vllm_ascend.ascend_config import get_ascend_config
 
         return bool(get_ascend_config().tree_spec_config.enabled)
     except RuntimeError:
-        additional_config = vllm_config.additional_config or {}
+        additional_config = getattr(vllm_config, "additional_config", {})
         tree_cfg = additional_config.get("tree_spec_config") or {}
         return bool(tree_cfg.get("enabled", False))

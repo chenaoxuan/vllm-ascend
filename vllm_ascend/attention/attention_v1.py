@@ -345,7 +345,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
+        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal,
+                                                              self.model_config,
+                                                              common_attn_metadata.tree_num_nodes,
+                                                              common_attn_metadata.tree_visibility)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)

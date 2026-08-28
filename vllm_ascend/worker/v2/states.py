@@ -19,6 +19,7 @@
 
 import torch
 from vllm.v1.worker.gpu.states import RequestState
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 
 class AscendRequestState(RequestState):
@@ -51,6 +52,49 @@ class AscendRequestState(RequestState):
             dtype=torch.int32,
             device="cpu",
         )
+
+        if dflash_tree_spec_enabled():
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            max_nodes = get_ascend_config().tree_spec_config.max_nodes
+            self.draft_tokens: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=self.draft_tokens.dtype,
+                device=device,
+            )
+
+            self.tree_depths: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=torch.int64,
+                device=device,
+            )
+
+            # include root, accepted token
+            tree_max_len = max_nodes + 1
+
+            self.tree_parents: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                tree_max_len,
+                dtype=torch.int32,
+                device=device,
+            )
+
+            self.tree_num_nodes: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=device,
+                )
+
+            self.tree_visibility: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                tree_max_len,
+                tree_max_len,
+                dtype=torch.bool,
+                device=device,
+            )
+
 
     def add_request(
         self,

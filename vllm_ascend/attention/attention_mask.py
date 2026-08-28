@@ -16,6 +16,8 @@ import torch
 
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+from vllm.triton_utils import tl, triton
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -28,6 +30,32 @@ def _generate_attn_mask(max_seq_len, dtype):
     mask_value = float("-inf") if dtype == torch.float16 else 1
     attn_mask = torch.zeros(size=(max_seq_len, max_seq_len), dtype=dtype).masked_fill_(mask_flag, mask_value)
     return attn_mask
+
+@triton.jit
+def get_tree_attention_mask_kernel(
+    tree_num_nodes_ptr,
+    tree_num_nodes_cumsum_ptr,
+    tree_visibility_ptr,
+    tree_visibility_stride_dim0,
+    tree_visibility_stride_dim1,
+    attn_mask_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_id = tl.program_id(0)
+    start = 0
+    if req_id > 0 :
+        start = tl.load(tree_num_nodes_cumsum_ptr + req_id - 1)
+    end = tl.load(tree_num_nodes_cumsum_ptr + req_id)
+    attn_mask_len = end - start
+
+    for row in tl.range(attn_mask_len):
+        for col in tl.range(0, attn_mask_len, BLOCK_SIZE):
+            block = col + tl.arange(0, BLOCK_SIZE)
+            triton_mask = block < attn_mask_len
+            tl.store(attn_mask_ptr + start + row * attn_mask_len + block,
+                     tree_visibility_ptr + req_id * tree_visibility_stride_dim0 +
+                        row * tree_visibility_stride_dim1 + block,
+                     mask=triton_mask)
 
 
 @singleton
@@ -54,7 +82,11 @@ class AttentionMaskBuilder:
             )
         return self.chunked_prefill_attn_mask
 
-    def get_attention_mask(self, causal: bool, model_config: ModelConfig):
+    def get_attention_mask(self, causal: bool,
+                           model_config: ModelConfig,
+                           tree_num_nodes: torch.Tensor | None = None,
+                           tree_visibility: torch.Tensor | None = None
+                           ):
         if not causal:
             # FIA applies any provided mask as defaultMask (sparse_mode=0),
             # which would wrongly mask out the upper triangle for
@@ -64,7 +96,29 @@ class AttentionMaskBuilder:
             # non-masking mask instead.
             return None
 
+        if dflash_tree_spec_enabled() and tree_num_nodes and tree_visibility:
+            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility)
+
         if model_config.runner_type == "pooling":
             return self.get_attn_mask(2048, torch.bool)
 
         return self.get_splitfuse_attn_mask()
+    
+    def get_tree_attention_mask(self, tree_num_nodes: torch.Tensor,
+                                tree_visibility: torch.Tensor):
+        num_reqs = tree_visibility.shape[0]
+
+        tree_num_nodes_cumsum = torch.cumsum(tree_num_nodes ** 2, dim=0)
+
+        mask_len = tree_num_nodes_cumsum[-1]
+        attn_mask = torch.zeros(mask_len, dtype=torch.bool, device=self.device)
+        get_tree_attention_mask_kernel[(num_reqs,)](
+            tree_num_nodes,
+            tree_num_nodes_cumsum,
+            tree_visibility,
+            tree_visibility.stride[0],
+            tree_visibility.stride[1],
+            attn_mask,
+            BLOCK_SIZE=1024,
+        )
+        return attn_mask

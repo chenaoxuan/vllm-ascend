@@ -64,9 +64,14 @@ if not vllm_version_is("0.27.1"):
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.sp_utils import (
+    _all_gather_hidden_states_and_aux,
+    _flashcomm_enabled,
+)
+from vllm_ascend.worker.v2.spec_decode import init_speculator, dflash_tree_spec_enabled
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
@@ -617,15 +622,24 @@ class NPUModelRunner(GPUModelRunner):
                     self.req_states.prefill_len.gpu,
                     self.req_states.num_computed_tokens.gpu,
                 )
-
-            # Prepare positions and seq_lens.
-            prepare_pos_seq_lens(
-                idx_mapping,
-                query_start_loc,
-                self.req_states.num_computed_tokens.gpu,
-                self.input_buffers.positions,
-                self.input_buffers.seq_lens,
-            )
+            if dflash_tree_spec_enabled(self.vllm_config):
+                prepare_tree_spec_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.req_states.tree_depths,
+                    self.input_buffers.positions,
+                    self.input_buffers.seq_lens,
+                )
+            else:
+                # Prepare positions and seq_lens.
+                prepare_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.input_buffers.positions,
+                    self.input_buffers.seq_lens,
+                )
             seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
             # Pad for full CUDA graph mode.
@@ -918,6 +932,28 @@ class NPUModelRunner(GPUModelRunner):
 
         return query_start_loc_np, num_reqs_padded
 
+    @torch.inference_mode()
+    @step_eplb_after()
+    def sample_tokens(
+            self, grammar_output: GrammarOutput | None
+    ) -> AsyncOutput | ModelRunnerOutput | None:
+        async_output = super().sample_tokens(grammar_output)
+
+        if dflash_tree_spec_enabled(self.vllm_config):
+            speculative_config = vllm_config.speculative_config
+            if speculative_config.use_dflash():
+                input_batch = self.speculator.input_batch
+                self.req_states.draft_tokens[input_batch.idx_mapping] = self.speculator.get_tree().tokens
+                self.req_states.tree_depths[input_batch.idx_mapping] = self.speculator.get_tree().depths
+                self.req_states.tree_parents[input_batch.idx_mapping] = self.speculator.get_tree().parents
+                self.req_states.tree_visibility[input_batch.idx_mapping] = self.speculator.get_tree().tree_visibility
+
+                if self.num_speculative_steps > 0:
+                    self.draft_tokens_handler.set_draft_tokens(
+                        input_batch,
+                        self.req_states.draft_tokens[input_batch.idx_mapping],
+                    )
+        return async_output
 
 @contextmanager
 def graph_manager_wrapper(model_runner):

@@ -102,5 +102,7 @@ class AscendModelState(DefaultModelState):
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,
+            tree_num_nodes=input_batch.tree_num_nodes,
+            tree_visibility=input_batch.tree_visibility
         )
         return self.attn_metadata

@@ -47,9 +47,8 @@ def test_batch_spine_and_sibling_trees() -> None:
         [True, True, False],
         [True, True, True],
     ]
-    assert layout.child_maps[0][0][0] == 1
-    assert layout.child_maps[0][1][1] == 2
-    assert layout.child_maps[0][2][2] == 3
+    assert layout.first_child[0, :4].tolist() == [1, 2, 3, -1]
+    assert layout.next_sibling[0, :4].tolist() == [-1, -1, -1, -1]
 
     assert layout.tokens[1].tolist() == [0, 1, 0]
     assert layout.depths[1].tolist() == [1, 1, 2]
@@ -59,8 +58,9 @@ def test_batch_spine_and_sibling_trees() -> None:
         [False, True, False],
         [True, False, True],
     ]
-    assert layout.child_maps[1][0] == {0: 1, 1: 2}
-    assert layout.child_maps[1][1][0] == 3
+    # Newest child is prepended: node 2 then sibling 1 under root.
+    assert layout.first_child[1, :4].tolist() == [2, 3, -1, -1]
+    assert layout.next_sibling[1, :4].tolist() == [-1, -1, 1, -1]
 
 
 def test_topk_is_independent_of_budget() -> None:
@@ -105,6 +105,15 @@ def test_random_trees_are_well_formed() -> None:
             else:
                 parent_arr = parent_id - 1
                 assert torch.equal(vis[child_arr, :child_arr], vis[parent_arr, :child_arr])
+        seen = set()
+        for parent_id in range(node_count + 1):
+            child = int(layout.first_child[req_idx, parent_id].item())
+            while child != -1:
+                assert child not in seen
+                seen.add(child)
+                assert int(layout.parents[req_idx, child - 1].item()) == parent_id
+                child = int(layout.next_sibling[req_idx, child].item())
+        assert seen == set(range(1, node_count + 1))
 
 
 def _make_tree_speculator(num_reqs: int = 1, steps: int = 3, budget: int = 3) -> AscendTreeSpeculator:
@@ -119,7 +128,8 @@ def _make_tree_speculator(num_reqs: int = 1, steps: int = 3, budget: int = 3) ->
     spec.tree_depths = torch.full((num_reqs, budget), 7, dtype=torch.int32)
     spec.tree_num_nodes = torch.zeros(num_reqs, dtype=torch.int32)
     spec.tree_visibility = torch.zeros((num_reqs, budget, budget), dtype=torch.bool)
-    spec.tree_child_maps = [[{}] for _ in range(num_reqs)]
+    spec.tree_first_child = torch.full((num_reqs, budget + 1), -1, dtype=torch.int32)
+    spec.tree_next_sibling = torch.full((num_reqs, budget + 1), -1, dtype=torch.int32)
     spec.sample_indices = torch.arange(num_reqs * steps, dtype=torch.int64)
     spec.model = MagicMock()
     spec.tree = None
@@ -158,6 +168,7 @@ def test_generate_draft_stores_tree_layout() -> None:
     assert layout.tokens[0, 3:].tolist() == [-1] * 5
     assert layout.parents[0, :3].tolist() == [0, 1, 2]
     assert layout.num_nodes[0].item() == 3
-    assert layout.child_maps[0] is spec.tree_child_maps[0]
+    assert layout.first_child[0, :4].tolist() == [1, 2, 3, -1]
+    assert layout.first_child.data_ptr() == spec.tree_first_child.data_ptr()
     spec.model.compute_logits.assert_called_once()
     spec._run_model.assert_called_once()

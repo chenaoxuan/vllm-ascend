@@ -19,8 +19,8 @@ def greedy_tree_reject(
     Unused slots are ``-1``.
     """
     tokens = tree.tokens
-    parents = tree.parents
-    num_nodes = tree.num_nodes
+    first_child = tree.first_child
+    next_sibling = tree.next_sibling
     device = tokens.device
     num_reqs, budget = tokens.shape
     spec_len = num_speculative_tokens
@@ -31,7 +31,6 @@ def greedy_tree_reject(
         dtype=torch.long,
         device=device,
     )
-    node_ids = torch.arange(1, budget + 1, dtype=torch.long, device=device)
     neg_one = torch.tensor(-1, dtype=torch.long, device=device)
 
     for req_idx in range(num_reqs):  # tl.program_id(0)
@@ -42,21 +41,22 @@ def greedy_tree_reject(
             sampled_token_ids[req_idx, n_out] = torch.where(
                 alive, t, sampled_token_ids[req_idx, n_out]
             )
-            child = neg_one
-            # TODO: scan all budget slots because child_maps is a host dict
-            # and cannot be indexed on device. Pack it into a sibling tensor
-            # so the inner loop only walks children of `current`.
-            for slot in range(budget):
-                hit = (
-                    alive
-                    & (child < 0)
-                    & (num_nodes[req_idx] > slot)
-                    & (parents[req_idx, slot] == current)
-                    & (tokens[req_idx, slot] == t)
+            child = first_child[req_idx, current].to(torch.long)
+            found_child = neg_one
+            for _ in range(budget):
+                valid = alive & (found_child < 0) & (child >= 0)
+                found_child = torch.where(
+                    valid & (tokens[req_idx, child - 1] == t),
+                    child,
+                    found_child,
                 )
-                child = torch.where(hit, node_ids[slot], child)
-            found = alive & (child >= 0)
-            current = torch.where(found, child, current)
+                child = torch.where(
+                    valid & (found_child < 0),
+                    next_sibling[req_idx, child].to(torch.long),
+                    child,
+                )
+            found = alive & (found_child >= 0)
+            current = torch.where(found, found_child, current)
             alive = found
         t = target_token_ids[req_idx, current]
         sampled_token_ids[req_idx, spec_len] = torch.where(

@@ -1,7 +1,5 @@
-from __future__ import annotations
-
 import heapq
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -15,7 +13,8 @@ class TreeLayout:
     A non-root node is packed at tensor slot i = node i+1(root is not a slot).
 
     Slot-indexed (non-root): tokens, depths, parents, visibility, num_nodes.
-    Node-id-indexed (includes root 0): values in parents and keys of child_maps.
+    Node-id-indexed (includes root 0): values in parents, first_child,
+    and next_sibling.
 
     Attributes:
         tokens: [R, budget] token id of non-root node i+1.
@@ -24,8 +23,8 @@ class TreeLayout:
         num_nodes: [R] number of valid non-root nodes.
         visibility: [R, budget, budget] whether non-root node i+1 can see
             non-root node j+1 (seeing root is implicit).
-        child_maps: per request, child_maps[p][token] = child, where p and
-            child are node ids.
+        first_child: [R, budget+1] first child node id of node p; -1 if none.
+        next_sibling: [R, budget+1] next sibling node id of node c; -1 if none.
     """
 
     tokens: torch.Tensor
@@ -33,7 +32,8 @@ class TreeLayout:
     parents: torch.Tensor
     num_nodes: torch.Tensor
     visibility: torch.Tensor
-    child_maps: list[list[dict[int, int]]] = field(default_factory=list)
+    first_child: torch.Tensor
+    next_sibling: torch.Tensor
 
 
 def empty_tree_layout(
@@ -48,7 +48,8 @@ def empty_tree_layout(
         parents=torch.full((num_reqs, budget), -1, dtype=torch.int32, device=device),
         num_nodes=torch.zeros((num_reqs,), dtype=torch.int32, device=device),
         visibility=torch.zeros((num_reqs, budget, budget), dtype=torch.bool, device=device),
-        child_maps=[[{}] for _ in range(num_reqs)],
+        first_child=torch.full((num_reqs, budget + 1), -1, dtype=torch.int32, device=device),
+        next_sibling=torch.full((num_reqs, budget + 1), -1, dtype=torch.int32, device=device),
     )
 
 
@@ -79,11 +80,12 @@ def build_trees(
     depths_np = np.zeros((num_reqs, budget), dtype=np.int32)
     parents_np = np.full((num_reqs, budget), -1, dtype=np.int32)
     num_nodes_np = np.zeros((num_reqs,), dtype=np.int32)
-    # tree mask among non-root nodes; seeing root is implicit
     visibility_np = np.zeros((num_reqs, budget, budget), dtype=np.bool_)
+    first_child_np = np.full((num_reqs, budget + 1), -1, dtype=np.int32)
+    next_sibling_np = np.full((num_reqs, budget + 1), -1, dtype=np.int32)
 
     for req_idx in range(num_reqs):
-        node_count, req_child_maps = _expand_one_tree(
+        node_count = _expand_one_tree(
             top_log_probs_np[req_idx],
             top_token_ids_np[req_idx],
             budget,
@@ -91,15 +93,18 @@ def build_trees(
             depths_np[req_idx],
             parents_np[req_idx],
             visibility_np[req_idx],
+            first_child_np[req_idx],
+            next_sibling_np[req_idx],
         )
         num_nodes_np[req_idx] = node_count
-        out.child_maps[req_idx] = req_child_maps
 
     out.tokens.copy_(torch.from_numpy(tokens_np), non_blocking=False)
     out.depths.copy_(torch.from_numpy(depths_np), non_blocking=False)
     out.parents.copy_(torch.from_numpy(parents_np), non_blocking=False)
     out.num_nodes.copy_(torch.from_numpy(num_nodes_np), non_blocking=False)
     out.visibility.copy_(torch.from_numpy(visibility_np), non_blocking=False)
+    out.first_child.copy_(torch.from_numpy(first_child_np), non_blocking=False)
+    out.next_sibling.copy_(torch.from_numpy(next_sibling_np), non_blocking=False)
     return out
 
 
@@ -111,14 +116,12 @@ def _expand_one_tree(
     depths_out: np.ndarray,
     parents_out: np.ndarray,
     visibility_out: np.ndarray,
-) -> tuple[int, list[dict[int, int]]]:
+    first_child_out: np.ndarray,
+    next_sibling_out: np.ndarray,
+) -> int:
     depth_limit, topk = top_log_probs.shape
-    child_maps: list[dict[int, int]] = [dict()]
 
-    # start from the argmax token in pos 0
     first_logw = float(top_log_probs[0, 0])
-    # heap: (-logw, ranks_along_path, parent_index, current_depth, current_rank). -logw is the min-heap key.
-    # depth from 1 to sepc_num (depth=0 means the root), but rank from 0 to topk-1
     heap: list[tuple[float, tuple[int, ...], int, int, int]] = [
         (-first_logw, (0,), 0, 1, 0),
     ]
@@ -132,8 +135,8 @@ def _expand_one_tree(
         tokens_out[node_count] = token_id
         depths_out[node_count] = depth
         parents_out[node_count] = parent_index
-        child_maps.append(dict())
-        child_maps[parent_index][token_id] = node_index
+        next_sibling_out[node_index] = first_child_out[parent_index]
+        first_child_out[parent_index] = node_index
         node_count += 1
 
         if rank + 1 < topk:
@@ -159,4 +162,4 @@ def _expand_one_tree(
         if parent_node_idx > 0:
             visibility_out[i, :i] = visibility_out[parent_node_idx - 1, :i]
         visibility_out[i, i] = True
-    return node_count, child_maps
+    return node_count

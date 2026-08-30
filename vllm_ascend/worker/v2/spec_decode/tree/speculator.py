@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from typing import Any
 
 import torch
@@ -78,7 +77,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             dtype=torch.bool,
             device=device,
         )
-        self.tree_child_maps: list[list[dict[int, int]]] = [[{}] for _ in range(self.max_num_reqs)]
+        self.tree_first_child = torch.full(
+            (self.max_num_reqs, self.budget + 1),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.tree_next_sibling = torch.full(
+            (self.max_num_reqs, self.budget + 1),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
         self.tree: TreeLayout | None = None
         logger.info(
             "DFlash tree speculator enabled: budget=%s topk=%s depth=%s "
@@ -130,7 +140,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._reset_tree_buffers(num_reqs)
         layout = self._load_layout_from_buffers(num_reqs)
         build_trees(logits, self.budget, topk, layout)
-        self.tree = replace(layout, child_maps=self.tree_child_maps[:num_reqs])
+        self.tree = layout
         return self.tree
 
     def _reset_tree_buffers(self, num_reqs: int) -> None:
@@ -139,15 +149,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.tree_depths[:num_reqs].zero_()
         self.tree_num_nodes[:num_reqs].zero_()
         self.tree_visibility[:num_reqs].zero_()
-        for req_idx in range(num_reqs):
-            self.tree_child_maps[req_idx] = [{}]
+        self.tree_first_child[:num_reqs].fill_(-1)
+        self.tree_next_sibling[:num_reqs].fill_(-1)
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
-        """Views into persistent buffers.
-
-        ``child_maps`` aliases the backing list so a builder can write through.
-        Callers that expose the tree should slice it to ``num_reqs``.
-        """
+        """Views into persistent buffers."""
         budget = self.budget
         return TreeLayout(
             tokens=self.draft_tokens[:num_reqs, :budget],
@@ -155,5 +161,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             parents=self.tree_parents[:num_reqs, :budget],
             num_nodes=self.tree_num_nodes[:num_reqs],
             visibility=self.tree_visibility[:num_reqs, :budget, :budget],
-            child_maps=self.tree_child_maps,
+            first_child=self.tree_first_child[:num_reqs, : budget + 1],
+            next_sibling=self.tree_next_sibling[:num_reqs, : budget + 1],
         )

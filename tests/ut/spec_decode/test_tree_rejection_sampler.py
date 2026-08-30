@@ -28,19 +28,21 @@ def test_greedy_tree_reject_batch_mixed_trees() -> None:
     tree.tokens[0, :3] = torch.tensor([0, 1, 2])
     tree.parents[0, :3] = torch.tensor([0, 1, 2])
     tree.num_nodes[0] = 3
-    tree.child_maps[0] = [{0: 1}, {1: 2}, {2: 3}, {}]
+    tree.first_child[0, :4] = torch.tensor([1, 2, 3, -1])
 
     # req 1: root children {0, 1}; target picks token 1 then bonus 9
     tree.tokens[1, :3] = torch.tensor([0, 1, 5])
     tree.parents[1, :3] = torch.tensor([0, 0, 1])
     tree.num_nodes[1] = 3
-    tree.child_maps[1] = [{0: 1, 1: 2}, {5: 3}, {}, {}]
+    tree.first_child[1, 0] = 1
+    tree.next_sibling[1, 1] = 2
+    tree.first_child[1, 1] = 3
 
     # req 2: same spine as req 0, but root greedy token misses every child
     tree.tokens[2, :3] = torch.tensor([0, 1, 2])
     tree.parents[2, :3] = torch.tensor([0, 1, 2])
     tree.num_nodes[2] = 3
-    tree.child_maps[2] = [{0: 1}, {1: 2}, {2: 3}, {}]
+    tree.first_child[2, :4] = torch.tensor([1, 2, 3, -1])
 
     target_ids = torch.zeros(3, budget + 1, dtype=torch.long)
     target_ids[0, :4] = torch.tensor([0, 1, 2, 7])

@@ -37,7 +37,7 @@ def test_batch_spine_and_sibling_trees() -> None:
         ]
     )
     out = empty_tree_layout(2, 3, device=logits.device)
-    layout = build_trees(logits, budget=3, topk=3, out=out)
+    layout = build_best_first_trees(logits, budget=3, topk=3, out=out)
 
     assert layout is out
     assert layout.num_nodes.tolist() == [3, 3]

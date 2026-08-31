@@ -680,3 +680,151 @@ def build_beam_trees(
         out.visibility[:, i, i] = True
 
     return out
+
+
+def _markov_correct_logits(
+    draft_model,
+    depth_logits: torch.Tensor,
+    frontier_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the DSpark markov logit-bias correction to one depth's base logits.
+
+    Mirrors the existing Ascend DSpark drafting loop
+    (``vllm_ascend/spec_decode/llm_base_proposer.py``): the bias is computed from
+    the frontier (previous) token via ``markov_embed`` + ``markov_bias`` and added
+    to the base logits.
+
+    Args:
+        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
+        depth_logits: [R, vocab] uncorrected base logits of this depth.
+        frontier_tokens: [R, batch] token ids of the frontier nodes (the "previous"
+            tokens), one per frontier node per request.
+
+    Returns:
+        [R, batch, vocab] corrected logits, one row per frontier node.
+    """
+    base = depth_logits.unsqueeze(1)  # [R, 1, vocab]
+    markov_emb = draft_model.markov_embed(frontier_tokens)      # [R, batch, markov_rank]
+    return base + draft_model.markov_bias(markov_emb)           # [R, batch, vocab]
+
+
+def build_trees(
+    draft_logits: torch.Tensor,
+    budget: int,
+    topk: int,
+    out: TreeLayout,
+    draft_model,
+    root_token_ids: torch.Tensor,
+):
+    """
+    Build trees from DSpark draft logits, applying the markov logit-bias
+    correction at each depth.
+
+    Port of DeepSpec's level-by-level (beam) construction, generalized to a batch
+    of requests. All requests share the same tree *structure* (frontier size is
+    1 at depth 0 then ``topk`` thereafter, so pool and node counts are identical
+    across requests), so everything is kept with a leading [R, ...] batch dim and
+    processed in one batched pass. At each depth the frontier's base logits are
+    corrected with the draft model's markov bias, the top-``topk`` candidates are
+    merged into a per-request pool, and the pool is re-ranked by (depth asc,
+    score desc) and truncated to ``budget`` nodes.
+
+    Args:
+        draft_logits: [num_reqs, spec_num, vocab] shared-depth draft base logits.
+        budget: maximum number of non-root nodes per request.
+        topk: number of candidate tokens kept at each depth.
+        out: TreeLayout to fill in place.
+        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
+        root_token_ids: [num_reqs] already-accepted anchor token per request, used
+            as the depth-0 "previous" token for the markov bias.
+    """
+    num_reqs, spec_num, vocab = draft_logits.shape
+    k = max(1, min(topk, vocab))
+    device = draft_logits.device
+
+    # Frontier = the set of nodes at the current depth. Root has no pool slot.
+    frontier_tokens = root_token_ids.unsqueeze(1)  # [R, 1]
+    frontier_scores = torch.zeros(num_reqs, 1, dtype=torch.float32, device=device)
+    frontier_pools = torch.full((num_reqs, 1), -1, dtype=torch.long, device=device)
+
+    pool_tokens = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
+    pool_scores = torch.empty(num_reqs, 0, dtype=torch.float32, device=device)
+    pool_parents = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
+    pool_depth = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
+
+    for depth in range(spec_num):
+        batch = frontier_tokens.size(1)
+        step_logits = _markov_correct_logits(draft_model, draft_logits[:, depth], frontier_tokens)  # [R, batch, vocab]
+        log_probs = torch.log_softmax(step_logits.float(), dim=-1)
+        top_vals, top_ids = log_probs.topk(k, dim=-1)  # [R, batch, k]
+        candidate_scores = frontier_scores.unsqueeze(-1) + top_vals  # [R, batch, k]
+        num_candidates = batch * k
+
+        pool_tokens = torch.cat([pool_tokens, top_ids.reshape(num_reqs, -1)], dim=-1)
+        pool_scores = torch.cat([pool_scores, candidate_scores.reshape(num_reqs, -1)], dim=-1)
+        pool_parents = torch.cat([pool_parents, frontier_pools.repeat_interleave(k, dim=-1)], dim=-1)
+        pool_depth = torch.cat(
+            [pool_depth, torch.full((num_reqs, num_candidates), depth, dtype=torch.long, device=device)],
+            dim=-1,
+        )
+
+        keep = min(k, num_candidates)
+        cand_flat = candidate_scores.reshape(num_reqs, -1)  # [R, num_candidates]
+        top_ids_flat = top_ids.reshape(num_reqs, -1)        # [R, num_candidates]
+        selected = cand_flat.topk(keep, dim=-1).indices     # [R, keep]
+        frontier_tokens = torch.gather(top_ids_flat, 1, selected)
+        frontier_scores = torch.gather(cand_flat, 1, selected)
+        frontier_pools = (pool_tokens.size(-1) - num_candidates) + selected
+
+    # Re-rank the whole pool by (depth asc, score desc) and keep budget nodes.
+    num_pool = pool_tokens.size(-1)
+    num_selected = min(int(budget), num_pool)
+    order = torch.argsort(pool_depth, dim=-1, stable=True)  # [R, num_pool]
+    order = torch.gather(
+        order, 1,
+        torch.argsort(torch.gather(pool_scores, 1, order), dim=-1, descending=True, stable=True),
+    )
+    selected = order[:, :num_selected]
+    packed = selected.sort(dim=-1).values                   # [R, num_selected]
+    num_nodes = num_selected
+
+    remap = torch.zeros(num_reqs, num_pool, dtype=torch.long, device=device)
+    node_ids = torch.arange(1, num_nodes + 1, dtype=torch.long, device=device).unsqueeze(0)
+    remap.scatter_(1, packed, node_ids.expand(num_reqs, num_nodes))
+    pool_parent_packed = torch.gather(pool_parents, 1, packed)
+    non_root = pool_parent_packed >= 0
+    raw_parent = torch.gather(remap, 1, pool_parent_packed.clamp(min=0))
+    parent_indices = torch.where(non_root, raw_parent, torch.zeros_like(raw_parent))  # [R, num_nodes]
+
+    out.tokens[:, :num_nodes] = torch.gather(pool_tokens, 1, packed)
+    out.depths[:, :num_nodes] = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
+    out.parents[:, :num_nodes] = parent_indices.to(torch.int32)
+    out.num_nodes[:] = num_nodes
+
+    # first_child / next_sibling: linked-list, sequential over node slots (batched over R).
+    for i in range(num_nodes):
+        node_id = i + 1
+        parent_id = parent_indices[:, i]  # [R]
+        cur_first = torch.gather(out.first_child, 1, parent_id.unsqueeze(1)).squeeze(1)  # [R]
+        out.next_sibling[:, node_id] = cur_first
+        out.first_child.scatter_(
+            1, parent_id.unsqueeze(1),
+            torch.full((num_reqs, 1), node_id, dtype=torch.int32, device=device),
+        )
+
+    # visibility: a node sees its parent's visible set plus itself (batched over R).
+    for i in range(num_nodes):
+        parent_id = parent_indices[:, i]  # [R]
+        if i > 0:
+            src_idx = (parent_id - 1).clamp(min=0)  # [R]
+            parent_vis = torch.gather(
+                out.visibility[:, :num_nodes, :i],
+                1,
+                src_idx.unsqueeze(1).unsqueeze(-1).expand(-1, 1, i),
+            ).squeeze(1)  # [R, i]
+            out.visibility[:, i, :i] = torch.where(
+                (parent_id > 0).unsqueeze(-1), parent_vis, out.visibility[:, i, :i]
+            )
+        out.visibility[:, i, i] = True
+
+    return out

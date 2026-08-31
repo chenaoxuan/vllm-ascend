@@ -10,10 +10,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     AscendDFlashSpeculator,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
-    compact_tree_query_along_path,
-)
-from vllm_ascend.worker.v2.spec_decode.tree.utils import TreeLayout, build_trees
+from vllm_ascend.worker.v2.spec_decode.tree.utils import TreeLayout, build_best_first_trees
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +174,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         # [bs, spec_num, vocab_size]
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
-        build_trees(logits, self.budget, self.topk, layout)
+        build_best_first_trees(logits, self.budget, topk, layout)
         self.tree = layout
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:

@@ -10,14 +10,80 @@ from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.utils import (
     TreeLayout,
-    build_trees,
+    build_best_first_trees,
     empty_tree_layout,
 )
 
 
 def _build_trees(logits: torch.Tensor, budget: int, topk: int) -> TreeLayout:
     out = empty_tree_layout(logits.shape[0], budget, device=logits.device)
-    return build_trees(logits, budget, topk, out)
+    return build_best_first_trees(logits, budget, topk, out)
+
+
+def test_batch_spine_and_sibling_trees() -> None:
+    logits = torch.tensor(
+        [
+            [
+                [10.0, 0.0, 0.0],
+                [0.0, 10.0, 0.0],
+                [0.0, 0.0, 10.0],
+            ],
+            [
+                [3.0, 2.9, 0.0],
+                [-20.0, -20.0, -20.0],
+                [-20.0, -20.0, -20.0],
+            ],
+        ]
+    )
+    out = empty_tree_layout(2, 3, device=logits.device)
+    layout = build_trees(logits, budget=3, topk=3, out=out)
+
+    assert layout is out
+    assert layout.num_nodes.tolist() == [3, 3]
+
+    assert layout.tokens[0].tolist() == [0, 1, 2]
+    assert layout.depths[0].tolist() == [1, 2, 3]
+    assert layout.parents[0].tolist() == [0, 1, 2]
+    assert layout.visibility[0].tolist() == [
+        [True, False, False],
+        [True, True, False],
+        [True, True, True],
+    ]
+    assert layout.first_child[0, :4].tolist() == [1, 2, 3, -1]
+    assert layout.next_sibling[0, :4].tolist() == [-1, -1, -1, -1]
+
+    assert layout.tokens[1].tolist() == [0, 1, 0]
+    assert layout.depths[1].tolist() == [1, 1, 2]
+    assert layout.parents[1].tolist() == [0, 0, 1]
+    assert layout.visibility[1].tolist() == [
+        [True, False, False],
+        [False, True, False],
+        [True, False, True],
+    ]
+    # Newest child is prepended: node 2 then sibling 1 under root.
+    assert layout.first_child[1, :4].tolist() == [2, 3, -1, -1]
+    assert layout.next_sibling[1, :4].tolist() == [-1, -1, 1, -1]
+
+
+def test_topk_is_independent_of_budget() -> None:
+    logits = torch.tensor(
+        [
+            [
+                [10.0, 0.0, 0.0],
+                [0.0, 10.0, 0.0],
+                [0.0, 0.0, 10.0],
+            ]
+        ]
+    )
+    spine = _build_trees(logits, budget=8, topk=1)
+    filled = _build_trees(logits, budget=8, topk=3)
+
+    assert spine.num_nodes[0].item() == 3
+    assert spine.tokens[0, :3].tolist() == [0, 1, 2]
+    assert spine.parents[0, :3].tolist() == [0, 1, 2]
+    assert spine.tokens[0, 3:].tolist() == [-1] * 5
+    assert spine.parents[0, 3:].tolist() == [-1] * 5
+    assert filled.num_nodes[0].item() == 8
 
 
 def test_random_trees_are_well_formed() -> None:

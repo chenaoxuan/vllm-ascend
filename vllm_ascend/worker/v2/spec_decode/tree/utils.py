@@ -53,7 +53,7 @@ def empty_tree_layout(
     )
 
 
-def build_trees(
+def build_best_first_trees(
     draft_logits: torch.Tensor,
     budget: int,
     topk: int,
@@ -191,26 +191,19 @@ def _markov_correct_logits(
     return base + draft_model.markov_bias(markov_emb)           # [R, batch, vocab]
 
 
-def build_trees(
+def build_beam_trees(
     draft_logits: torch.Tensor,
     budget: int,
     topk: int,
     out: TreeLayout,
     draft_model,
     root_token_ids: torch.Tensor,
-):
-    """
-    Build trees from DSpark draft logits, applying the markov logit-bias
-    correction at each depth.
+) -> TreeLayout:
+    """Expand DSpark draft logits into a beam draft tree.
 
-    Port of DeepSpec's level-by-level (beam) construction, generalized to a batch
-    of requests. All requests share the same tree *structure* (frontier size is
-    1 at depth 0 then ``topk`` thereafter, so pool and node counts are identical
-    across requests), so everything is kept with a leading [R, ...] batch dim and
-    processed in one batched pass. At each depth the frontier's base logits are
-    corrected with the draft model's markov bias, the top-``topk`` candidates are
-    merged into a per-request pool, and the pool is re-ranked by (depth asc,
-    score desc) and truncated to ``budget`` nodes.
+    Each depth applies Markov bias from the parent token, keeps the top-``topk``
+    children of the current frontier, then truncates the pool to ``budget``
+    nodes. Requests are batched in one pass.
 
     Args:
         draft_logits: [num_reqs, spec_num, vocab] shared-depth draft base logits.

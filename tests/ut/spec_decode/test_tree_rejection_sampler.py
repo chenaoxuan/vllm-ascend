@@ -1,8 +1,11 @@
-"""CPU unit tests for greedy tree rejection."""
+"""CPU unit tests for greedy and block tree rejection."""
 
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import greedy_tree_reject
+from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
+    block_tree_reject,
+    greedy_tree_reject,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.utils import empty_tree_layout
 
 
@@ -58,3 +61,35 @@ def test_greedy_tree_reject_batch_mixed_trees() -> None:
         [1, 9, -1, -1],
         [9, -1, -1, -1],
     ]
+
+
+def test_block_tree_reject_paper_path() -> None:
+    """Reject X3 then X4 (locks p'≈0.091), then accept X2→X5 and recover Y."""
+    mb = torch.tensor([0.3, 0.4, 0.3])
+    ms = torch.tensor([0.6, 0.3, 0.1])
+    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+    draft = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 2, 3).contiguous()
+
+    tree = empty_tree_layout(1, 5, device="cpu")
+    # X1=a, X2=c, X3=b, X4=c, X5=a
+    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
+    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
+    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
+    tree.num_nodes[0] = 5
+    tree.first_child[0, 0] = 1
+    tree.next_sibling[0, 1] = 2
+    tree.first_child[0, 1] = 3
+    tree.next_sibling[0, 3] = 4
+    tree.first_child[0, 2] = 5
+
+    sampled = block_tree_reject(
+        tree,
+        target,
+        draft,
+        2,
+        # 0.7 ∈ (7/11, 1): correct p(X4)≈0.636 rejects; p(X4)=1 (wiped p') would accept.
+        etas=torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]]),
+        recover_u=torch.zeros(1),
+    )
+    # X1 pruned after X4; accept X2=c, X5=a; Y from M_b at X5, u=0 -> a
+    assert sampled.tolist() == [[2, 0, 0]]

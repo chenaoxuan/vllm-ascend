@@ -251,7 +251,8 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.draft_tokens[input_batch.idx_mapping] = tree.tokens
                 self.req_states.tree_depths[input_batch.idx_mapping] = tree.depths
                 self.req_states.tree_parents[input_batch.idx_mapping] = tree.parents
-                self.req_states.tree_visibility[input_batch.idx_mapping] = tree.tree_visibility
+                self.req_states.tree_visibility[input_batch.idx_mapping] = tree.visibility
+                self.req_states.tree_num_nodes[input_batch.idx_mapping] = tree.num_nodes
                 if self.num_speculative_steps > 0:
                     self.draft_tokens_handler.set_draft_tokens(
                         input_batch,
@@ -449,9 +450,14 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         if dflash_tree_spec_enabled(self.vllm_config):
+            is_prefilling = async_copy_to_gpu(
+                torch.from_numpy(batch_req_state.is_prefilling_np),
+                device=self.device,
+            )
             prepare_tree_spec_pos_seq_lens(
                 idx_mapping,
                 query_start_loc,
+                is_prefilling,
                 self.req_states.num_computed_tokens.gpu,
                 self.req_states.tree_depths,
                 self.input_buffers.positions,
@@ -557,6 +563,10 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
+
+        if dflash_tree_spec_enabled(self.vllm_config):
+            input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
+            input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.

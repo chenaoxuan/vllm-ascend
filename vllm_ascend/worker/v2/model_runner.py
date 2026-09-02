@@ -248,11 +248,14 @@ class NPUModelRunner(GPUModelRunner):
             if speculative_config is not None and speculative_config.use_dflash():
                 input_batch = self.speculator.input_batch
                 tree = self.speculator.get_tree()
-                self.req_states.draft_tokens[input_batch.idx_mapping] = tree.tokens
-                self.req_states.tree_depths[input_batch.idx_mapping] = tree.depths
-                self.req_states.tree_parents[input_batch.idx_mapping] = tree.parents
-                self.req_states.tree_visibility[input_batch.idx_mapping] = tree.visibility
-                self.req_states.tree_num_nodes[input_batch.idx_mapping] = tree.num_nodes
+                idx = input_batch.idx_mapping
+                self.req_states.draft_tokens[idx] = tree.tokens
+                self.req_states.tree_depths[idx] = tree.depths
+                self.req_states.tree_parents[idx] = tree.parents
+                self.req_states.tree_visibility[idx] = tree.visibility
+                self.req_states.tree_num_nodes[idx] = tree.num_nodes
+                self.req_states.tree_first_child[idx] = tree.first_child
+                self.req_states.tree_next_sibling[idx] = tree.next_sibling
                 if self.num_speculative_steps > 0:
                     self.draft_tokens_handler.set_draft_tokens(
                         input_batch,
@@ -567,6 +570,11 @@ class NPUModelRunner(GPUModelRunner):
         if dflash_tree_spec_enabled(self.vllm_config):
             input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
             input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
+            input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
+            input_batch.tree_depths = self.req_states.tree_depths[idx_mapping]
+            input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
+            input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
+            input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.

@@ -84,3 +84,15 @@ class AscendRequestState(RequestState):
                 dtype=torch.bool,
                 device=device,
             )
+            self.tree_first_child: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_next_sibling: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )

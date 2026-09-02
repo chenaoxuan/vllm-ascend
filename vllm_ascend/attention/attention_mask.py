@@ -17,7 +17,7 @@ import torch
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
-from vllm.triton_utils import tl, triton
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -31,32 +31,8 @@ def _generate_attn_mask(max_seq_len, dtype):
     attn_mask = torch.zeros(size=(max_seq_len, max_seq_len), dtype=dtype).masked_fill_(mask_flag, mask_value)
     return attn_mask
 
-@triton.jit
-def get_tree_attention_mask_kernel(
-    tree_num_nodes_ptr,
-    tree_num_nodes_cumsum_ptr,
-    tree_visibility_ptr,
-    tree_visibility_stride_dim0,
-    tree_visibility_stride_dim1,
-    attn_mask_ptr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_id = tl.program_id(0)
-    start = 0
-    if req_id > 0 :
-        start = tl.load(tree_num_nodes_cumsum_ptr + req_id - 1)
-    end = tl.load(tree_num_nodes_cumsum_ptr + req_id)
-    attn_mask_len = end - start
-
-    for row in tl.range(attn_mask_len):
-        for col in tl.range(0, attn_mask_len, BLOCK_SIZE):
-            block = col + tl.arange(0, BLOCK_SIZE)
-            triton_mask = block < attn_mask_len
-            tl.store(attn_mask_ptr + start + row * attn_mask_len + block,
-                     tree_visibility_ptr + req_id * tree_visibility_stride_dim0 +
-                        row * tree_visibility_stride_dim1 + block,
-                     mask=triton_mask)
-
+def align_up(value, alignment=128):
+    return ((value + alignment - 1) // alignment) * alignment
 
 @singleton
 class AttentionMaskBuilder:
@@ -85,7 +61,9 @@ class AttentionMaskBuilder:
     def get_attention_mask(self, causal: bool,
                            model_config: ModelConfig,
                            tree_num_nodes: torch.Tensor | None = None,
-                           tree_visibility: torch.Tensor | None = None
+                           tree_visibility: torch.Tensor | None = None,
+                           seq_lens: torch.Tensor | None = None,
+                           is_prefill: bool = False
                            ):
         if not causal:
             # FIA applies any provided mask as defaultMask (sparse_mode=0),
@@ -96,8 +74,8 @@ class AttentionMaskBuilder:
             # non-masking mask instead.
             return None
 
-        if dflash_tree_spec_enabled() and tree_num_nodes and tree_visibility:
-            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility)
+        if dflash_tree_spec_enabled() and not is_prefill:
+            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility, seq_lens)
 
         if model_config.runner_type == "pooling":
             return self.get_attn_mask(2048, torch.bool)
@@ -105,20 +83,19 @@ class AttentionMaskBuilder:
         return self.get_splitfuse_attn_mask()
     
     def get_tree_attention_mask(self, tree_num_nodes: torch.Tensor,
-                                tree_visibility: torch.Tensor):
+                                tree_visibility: torch.Tensor,
+                                seq_lens: torch.Tensor):
         num_reqs = tree_visibility.shape[0]
+        max_nodes = get_ascend_config().tree_spec_config.budget
+        query_len = 1 + max_nodes
 
-        tree_num_nodes_cumsum = torch.cumsum(tree_num_nodes ** 2, dim=0)
+        attn_mask = torch.ones(num_reqs, 1, query_len,
+            align_up(seq_lens.max(), 128), dtype=torch.bool, device=self.device)
+        for i in range(num_reqs):
+            req_mask = attn_mask[i, 0, :, :]
+            seq_len = seq_lens[i].item()
+            prev_kv_len = seq_len - query_len
 
-        mask_len = tree_num_nodes_cumsum[-1]
-        attn_mask = torch.zeros(mask_len, dtype=torch.bool, device=self.device)
-        get_tree_attention_mask_kernel[(num_reqs,)](
-            tree_num_nodes,
-            tree_num_nodes_cumsum,
-            tree_visibility,
-            tree_visibility.stride[0],
-            tree_visibility.stride[1],
-            attn_mask,
-            BLOCK_SIZE=1024,
-        )
+            req_mask[:, :prev_kv_len + 1] = False
+            req_mask[1:, prev_kv_len + 1 : prev_kv_len + 1 + max_nodes] = tree_visibility[i, :, :]
         return attn_mask

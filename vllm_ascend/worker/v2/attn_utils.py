@@ -255,7 +255,7 @@ def build_attn_metadata(
             max_seq_len=max_seq_len,
             causal=group_causal,
             tree_num_nodes=tree_num_nodes,
-            tree_visibility=tree_visibility
+            tree_visibility=tree_visibility,
             **common_attn_metadata_extra_kwargs,
         )
 

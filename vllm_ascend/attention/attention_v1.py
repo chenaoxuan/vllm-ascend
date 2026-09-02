@@ -63,6 +63,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import is_950, vllm_version_is, weak_ref_tensors
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 if vllm_version_is("0.27.1"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -348,7 +349,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal,
                                                               self.model_config,
                                                               common_attn_metadata.tree_num_nodes,
-                                                              common_attn_metadata.tree_visibility)
+                                                              common_attn_metadata.tree_visibility,
+                                                              seq_lens,
+                                                              True if num_prefills > 0 else False)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -1445,7 +1448,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # ChunkedPrefill mixing prefill+decode: split into a per-phase
                 # FIA call each (A5 only).
                 if (
-                    is_950()
+                    (is_950() or dflash_tree_spec_enabled())
                     and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
                     and attn_metadata.num_decodes > 0
                     and attn_metadata.num_prefills > 0
@@ -1453,6 +1456,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     return self._forward_fia_chunked_prefill_split(
                         query, key, value, key, passed_value, block_size, block_table, attn_metadata, output
                     )
+
+                if dflash_tree_spec_enabled() and attn_metadata.num_prefills == 0:
+                    sparse_mode=1
+                else:
+                    sparse_mode=3
                 attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1473,7 +1481,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     current_value=passed_value,
                     attn_metadata=attn_metadata,
                     is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
-                    sparse_mode=3,
+                    sparse_mode=sparse_mode,
                 )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
@@ -1504,6 +1512,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         # decode part
         if num_decode_tokens > 0:
+            if dflash_tree_spec_enabled():
+                sparse_mode=1
+            else:
+                sparse_mode=3
+            print(f"=====decode={attn_metadata.attn_mask.shape=}")
             decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[:num_decode_tokens],
                 key=key,
@@ -1525,7 +1538,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 current_value=value,
                 attn_metadata=attn_metadata,
                 is_prefill_no_cache=False,
-                sparse_mode=3,
+                sparse_mode=sparse_mode,
             )
             output[:num_decode_tokens] = decode_out.view(num_decode_tokens, self.num_heads, self.head_size)
 
@@ -1535,11 +1548,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_seq_qlen = [
                 actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
             ]
+            if dflash_tree_spec_enabled():
+                prefill_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(attn_metadata.attn_mask.device)
+            else:
+                prefill_mask = attn_metadata.attn_mask
+
+            print(f"=====prefill={prefill_mask.shape=}")
             prefill_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[num_decode_tokens:num_tokens],
                 key=key,
                 value=value,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=prefill_mask,
                 block_table=block_table[num_decodes:],
                 input_layout="TND",
                 block_size=block_size,

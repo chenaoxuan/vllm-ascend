@@ -56,7 +56,7 @@ class AscendRequestState(RequestState):
         if dflash_tree_spec_enabled():
             from vllm_ascend.ascend_config import get_ascend_config
 
-            max_nodes = get_ascend_config().tree_spec_config.max_nodes
+            max_nodes = get_ascend_config().tree_spec_config.budget
             self.draft_tokens: torch.Tensor = torch.zeros(
                 self.max_num_reqs,
                 max_nodes,
@@ -67,16 +67,13 @@ class AscendRequestState(RequestState):
             self.tree_depths: torch.Tensor = torch.zeros(
                 self.max_num_reqs,
                 max_nodes,
-                dtype=torch.int64,
+                dtype=torch.int32,
                 device=device,
             )
 
-            # include root, accepted token
-            tree_max_len = max_nodes + 1
-
             self.tree_parents: torch.Tensor = torch.zeros(
                 self.max_num_reqs,
-                tree_max_len,
+                max_nodes,
                 dtype=torch.int32,
                 device=device,
             )
@@ -89,8 +86,8 @@ class AscendRequestState(RequestState):
 
             self.tree_visibility: torch.Tensor = torch.zeros(
                 self.max_num_reqs,
-                tree_max_len,
-                tree_max_len,
+                max_nodes,
+                max_nodes,
                 dtype=torch.bool,
                 device=device,
             )

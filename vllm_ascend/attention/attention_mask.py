@@ -89,10 +89,10 @@ class AttentionMaskBuilder:
         max_nodes = get_ascend_config().tree_spec_config.budget
         query_len = 1 + max_nodes
 
-        attn_mask = torch.ones(num_reqs, 1, query_len,
+        attn_mask = torch.ones(num_reqs, query_len,
             align_up(seq_lens.max(), 128), dtype=torch.bool, device=self.device)
         for i in range(num_reqs):
-            req_mask = attn_mask[i, 0, :, :]
+            req_mask = attn_mask[i, :, :]
             seq_len = seq_lens[i].item()
             prev_kv_len = seq_len - query_len
 

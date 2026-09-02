@@ -351,7 +351,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                                                               common_attn_metadata.tree_num_nodes,
                                                               common_attn_metadata.tree_visibility,
                                                               seq_lens,
-                                                              True if num_prefills > 0 else False)
+                                                              num_decodes)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -1516,7 +1516,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 sparse_mode=1
             else:
                 sparse_mode=3
-            print(f"=====decode={attn_metadata.attn_mask.shape=}")
             decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[:num_decode_tokens],
                 key=key,
@@ -1552,8 +1551,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 prefill_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(attn_metadata.attn_mask.device)
             else:
                 prefill_mask = attn_metadata.attn_mask
-
-            print(f"=====prefill={prefill_mask.shape=}")
             prefill_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[num_decode_tokens:num_tokens],
                 key=key,

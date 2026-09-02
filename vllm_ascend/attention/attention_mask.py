@@ -63,7 +63,7 @@ class AttentionMaskBuilder:
                            tree_num_nodes: torch.Tensor | None = None,
                            tree_visibility: torch.Tensor | None = None,
                            seq_lens: torch.Tensor | None = None,
-                           is_prefill: bool = False
+                           num_decode: int = 0
                            ):
         if not causal:
             # FIA applies any provided mask as defaultMask (sparse_mode=0),
@@ -74,8 +74,8 @@ class AttentionMaskBuilder:
             # non-masking mask instead.
             return None
 
-        if dflash_tree_spec_enabled() and not is_prefill:
-            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility, seq_lens)
+        if dflash_tree_spec_enabled() and num_decode > 0:
+            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility, seq_lens, num_decode)
 
         if model_config.runner_type == "pooling":
             return self.get_attn_mask(2048, torch.bool)
@@ -84,14 +84,15 @@ class AttentionMaskBuilder:
     
     def get_tree_attention_mask(self, tree_num_nodes: torch.Tensor,
                                 tree_visibility: torch.Tensor,
-                                seq_lens: torch.Tensor):
+                                seq_lens: torch.Tensor,
+                                num_decode):
         num_reqs = tree_visibility.shape[0]
         max_nodes = get_ascend_config().tree_spec_config.budget
         query_len = 1 + max_nodes
 
-        attn_mask = torch.ones(num_reqs, query_len,
+        attn_mask = torch.ones(num_decode, query_len,
             align_up(seq_lens.max(), 128), dtype=torch.bool, device=self.device)
-        for i in range(num_reqs):
+        for i in range(num_decode):
             req_mask = attn_mask[i, :, :]
             seq_len = seq_lens[i].item()
             prev_kv_len = seq_len - query_len

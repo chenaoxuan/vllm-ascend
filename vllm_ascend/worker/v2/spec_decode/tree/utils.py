@@ -1,9 +1,12 @@
 import heapq
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -264,7 +267,7 @@ def build_dar_tree(
     supertree_width: int | None = None,
     pruned: bool = True,
     correction_scorer=None,
-    parallel_hiddens: torch.Tensor | None = None,
+    draft_hidden: torch.Tensor | None = None,
     root_token_ids: torch.Tensor | None = None,
     prefix_len: int = 0,
     candidate_vocab_size: int | None = None,
@@ -299,7 +302,7 @@ def build_dar_tree(
         correction_scorer: optional Domino-like correction scorer exposing
             ``project_z``, ``update_hidden``, ``w_s``, ``fc1_bias``, ``middle``,
             ``fc2_weight`` and ``fc2_bias`` (see ``_dar_corrected_candidates``).
-        parallel_hiddens: [num_reqs, spec_num, hidden] draft backbone output;
+        draft_hidden: [num_reqs, spec_num, hidden] draft backbone output;
             required when ``correction_scorer`` is set (source of ``z``).
         root_token_ids: [num_reqs] already-accepted anchor token per request;
             required when ``correction_scorer`` is set.
@@ -308,13 +311,13 @@ def build_dar_tree(
         candidate_vocab_size: number of candidate tokens gathered per depth for
             the correction scorer; defaults to ``vocab``.
     """
-    num_reqs, depth_limit, vocab = draft_logits.shape
+    num_reqs, block_size, vocab = draft_logits.shape
     device = draft_logits.device
     budget = max(0, int(budget))
     topk = max(1, int(topk))
     k = min(topk, vocab, budget)  # candidate tokens kept per parent
 
-    if budget <= 0 or depth_limit <= 0 or k <= 0:
+    if budget <= 0 or block_size <= 0 or k <= 0:
         out.num_nodes.zero_()
         return out
 
@@ -322,14 +325,14 @@ def build_dar_tree(
         width = supertree_width if supertree_width is not None else k
         width = max(1, min(int(width), k))
     else:
-        width = max(1, min(int(np.ceil(budget / depth_limit)), k, budget))
-    supertree_budget = width * depth_limit
+        width = max(1, min(int(np.ceil(budget / block_size)), k, budget))
+    supertree_budget = width * block_size
 
     with_correction = correction_scorer is not None
     if with_correction:
-        if parallel_hiddens is None or root_token_ids is None:
+        if draft_hidden is None or root_token_ids is None:
             raise ValueError(
-                "correction_scorer requires parallel_hiddens and root_token_ids"
+                "correction_scorer requires draft_hidden and root_token_ids"
             )
         # Precompute the per-depth candidate tables (base values + fc2 gather).
         cand_vocab = vocab if candidate_vocab_size is None else int(candidate_vocab_size)
@@ -342,17 +345,21 @@ def build_dar_tree(
         flat_cids = candidate_ids.reshape(-1)
         candidate_weight = correction_scorer.fc2_weight.index_select(
             0, flat_cids
-        ).view(num_reqs, depth_limit, candidate_count, -1)  # [R, spec, C, mid]
+        ).view(num_reqs, block_size, candidate_count, -1)  # [R, spec, C, mid]
         candidate_bias = None
         if correction_scorer.fc2_bias is not None:
             candidate_bias = correction_scorer.fc2_bias.index_select(
                 0, flat_cids
-            ).view(num_reqs, depth_limit, candidate_count)  # [R, spec, C]
+            ).view(num_reqs, block_size, candidate_count)  # [R, spec, C]
         z_parts = correction_scorer.project_z(
-            parallel_hiddens[:, :depth_limit]
+            draft_hidden[:, :block_size]
         )  # [R, spec, mid]
         gru_hidden_dim = int(correction_scorer.w_s.shape[1])
     else:
+        logger.warning(
+            "build_dar_tree received no correction_scorer; the draft tree "
+            "will be built from uncorrected base logits."
+        )
         log_probs = torch.log_softmax(draft_logits.float(), dim=-1)  # [R, spec, vocab]
 
     # Node buffers. Node 0 is the root (parent -1); non-root node i+1 has
@@ -386,7 +393,7 @@ def build_dar_tree(
     frontier = torch.zeros((num_reqs, width), dtype=torch.long, device=device)
     frontier_len = 1  # layer 1 expands only the root
     node_count = 0
-    for child_depth in range(1, depth_limit + 1):
+    for child_depth in range(1, block_size + 1):
         if node_count >= supertree_budget:
             break
         take = min(width, frontier_len * k, supertree_budget - node_count)

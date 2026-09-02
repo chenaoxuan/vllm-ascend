@@ -27,6 +27,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
@@ -106,3 +107,15 @@ class AscendModelState(DefaultModelState):
             tree_visibility=input_batch.tree_visibility
         )
         return self.attn_metadata
+
+    def custom_sampler(self, sampler):
+        if not dflash_tree_spec_enabled(self.vllm_config):
+            return None
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is None:
+            return None
+        from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
+            TreeRejectionSampler,
+        )
+
+        return sampler, TreeRejectionSampler(sampler, spec_config, self.device)

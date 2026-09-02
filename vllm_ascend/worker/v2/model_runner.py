@@ -212,11 +212,15 @@ class NPUModelRunner(GPUModelRunner):
             speculative_config = self.vllm_config.speculative_config
             if speculative_config.use_dflash():
                 input_batch = self.speculator.input_batch
-                self.req_states.draft_tokens[input_batch.idx_mapping] = self.speculator.get_tree().tokens
-                self.req_states.tree_depths[input_batch.idx_mapping] = self.speculator.get_tree().depths
-                self.req_states.tree_parents[input_batch.idx_mapping] = self.speculator.get_tree().parents
-                self.req_states.tree_visibility[input_batch.idx_mapping] = self.speculator.get_tree().visibility
-                self.req_states.tree_num_nodes[input_batch.idx_mapping] = self.speculator.get_tree().num_nodes
+                tree = self.speculator.get_tree()
+                idx = input_batch.idx_mapping
+                self.req_states.draft_tokens[idx] = tree.tokens
+                self.req_states.tree_depths[idx] = tree.depths
+                self.req_states.tree_parents[idx] = tree.parents
+                self.req_states.tree_visibility[idx] = tree.visibility
+                self.req_states.tree_num_nodes[idx] = tree.num_nodes
+                self.req_states.tree_first_child[idx] = tree.first_child
+                self.req_states.tree_next_sibling[idx] = tree.next_sibling
 
                 if self.num_speculative_steps > 0:
                     self.draft_tokens_handler.set_draft_tokens(
@@ -737,8 +741,13 @@ class NPUModelRunner(GPUModelRunner):
                 attn_state=attn_state,
             )
             if dflash_tree_spec_enabled(self.vllm_config):
-                input_batch.tree_visibility=self.req_states.tree_visibility[idx_mapping]
-                input_batch.tree_num_nodes=self.req_states.tree_num_nodes[idx_mapping]
+                input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
+                input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
+                input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
+                input_batch.tree_depths = self.req_states.tree_depths[idx_mapping]
+                input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
+                input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
+                input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
 
             input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 

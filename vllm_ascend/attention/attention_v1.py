@@ -1548,7 +1548,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
             ]
             if dflash_tree_spec_enabled():
-                prefill_mask = torch.triu(torch.ones(2048, 2048), diagonal=1).to(torch.int8).to(attn_metadata.attn_mask.device)
+                prefill_mask = AttentionMaskBuilder(attn_metadata.attn_mask.device).get_splitfuse_attn_mask()
             else:
                 prefill_mask = attn_metadata.attn_mask
             prefill_out, _ = DeviceOperator.npu_fused_infer_attention_score(

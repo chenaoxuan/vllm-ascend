@@ -78,6 +78,11 @@ class AscendInputBatch(InputBatch):
         seq_lens_np: np.ndarray = None  # type: ignore[assignment, no-redef]
         tree_visibility: torch.Tensor | None = None
         tree_num_nodes: torch.Tensor | None = None
+        tree_tokens: torch.Tensor | None = None
+        tree_depths: torch.Tensor | None = None
+        tree_parents: torch.Tensor | None = None
+        tree_first_child: torch.Tensor | None = None
+        tree_next_sibling: torch.Tensor | None = None
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
@@ -186,6 +191,9 @@ def _prepare_tree_spec_pos_seq_lens_kernel(
             tl.store(pos_ptr + start + block, pos, mask=mask)
         return
 
+    # Root at num_computed; drafts use tree depth for RoPE (siblings may share pos).
+    # TODO(check): double-check KV slot_mapping gives each draft token a unique
+    # slot; tree attn mask columns are slot-ordered, not position-ordered.
     tl.store(pos_ptr + start, num_computed_tokens)
     for i in tl.range(1, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)

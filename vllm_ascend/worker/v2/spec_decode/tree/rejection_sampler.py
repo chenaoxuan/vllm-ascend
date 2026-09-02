@@ -1,4 +1,11 @@
+from typing import Any
+
+import numpy as np
 import torch
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 from vllm_ascend.worker.v2.spec_decode.tree.utils import TreeLayout
 
@@ -64,6 +71,114 @@ def greedy_tree_reject(
         )
 
     return sampled_token_ids
+
+
+def _tree_from_input_batch(input_batch: Any) -> TreeLayout | None:
+    """Build a ``TreeLayout`` view from batch-ordered tree fields."""
+    tokens = getattr(input_batch, "tree_tokens", None)
+    first_child = getattr(input_batch, "tree_first_child", None)
+    next_sibling = getattr(input_batch, "tree_next_sibling", None)
+    if tokens is None or first_child is None or next_sibling is None:
+        return None
+    return TreeLayout(
+        tokens=tokens,
+        depths=input_batch.tree_depths,
+        parents=input_batch.tree_parents,
+        num_nodes=input_batch.tree_num_nodes,
+        visibility=input_batch.tree_visibility,
+        first_child=first_child,
+        next_sibling=next_sibling,
+    )
+
+
+def _pack_tree_target_logits(
+    logits: torch.Tensor,
+    cu_num_logits_np: np.ndarray,
+    num_reqs: int,
+    node_dim: int,
+) -> torch.Tensor:
+    """Pack flat ``[num_logits, V]`` target logits into ``[R, node_dim, V]``.
+
+    Column ``j`` is target logits at tree node id ``j``. Requests shorter than
+    ``node_dim`` keep ``-inf`` in the unused node columns.
+    ``cu_num_logits_np`` is the host prefix-sum of per-request logit counts.
+    """
+    vocab = logits.shape[-1]
+    num_logits = logits.shape[0]
+    if num_reqs > 0 and num_logits == num_reqs * node_dim:
+        return logits.view(num_reqs, node_dim, vocab)
+    if num_reqs > 0 and num_logits % num_reqs == 0:
+        query_len = num_logits // num_reqs
+        packed = logits.view(num_reqs, query_len, vocab)
+        if query_len == node_dim:
+            return packed
+        out = packed.new_full((num_reqs, node_dim, vocab), float("-inf"))
+        n = min(query_len, node_dim)
+        out[:, :n] = packed[:, :n]
+        return out
+    out = logits.new_full((num_reqs, node_dim, vocab), float("-inf"))
+    for i in range(num_reqs):
+        start = int(cu_num_logits_np[i])
+        end = int(cu_num_logits_np[i + 1])
+        n = min(end - start, node_dim)
+        if n > 0:
+            out[i, :n] = logits[start : start + n]
+    return out
+
+
+def _num_sampled_and_rejected(
+    sampled: torch.Tensor,
+    input_batch: InputBatch,
+    prefill_len: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count accepted path tokens and the unused forwarded tree slots."""
+    num_reqs = input_batch.num_reqs
+    num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
+    cu = input_batch.cu_num_logits[: num_reqs + 1]
+    num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
+    seq_lens = input_batch.seq_lens[:num_reqs]
+    idx_mapping = input_batch.idx_mapping[:num_reqs]
+    is_chunked = seq_lens < prefill_len[idx_mapping]
+    zero = num_sampled.new_zeros(())
+    num_sampled = torch.where(is_chunked, zero, num_sampled)
+    num_rejected = torch.where(is_chunked, zero, num_logits - num_sampled)
+    return num_sampled, num_rejected
+
+
+class TreeRejectionSampler(RejectionSampler):
+    """v2 rejection sampler that greedy-verifies a DFlash draft tree."""
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None = None,
+    ) -> SamplerOutput:
+        tree = _tree_from_input_batch(input_batch)
+        if tree is None:
+            return super().__call__(logits, input_batch, draft_logits)
+
+        num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+        node_dim = tree.tokens.shape[1] + 1
+        target_logits = _pack_tree_target_logits(
+            logits,
+            input_batch.cu_num_logits_np,
+            input_batch.num_reqs,
+            node_dim,
+        )
+        sampled = greedy_tree_reject(tree, target_logits, self.num_speculative_steps)
+        num_sampled, num_rejected = _num_sampled_and_rejected(
+            sampled,
+            input_batch,
+            self.sampler.req_states.prefill_len.gpu,
+        )
+        return SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=None,
+            num_nans=num_nans,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
 
 
 def _update_parent_residual(

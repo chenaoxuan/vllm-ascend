@@ -88,6 +88,9 @@ class AttentionMaskBuilder:
                                 num_decode):
         num_reqs = tree_visibility.shape[0]
         max_nodes = get_ascend_config().tree_spec_config.budget
+        # TODO: align query_len with actual scheduled query length
+        # (e.g. 1 + num_speculative_steps / num_scheduled_tokens). Using
+        # 1 + budget breaks prev_kv_len and FIA S1 when budget differs.
         query_len = 1 + max_nodes
 
         attn_mask = torch.ones(num_decode, query_len,
@@ -98,5 +101,9 @@ class AttentionMaskBuilder:
             prev_kv_len = seq_len - query_len
 
             req_mask[:, :prev_kv_len + 1] = False
-            req_mask[1:, prev_kv_len + 1 : prev_kv_len + 1 + max_nodes] = tree_visibility[i, :, :]
+            # tree_visibility: True = can attend; FIA bool mask: True = masked out.
+            # Draft columns are slot-indexed (contiguous j), matching visibility.
+            # TODO(check): double-check that KV slot_mapping is also per-slot
+            # unique when siblings share the same RoPE depth (positions use depth).
+            req_mask[1:, prev_kv_len + 1 : prev_kv_len + 1 + max_nodes] = ~tree_visibility[i]
         return attn_mask

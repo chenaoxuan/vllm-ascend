@@ -92,7 +92,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.tree: TreeLayout | None = None
         logger.info(
             "DFlash tree speculator enabled: budget=%s topk=%s depth=%s "
-            "(target tree verify is not wired yet)",
+            "(target verify uses greedy_tree_reject)",
             self.budget,
             self.topk,
             self.num_speculative_steps,

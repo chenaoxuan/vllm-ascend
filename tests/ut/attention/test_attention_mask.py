@@ -13,9 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from types import SimpleNamespace
-from unittest.mock import patch
-
 import torch
 
 from tests.ut.base import TestBase
@@ -56,7 +53,7 @@ class TestAttentionMaskBuilder(TestBase):
         visibility[0, 0, 0] = True
         visibility[1] = torch.eye(2, dtype=torch.bool)
         seq_lens = torch.tensor([10, 20], dtype=torch.int32)
-        mask = builder.get_tree_attention_mask(None, visibility, seq_lens, num_decode=2)
+        mask = builder.get_tree_attention_mask(visibility, seq_lens, num_decode=2)
         self.assertEqual(mask.shape, (2, 1, 3, 128))
         # query_len=3 → prev_kv is 7 and 17; prefix+root columns are visible.
         self.assertFalse(mask[0, 0, :, :8].any())
@@ -70,19 +67,3 @@ class TestAttentionMaskBuilder(TestBase):
         self.assertTrue(bool(mask[1, 0, 1, 19]))
         self.assertTrue(bool(mask[1, 0, 2, 18]))
         self.assertFalse(bool(mask[1, 0, 2, 19]))
-
-    @patch("vllm_ascend.attention.attention_mask.dflash_tree_spec_enabled", return_value=True)
-    def test_tree_attention_mask_requires_decode_classification(self, _mock):
-        """num_decode=0 (budget query misclassified as prefill) drops the tree mask."""
-        builder = AttentionMaskBuilder(torch.device("cpu"))
-        visibility = torch.eye(2, dtype=torch.bool).unsqueeze(0)
-        seq_lens = torch.tensor([10], dtype=torch.int32)
-        model_config = SimpleNamespace(runner_type="generate")
-        prefill = builder.get_attention_mask(
-            True, model_config, None, visibility, seq_lens, num_decode=0
-        )
-        decode = builder.get_attention_mask(
-            True, model_config, None, visibility, seq_lens, num_decode=1
-        )
-        self.assertEqual(prefill.shape, (2048, 2048))
-        self.assertEqual(decode.shape, (1, 1, 3, 128))

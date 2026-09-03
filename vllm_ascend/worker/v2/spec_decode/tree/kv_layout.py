@@ -20,8 +20,6 @@ def compact_tree_kv_along_path(
     Reads are gathered into a temporary before scatter so overlapping src/dst
     slots (including swaps) stay correct.
     """
-    if not caches:
-        return
     node = path_node_ids.to(dtype=torch.long)
     req_idx = idx_mapping[: node.shape[0]]
     safe_idx = req_idx.clamp(min=0)
@@ -48,7 +46,7 @@ def compact_tree_query_along_path(
     tensors: list[torch.Tensor],
     query_start_loc: torch.Tensor,
     path_node_ids: torch.Tensor,
-    linearize_positions: torch.Tensor | None = None,
+    linearize_positions: torch.Tensor,
 ) -> None:
     """Move accepted-path query rows onto the linear prefix of each request.
 
@@ -59,15 +57,13 @@ def compact_tree_query_along_path(
     slots are no-ops (src = dst). Gather clones before scatter so overlapping
     src/dst rows stay correct.
 
-    When ``linearize_positions`` is set (``[num_tokens]`` device), the same
-    destination rows are rewritten as ``root_pos + 0..k`` rather than packed
-    RoPE (siblings may share a packed position). Leftover rejected rows keep
-    their packed RoPE; DFlash context-slot writes must PAD that suffix
+    ``linearize_positions`` is ``[num_tokens]`` (device). Destination rows
+    become ``root_pos + 0..k`` rather than packed RoPE (siblings may share a
+    packed position). Leftover rejected rows keep their packed RoPE; DFlash
+    context-slot writes must PAD that suffix
     (``mask_rejected_dflash_context_slots`` / kernel ``is_valid_ctx``).
     """
     num_reqs, spec_len = path_node_ids.shape
-    if num_reqs == 0:
-        return
     node = path_node_ids.to(dtype=torch.long)
     qsl = query_start_loc[:num_reqs].to(dtype=torch.long)
     root = torch.zeros((num_reqs, 1), dtype=torch.long, device=node.device)
@@ -88,8 +84,6 @@ def compact_tree_query_along_path(
     for tensor in tensors:
         gathered = tensor[src_idx].clone()
         tensor[dst_idx] = gathered
-    if linearize_positions is None:
-        return
     base = linearize_positions[qsl].unsqueeze(1)
     new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
     cur = linearize_positions[dst_idx]
@@ -110,8 +104,6 @@ def mask_rejected_dflash_context_slots(
     All tensors are device-side. ``query_start_loc`` is ``[num_reqs + 1]``.
     """
     num_reqs = num_rejected.shape[0]
-    if num_reqs == 0 or context_slot_mapping.numel() == 0:
-        return
     starts = query_start_loc[:num_reqs].to(dtype=torch.long)
     ends = query_start_loc[1 : num_reqs + 1].to(dtype=torch.long)
     valid_ends = ends - num_rejected.to(dtype=torch.long)

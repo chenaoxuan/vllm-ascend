@@ -103,16 +103,13 @@ class AscendModelState(DefaultModelState):
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,
-            tree_num_nodes=input_batch.tree_num_nodes,
             tree_visibility=input_batch.tree_visibility
         )
         return self.attn_metadata
 
     def custom_sampler(self, sampler):
-        if not dflash_tree_spec_enabled(self.vllm_config):
-            return None
         spec_config = self.vllm_config.speculative_config
-        if spec_config is None:
+        if spec_config is None or not dflash_tree_spec_enabled(self.vllm_config):
             return None
         from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
             TreeRejectionSampler,

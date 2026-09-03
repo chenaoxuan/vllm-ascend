@@ -98,13 +98,13 @@ def build_trees(
         )
         num_nodes_np[req_idx] = node_count
 
-    out.tokens.copy_(torch.from_numpy(tokens_np), non_blocking=False)
-    out.depths.copy_(torch.from_numpy(depths_np), non_blocking=False)
-    out.parents.copy_(torch.from_numpy(parents_np), non_blocking=False)
-    out.num_nodes.copy_(torch.from_numpy(num_nodes_np), non_blocking=False)
-    out.visibility.copy_(torch.from_numpy(visibility_np), non_blocking=False)
-    out.first_child.copy_(torch.from_numpy(first_child_np), non_blocking=False)
-    out.next_sibling.copy_(torch.from_numpy(next_sibling_np), non_blocking=False)
+    out.tokens.copy_(torch.from_numpy(tokens_np))
+    out.depths.copy_(torch.from_numpy(depths_np))
+    out.parents.copy_(torch.from_numpy(parents_np))
+    out.num_nodes.copy_(torch.from_numpy(num_nodes_np))
+    out.visibility.copy_(torch.from_numpy(visibility_np))
+    out.first_child.copy_(torch.from_numpy(first_child_np))
+    out.next_sibling.copy_(torch.from_numpy(next_sibling_np))
     return out
 
 

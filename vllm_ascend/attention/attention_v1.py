@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.utils import (
@@ -63,10 +64,7 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import is_950, vllm_version_is, weak_ref_tensors
-from vllm_ascend.worker.v2.spec_decode import (
-    dflash_tree_decode_query_len,
-    dflash_tree_spec_enabled,
-)
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 if vllm_version_is("0.27.1"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -262,10 +260,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             if self.tree_spec_enabled:
-                # Packed tree verify is budget+1, not spec_depth+1.
-                self.decode_threshold = dflash_tree_decode_query_len(spec_token_num)
+                self.decode_threshold = 1 + get_ascend_config().tree_spec_config.budget
             else:
-                self.decode_threshold += spec_token_num
+                self.decode_threshold = 1 + spec_token_num
                 assert self.decode_threshold <= 16, (
                     f"decode_threshold exceeded \
                     npu_fused_infer_attention_score TND layout's limit of 16, \
@@ -298,13 +295,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Tree decode_threshold is 1+budget. A first prefill shorter than that
         # (e.g. "what is your name" with budget=4) must stay a prefill, or FIA
         # tree-decode BSND runs without page attention.
-        treat_short_as_decode = True
-        if self.tree_spec_enabled and common_attn_metadata.is_prefilling is not None:
-            treat_short_as_decode = False
+        # Draft propose does not populate is_prefilling; keep the default
+        # short-extend-as-decode path there so split does not assert.
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
-            treat_short_extends_as_decodes=treat_short_as_decode,
+            treat_short_extends_as_decodes=(
+                not self.tree_spec_enabled
+                or common_attn_metadata.is_prefilling is None
+            ),
         )
 
     def _build_backend_metadata(
@@ -361,12 +360,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal,
-                                                              self.model_config,
-                                                              common_attn_metadata.tree_num_nodes,
-                                                              common_attn_metadata.tree_visibility,
-                                                              seq_lens,
-                                                              num_decodes)
+        attn_mask = self.attn_mask_builder.get_attention_mask(
+            common_attn_metadata.causal,
+            self.model_config,
+            tree_visibility=common_attn_metadata.tree_visibility,
+            seq_lens=seq_lens,
+            num_decode=num_decodes,
+        )
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
@@ -1460,10 +1460,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
+                tree_spec = dflash_tree_spec_enabled()
                 # ChunkedPrefill mixing prefill+decode: split into a per-phase
                 # FIA call each (A5 only).
                 if (
-                    (is_950() or dflash_tree_spec_enabled())
+                    (is_950() or tree_spec)
                     and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
                     and attn_metadata.num_decodes > 0
                     and attn_metadata.num_prefills > 0
@@ -1476,7 +1477,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 # PrefillNoCache keeps 3D dense K/V; BSND 4D query then hits
                 # "value'dim should equal to query's dim".
                 if (
-                    dflash_tree_spec_enabled()
+                    tree_spec
                     and attn_metadata.num_prefills == 0
                     and attn_metadata.num_decodes > 0
                     and block_table is not None
@@ -1605,10 +1606,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         seq_lens_list = attn_metadata.seq_lens_list
         num_tokens = int(actual_seq_qlen[-1])
+        tree_spec = dflash_tree_spec_enabled()
 
         # decode part
         if num_decode_tokens > 0:
-            if dflash_tree_spec_enabled():
+            if tree_spec:
                 decode_out = self._forward_tree_decode_fia(
                     query[:num_decode_tokens],
                     key,
@@ -1656,7 +1658,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_seq_qlen = [
                 actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
             ]
-            if dflash_tree_spec_enabled():
+            if tree_spec:
                 prefill_mask = AttentionMaskBuilder(attn_metadata.attn_mask.device).get_splitfuse_attn_mask()
             else:
                 prefill_mask = attn_metadata.attn_mask

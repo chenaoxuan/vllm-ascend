@@ -67,10 +67,10 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.spec_decode import (
-    dflash_tree_decode_query_len,
     dflash_tree_spec_enabled,
     init_speculator,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
@@ -202,9 +202,7 @@ class NPUModelRunner(GPUModelRunner):
         # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
         # nodes, so the verify query is budget+1 rather than spec_depth+1.
         if dflash_tree_spec_enabled(vllm_config):
-            self.decode_query_len = dflash_tree_decode_query_len(
-                self.num_speculative_steps, vllm_config
-            )
+            self.decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
         else:
             self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
@@ -221,25 +219,16 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(self, grammar_output):
         output = super().sample_tokens(grammar_output)
 
-        if dflash_tree_spec_enabled(self.vllm_config):
-            speculative_config = self.vllm_config.speculative_config
-            if speculative_config.use_dflash():
-                input_batch = self.speculator.input_batch
-                tree = self.speculator.get_tree()
-                idx = input_batch.idx_mapping
-                self.req_states.draft_tokens[idx] = tree.tokens
-                self.req_states.tree_depths[idx] = tree.depths
-                self.req_states.tree_parents[idx] = tree.parents
-                self.req_states.tree_visibility[idx] = tree.visibility
-                self.req_states.tree_num_nodes[idx] = tree.num_nodes
-                self.req_states.tree_first_child[idx] = tree.first_child
-                self.req_states.tree_next_sibling[idx] = tree.next_sibling
-
-                if self.num_speculative_steps > 0:
-                    self.draft_tokens_handler.set_draft_tokens(
-                        input_batch,
-                        self.req_states.draft_tokens[input_batch.idx_mapping],
-                    )
+        if self.is_last_pp_rank and isinstance(self.speculator, AscendTreeSpeculator):
+            tree = self.speculator.tree
+            input_batch = self.speculator.input_batch
+            idx = input_batch.idx_mapping
+            self.req_states.tree_depths[idx] = tree.depths
+            self.req_states.tree_parents[idx] = tree.parents
+            self.req_states.tree_visibility[idx] = tree.visibility
+            self.req_states.tree_num_nodes[idx] = tree.num_nodes
+            self.req_states.tree_first_child[idx] = tree.first_child
+            self.req_states.tree_next_sibling[idx] = tree.next_sibling
 
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -654,13 +643,14 @@ class NPUModelRunner(GPUModelRunner):
                     self.req_states.prefill_len.gpu,
                     self.req_states.num_computed_tokens.gpu,
                 )
-            if dflash_tree_spec_enabled(self.vllm_config):
+            tree_depths = getattr(self.req_states, "tree_depths", None)
+            if tree_depths is not None:
                 prepare_tree_spec_pos_seq_lens(
                     idx_mapping,
                     query_start_loc,
                     is_prefilling,
                     self.req_states.num_computed_tokens.gpu,
-                    self.req_states.tree_depths,
+                    tree_depths,
                     self.input_buffers.positions,
                     self.input_buffers.slot_positions,
                     self.input_buffers.seq_lens,
@@ -674,7 +664,6 @@ class NPUModelRunner(GPUModelRunner):
                     self.input_buffers.positions,
                     self.input_buffers.seq_lens,
                 )
-            # print(f"============={self.input_buffers.positions[:self.input_buffers.query_start_loc[num_reqs_padded]]}\n{self.req_states.tree_depths[idx_mapping]=}")
 
             seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -754,11 +743,11 @@ class NPUModelRunner(GPUModelRunner):
                 seq_lens_np=self.input_buffers.seq_lens_np,
                 attn_state=attn_state,
             )
-            if dflash_tree_spec_enabled(self.vllm_config):
+            if tree_depths is not None:
                 input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
                 input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
                 input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
-                input_batch.tree_depths = self.req_states.tree_depths[idx_mapping]
+                input_batch.tree_depths = tree_depths[idx_mapping]
                 input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
                 input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
                 input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
@@ -903,12 +892,11 @@ class NPUModelRunner(GPUModelRunner):
         npu attention backends need seq_lens_cpu to work.
         so we need to copy num_computed_tokens back to cpu here.
         """
-        if dflash_tree_spec_enabled(self.vllm_config):
-            sampler = getattr(self, "rejection_sampler", None)
-            path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
-            if path_node_ids is not None:
-                self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
-                sampler.path_node_ids = None
+        sampler = getattr(self, "rejection_sampler", None)
+        path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+        if path_node_ids is not None:
+            self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
+            sampler.path_node_ids = None
 
         super().postprocess_sampled(
             idx_mapping,
@@ -925,8 +913,6 @@ class NPUModelRunner(GPUModelRunner):
 
     def _compact_accepted_tree_kv(self, idx_mapping, path_node_ids):
         """Copy accepted-path KV from tree slots onto the linear prefix."""
-        if not hasattr(self, "kv_cache_config"):
-            return
         ctx = self.compilation_config.static_forward_context
         num_computed = self.req_states.num_computed_tokens.gpu
         seen: set[int] = set()
@@ -1032,6 +1018,7 @@ class NPUModelRunner(GPUModelRunner):
             num_reqs_padded = num_reqs_padded + 1
 
         return query_start_loc_np, num_reqs_padded
+
 
 @contextmanager
 def graph_manager_wrapper(model_runner):

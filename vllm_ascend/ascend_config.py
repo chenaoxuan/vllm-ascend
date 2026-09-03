@@ -861,16 +861,16 @@ class TreeSpecConfig:
     """DFlash draft-tree construction from ``additional_config.tree_spec_config``.
 
     When ``enabled`` is true, the v2 DFlash speculator expands shared depth
-    logits into a draft tree instead of a single linear draft chain. Target
-    tree verify is a follow-up; this flag only selects the tree speculator.
+    logits into a draft tree instead of a single linear draft chain, and
+    ``budget`` / ``topk`` are required. Target verify walks the tree with
+    greedy token-id matching.
 
     ``budget`` is the per-request node budget excluding the already-accepted
-    root. ``None`` uses ``num_speculative_tokens``. When set, it must be
-    >= ``num_speculative_tokens``.
+    root; it must be >= ``num_speculative_tokens``.
 
     ``topk`` is the per-depth candidate count: how many logits are kept at each
     mask position before best-first expansion. It is independent of
-    ``budget``. ``None`` keeps the full vocabulary (clamped at runtime).
+    ``budget``.
 
     Usage::
 
@@ -892,6 +892,10 @@ class TreeSpecConfig:
 
     @model_validator(mode="after")
     def _validate(self):
+        if self.enabled and (self.budget is None or self.topk is None):
+            raise ValueError(
+                "tree_spec_config.budget and tree_spec_config.topk are required when enabled"
+            )
         if self.budget is not None and self.budget < 0:
             raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
         if self.topk is not None and self.topk < 1:

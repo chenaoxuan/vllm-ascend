@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 from typing import Any
 
@@ -27,8 +25,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     replaces per-position single-token sampling.
 
     ``propose()`` still returns flattened non-root tokens so the existing
-    runner call stays valid. The tree itself is ``TreeLayout``; read it with
-    ``get_tree()`` after ``propose()`` / ``_generate_draft()``.
+    runner call stays valid. The tree itself is ``self.tree`` after
+    ``propose()`` / ``_generate_draft()``.
     """
 
     _speculator_name = "DFlashTree"
@@ -42,16 +40,13 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             )
 
         tree_cfg = get_ascend_config().tree_spec_config
-        if tree_cfg.budget is None:
-            self.budget = self.num_speculative_steps
-        else:
-            self.budget = tree_cfg.budget
+        self.budget = tree_cfg.budget
+        self.topk = tree_cfg.topk
         if self.budget < self.num_speculative_steps:
             raise ValueError(
                 "tree_spec_config.budget must be >= num_speculative_tokens "
                 f"({self.num_speculative_steps}), got {self.budget}"
             )
-        self.topk = tree_cfg.topk
         if self.budget > self.draft_tokens.shape[1]:
             self.draft_tokens = torch.zeros(
                 self.max_num_reqs,
@@ -93,10 +88,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             dtype=torch.int32,
             device=device,
         )
-        self.tree: TreeLayout | None = None
+        self.tree = self._load_layout_from_buffers(self.max_num_reqs)
         logger.info(
-            "DFlash tree speculator enabled: budget=%s topk=%s depth=%s "
-            "(target verify uses greedy_tree_reject)",
+            "DFlash tree speculator enabled: budget=%s topk=%s depth=%s",
             self.budget,
             self.topk,
             self.num_speculative_steps,
@@ -109,12 +103,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 "disabling full ACL graphs for the draft query."
             )
         super().init_cudagraph_manager(CUDAGraphMode.NONE)
-
-    def get_tree(self) -> TreeLayout:
-        """Return the last draft tree built by ``propose`` / ``_generate_draft``."""
-        if self.tree is None:
-            raise RuntimeError("Draft tree has not been built yet.")
-        return self.tree
 
     def propose(
         self,
@@ -173,7 +161,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    ) -> TreeLayout:
+    ) -> None:
         # [all_tokens, dim] all_tokens include the anchor token
         last_hidden_states = self._run_model(
             num_tokens_padded,
@@ -188,22 +176,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         logits = self.model.compute_logits(sample_hidden_states)
         # [bs, spec_num, vocab_size]
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
-        vocab_size = logits.shape[-1]
-        topk = vocab_size if self.topk is None else self.topk
-        self._reset_tree_buffers(num_reqs)
         layout = self._load_layout_from_buffers(num_reqs)
-        build_trees(logits, self.budget, topk, layout)
+        build_trees(logits, self.budget, self.topk, layout)
         self.tree = layout
-        return self.tree
-
-    def _reset_tree_buffers(self, num_reqs: int) -> None:
-        self.draft_tokens[:num_reqs].fill_(-1)
-        self.tree_parents[:num_reqs].fill_(-1)
-        self.tree_depths[:num_reqs].zero_()
-        self.tree_num_nodes[:num_reqs].zero_()
-        self.tree_visibility[:num_reqs].zero_()
-        self.tree_first_child[:num_reqs].fill_(-1)
-        self.tree_next_sibling[:num_reqs].fill_(-1)
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

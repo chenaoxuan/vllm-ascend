@@ -244,9 +244,8 @@ def _prepare_tree_spec_pos_seq_lens_torch(
             pos[start:end] = linear
             continue
         pos[start] = computed
-        if query_len > 1:
-            depths = tree_depths[req_state_idx, : query_len - 1].to(dtype=pos.dtype)
-            pos[start + 1 : end] = computed + depths
+        depths = tree_depths[req_state_idx, : query_len - 1].to(dtype=pos.dtype)
+        pos[start + 1 : end] = computed + depths
 
 
 def prepare_tree_spec_pos_seq_lens(

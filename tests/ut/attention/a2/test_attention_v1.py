@@ -314,39 +314,6 @@ def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
     assert builder._split_decodes_and_prefills(common_metadata) == (0, 2, 0, 5)
 
 
-def test_tree_builder_keeps_short_prefill_out_of_decode() -> None:
-    """budget+1 decode_threshold must not classify a first short prefill as decode."""
-    builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
-    builder.decode_threshold = 5
-    builder.tree_spec_enabled = True
-    common_metadata = SimpleNamespace(
-        context_parallel_metadata=None,
-        max_query_len=4,
-        num_reqs=1,
-        num_actual_tokens=4,
-        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
-        is_prefilling=torch.tensor([True], dtype=torch.bool),
-    )
-
-    assert builder._split_decodes_and_prefills(common_metadata) == (0, 1, 0, 4)
-
-
-def test_tree_builder_packed_verify_stays_decode() -> None:
-    builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
-    builder.decode_threshold = 5
-    builder.tree_spec_enabled = True
-    common_metadata = SimpleNamespace(
-        context_parallel_metadata=None,
-        max_query_len=5,
-        num_reqs=1,
-        num_actual_tokens=5,
-        query_start_loc_cpu=torch.tensor([0, 5], dtype=torch.int32),
-        is_prefilling=torch.tensor([False], dtype=torch.bool),
-    )
-
-    assert builder._split_decodes_and_prefills(common_metadata) == (1, 0, 5, 0)
-
-
 class TestAscendAttentionBackendImpl(TestBase):
     def setUp(self):
         self.mock_event = MagicMock()
@@ -527,35 +494,6 @@ class TestAscendAttentionBackendImpl(TestBase):
 
         mock_forward.assert_not_called()
         self.impl.forward_fused_infer_attention.assert_called_once()
-        self.assertIs(result, output)
-
-    @patch("vllm_ascend.attention.attention_v1.dflash_tree_spec_enabled", return_value=True)
-    @patch("vllm_ascend.attention.attention_v1.DeviceOperator.npu_fused_infer_attention_score")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    def test_tree_prefill_without_block_table_keeps_tnd(self, mock_get_forward_context, mock_fia, _tree):
-        query = torch.randn(4, 8, 64)
-        key = torch.randn(4, 8, 64)
-        value = torch.randn(4, 8, 64)
-        output = torch.empty_like(query)
-        metadata = self.attn_metadata
-        metadata.attn_state = AscendAttentionState.PrefillNoCache
-        metadata.causal = True
-        metadata.attn_mask = torch.ones(1, 1, 5, 128, dtype=torch.bool)
-        metadata.actual_seq_lengths_q = [4]
-        metadata.seq_lens_list = [4]
-        metadata.num_prefills = 0
-        metadata.num_decodes = 1
-        metadata.num_decode_tokens = 4
-        metadata.block_tables = None
-        mock_get_forward_context.return_value = SimpleNamespace(capturing=False, additional_kwargs={})
-        mock_fia.return_value = (torch.ones(4, 8, 64), None)
-
-        result = self.impl.forward_fused_infer_attention(query, key, value, metadata, output)
-
-        mock_fia.assert_called_once()
-        call_kwargs = mock_fia.call_args.kwargs
-        self.assertEqual(call_kwargs["query"].dim(), 3)
-        self.assertEqual(call_kwargs["input_layout"], "TND")
         self.assertIs(result, output)
 
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention", return_value=True)

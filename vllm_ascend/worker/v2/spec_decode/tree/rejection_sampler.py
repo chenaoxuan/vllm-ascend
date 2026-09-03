@@ -1,5 +1,3 @@
-from typing import Any
-
 import numpy as np
 import torch
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -20,8 +18,9 @@ def greedy_tree_reject(
 ) -> torch.Tensor:
     """Greedy-verify a draft tree by token-id comparison on device.
 
-    ``target_logits`` is ``[batch_size, budget + 1, vocab_size]``, indexed by
-    node id (column 0 is the already-accepted root).
+    Walks ``tokens`` / ``first_child`` / ``next_sibling``. ``target_logits``
+    is ``[batch_size, budget + 1, vocab_size]``, indexed by node id (column 0
+    is the already-accepted root).
 
     Returns ``[num_reqs, spec_len + 1]`` accepted token ids including bonus.
     Unused slots are ``-1``. When ``path_node_ids`` is set it is filled with
@@ -52,7 +51,7 @@ def greedy_tree_reject(
         path_out.fill_(-1)
     neg_one = torch.tensor(-1, dtype=torch.long, device=device)
 
-    for req_idx in range(num_reqs):  # tl.program_id(0)
+    for req_idx in range(num_reqs):
         current = torch.zeros((), dtype=torch.long, device=device)
         alive = torch.ones((), dtype=torch.bool, device=device)
         for n_out in range(spec_len):
@@ -87,24 +86,6 @@ def greedy_tree_reject(
     return sampled_token_ids
 
 
-def _tree_from_input_batch(input_batch: Any) -> TreeLayout | None:
-    """Build a ``TreeLayout`` view from batch-ordered tree fields."""
-    tokens = getattr(input_batch, "tree_tokens", None)
-    first_child = getattr(input_batch, "tree_first_child", None)
-    next_sibling = getattr(input_batch, "tree_next_sibling", None)
-    if tokens is None or first_child is None or next_sibling is None:
-        return None
-    return TreeLayout(
-        tokens=tokens,
-        depths=input_batch.tree_depths,
-        parents=input_batch.tree_parents,
-        num_nodes=input_batch.tree_num_nodes,
-        visibility=input_batch.tree_visibility,
-        first_child=first_child,
-        next_sibling=next_sibling,
-    )
-
-
 def _pack_tree_target_logits(
     logits: torch.Tensor,
     cu_num_logits_np: np.ndarray,
@@ -119,8 +100,6 @@ def _pack_tree_target_logits(
     """
     vocab = logits.shape[-1]
     out = logits.new_full((num_reqs, node_dim, vocab), float("-inf"))
-    if num_reqs == 0:
-        return out
     # Host prefix-sum of per-request logit counts. Equal counts that merely
     # *sum* to ``R * node_dim`` (e.g. 8+10) are not a rectangular ``[R, D, V]``.
     counts = np.diff(np.asarray(cu_num_logits_np[: num_reqs + 1], dtype=np.int64))
@@ -130,32 +109,16 @@ def _pack_tree_target_logits(
         start = int(cu_num_logits_np[i])
         end = int(cu_num_logits_np[i + 1])
         n = min(end - start, node_dim)
-        if n > 0:
-            out[i, :n] = logits[start : start + n]
+        out[i, :n] = logits[start : start + n]
     return out
 
 
-def _num_sampled_and_rejected(
-    sampled: torch.Tensor,
-    input_batch: InputBatch,
-    prefill_len: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Count accepted path tokens and the unused forwarded tree slots."""
-    num_reqs = input_batch.num_reqs
-    num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
-    cu = input_batch.cu_num_logits[: num_reqs + 1]
-    num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
-    seq_lens = input_batch.seq_lens[:num_reqs]
-    idx_mapping = input_batch.idx_mapping[:num_reqs]
-    is_chunked = seq_lens < prefill_len[idx_mapping]
-    zero = num_sampled.new_zeros(())
-    num_sampled = torch.where(is_chunked, zero, num_sampled)
-    num_rejected = torch.where(is_chunked, zero, num_logits - num_sampled)
-    return num_sampled, num_rejected
-
-
 class TreeRejectionSampler(RejectionSampler):
-    """v2 rejection sampler that greedy-verifies a DFlash draft tree."""
+    """v2 rejection sampler that greedy-verifies a DFlash draft tree.
+
+    ``block_tree_reject`` is implemented for a later switch; this class still
+    calls ``greedy_tree_reject``.
+    """
 
     path_node_ids: torch.Tensor | None = None
 
@@ -165,11 +128,15 @@ class TreeRejectionSampler(RejectionSampler):
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
     ) -> SamplerOutput:
-        tree = _tree_from_input_batch(input_batch)
-        if tree is None:
-            self.path_node_ids = None
-            input_batch.path_node_ids = None
-            return super().__call__(logits, input_batch, draft_logits)
+        tree = TreeLayout(
+            tokens=input_batch.tree_tokens,
+            depths=input_batch.tree_depths,
+            parents=input_batch.tree_parents,
+            num_nodes=input_batch.tree_num_nodes,
+            visibility=input_batch.tree_visibility,
+            first_child=input_batch.tree_first_child,
+            next_sibling=input_batch.tree_next_sibling,
+        )
 
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         node_dim = tree.tokens.shape[1] + 1
@@ -191,17 +158,24 @@ class TreeRejectionSampler(RejectionSampler):
             self.num_speculative_steps,
             path_node_ids=path_node_ids,
         )
-        self.path_node_ids = path_node_ids
-        num_sampled, num_rejected = _num_sampled_and_rejected(
-            sampled,
-            input_batch,
-            self.sampler.req_states.prefill_len.gpu,
+        num_reqs = input_batch.num_reqs
+        num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
+        cu = input_batch.cu_num_logits[: num_reqs + 1]
+        num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
+        is_chunked = (
+            input_batch.seq_lens[:num_reqs]
+            < self.sampler.req_states.prefill_len.gpu[input_batch.idx_mapping[:num_reqs]]
         )
+        zero = num_sampled.new_zeros(())
+        num_sampled = torch.where(is_chunked, zero, num_sampled)
+        num_rejected = torch.where(is_chunked, zero, num_logits - num_sampled)
         # Chunked prefills zero num_sampled; keep those path rows at -1 so
-        # propose() does not scramble linear prefill hidden_states.
-        input_batch.path_node_ids = path_node_ids.masked_fill(
+        # KV compact / propose() do not scramble linear prefill state.
+        path_node_ids = path_node_ids.masked_fill(
             (num_sampled == 0).unsqueeze(1), -1
         )
+        self.path_node_ids = path_node_ids
+        input_batch.path_node_ids = path_node_ids
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=None,
@@ -364,6 +338,7 @@ def block_tree_reject(
 ) -> torch.Tensor:
     """MagicMTP Block Verify on a draft tree, from leaf to root.
 
+    Not yet selected by ``TreeRejectionSampler``; greedy is the live path.
     ``target_logits`` is ``[num_reqs, budget + 1, vocab]``, node 0 = root.
     ``draft_logits`` is ``[num_reqs, spec_num, vocab]`` (DFlash depth rows) or
     ``None`` (q=1, one-hot residual). No temperature / top-k / top-p.

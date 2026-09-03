@@ -16,7 +16,6 @@ import torch
 
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
-from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -59,7 +58,6 @@ class AttentionMaskBuilder:
 
     def get_attention_mask(self, causal: bool,
                            model_config: ModelConfig,
-                           tree_num_nodes: torch.Tensor | None = None,
                            tree_visibility: torch.Tensor | None = None,
                            seq_lens: torch.Tensor | None = None,
                            num_decode: int = 0
@@ -73,16 +71,15 @@ class AttentionMaskBuilder:
             # non-masking mask instead.
             return None
 
-        if dflash_tree_spec_enabled() and num_decode > 0:
-            return self.get_tree_attention_mask(tree_num_nodes, tree_visibility, seq_lens, num_decode)
+        if tree_visibility is not None and num_decode > 0:
+            return self.get_tree_attention_mask(tree_visibility, seq_lens, num_decode)
 
         if model_config.runner_type == "pooling":
             return self.get_attn_mask(2048, torch.bool)
 
         return self.get_splitfuse_attn_mask()
     
-    def get_tree_attention_mask(self, tree_num_nodes: torch.Tensor,
-                                tree_visibility: torch.Tensor,
+    def get_tree_attention_mask(self, tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
                                 num_decode):
         max_nodes = tree_visibility.shape[-1]
@@ -97,7 +94,7 @@ class AttentionMaskBuilder:
         )
         for i in range(num_mask):
             req_mask = attn_mask[i, 0]
-            prev_kv_len = max(int(seq_lens[i]) - query_len, 0)
+            prev_kv_len = int(seq_lens[i]) - query_len
             req_mask[:, : prev_kv_len + 1] = False
             # tree_visibility: True = can attend; FIA bool mask: True = masked out.
             # Draft columns are slot-indexed (contiguous j). KV slot_mapping uses

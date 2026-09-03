@@ -258,13 +258,13 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "budget": 8},
+            "tree_spec_config": {"enabled": True, "budget": 8, "topk": 4},
             "refresh": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertTrue(ascend_config.tree_spec_config.enabled)
         self.assertEqual(ascend_config.tree_spec_config.budget, 8)
-        self.assertIsNone(ascend_config.tree_spec_config.topk)
+        self.assertEqual(ascend_config.tree_spec_config.topk, 4)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

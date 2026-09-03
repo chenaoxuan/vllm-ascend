@@ -1,11 +1,13 @@
 """CPU unit tests for DFlash draft-tree construction."""
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.config.compilation import CUDAGraphMode
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_decode_query_len
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_kv_along_path
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.utils import (
@@ -235,4 +237,30 @@ def test_tree_kv_slot_layout_and_compact() -> None:
     )
     assert cache[0, 11].tolist() == before[0, 12].tolist()
     assert cache[0, 12].tolist() == before[0, 13].tolist()
+
+
+def test_tree_decode_query_len_uses_budget_not_spec_depth() -> None:
+    """budget=12 verify is 13 tokens; spec+1=9 would classify it as prefill."""
+    spec, budget = 8, 12
+    tree_cfg = SimpleNamespace(enabled=True, budget=budget)
+    with patch(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        return_value=SimpleNamespace(tree_spec_config=tree_cfg),
+    ):
+        assert dflash_tree_decode_query_len(spec) == 1 + budget
+        assert dflash_tree_decode_query_len(spec) > 1 + spec
+
+    chain_cfg = SimpleNamespace(enabled=True, budget=None)
+    with patch(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        return_value=SimpleNamespace(tree_spec_config=chain_cfg),
+    ):
+        assert dflash_tree_decode_query_len(spec) == 1 + spec
+
+    off_cfg = SimpleNamespace(enabled=False, budget=budget)
+    with patch(
+        "vllm_ascend.ascend_config.get_ascend_config",
+        return_value=SimpleNamespace(tree_spec_config=off_cfg),
+    ):
+        assert dflash_tree_decode_query_len(spec) == 1 + spec
 

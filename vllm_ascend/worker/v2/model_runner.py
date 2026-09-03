@@ -69,7 +69,11 @@ from vllm_ascend.worker.v2.pp_utils import (
     resolve_spec_pp_support,
     restore_pp_after_upstream_init,
 )
-from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled, init_speculator
+from vllm_ascend.worker.v2.spec_decode import (
+    dflash_tree_decode_query_len,
+    dflash_tree_spec_enabled,
+    init_speculator,
+)
 from vllm_ascend.worker.v2.sp_utils import (
     _all_gather_hidden_states_and_aux,
     _flashcomm_enabled,
@@ -190,8 +194,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm.
-        self.decode_query_len = self.num_speculative_steps + 1
+        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
+        # nodes, so the verify query is budget+1 rather than spec_depth+1.
+        if dflash_tree_spec_enabled(vllm_config):
+            self.decode_query_len = dflash_tree_decode_query_len(
+                self.num_speculative_steps, vllm_config
+            )
+        else:
+            self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)

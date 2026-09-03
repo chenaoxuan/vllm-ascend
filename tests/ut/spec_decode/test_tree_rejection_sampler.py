@@ -75,6 +75,42 @@ def test_greedy_tree_reject_batch_mixed_trees() -> None:
     ]
 
 
+def test_greedy_tree_reject_follows_rank0_spine_past_siblings() -> None:
+    """Full rank-0 spine plus later siblings: target still takes the spine.
+
+    Build order matches ``_expand_one_tree``: plant 0→1→2 first, then prepend
+    a sibling at each parent so ``first_child`` is the fork. Target argmax
+    along the spine equals the next rank-0 token, so sibling hops must not
+    steal the path.
+    """
+    budget = 6
+    spec_len = 3
+    vocab_size = 10
+    tree = empty_tree_layout(1, budget, device="cpu")
+    # nodes 1-3: rank-0 spine tokens 0,1,2; nodes 4-6: siblings 8,7,6.
+    tree.tokens[0, :6] = torch.tensor([0, 1, 2, 8, 7, 6])
+    tree.parents[0, :6] = torch.tensor([0, 1, 2, 0, 1, 2])
+    tree.depths[0, :6] = torch.tensor([1, 2, 3, 1, 2, 3])
+    tree.num_nodes[0] = 6
+    tree.first_child[0, 0] = 4
+    tree.next_sibling[0, 4] = 1
+    tree.first_child[0, 1] = 5
+    tree.next_sibling[0, 5] = 2
+    tree.first_child[0, 2] = 6
+    tree.next_sibling[0, 6] = 3
+
+    target_ids = torch.zeros(1, budget + 1, dtype=torch.long)
+    # Columns are node ids. Spine 0→1→2 then bonus 9; sibling columns are
+    # decoys that a first-child-only walk would follow.
+    target_ids[0, :7] = torch.tensor([0, 1, 2, 9, 4, 5, 6])
+    target_logits = _logits_from_greedy_ids(target_ids, vocab_size)
+
+    path = torch.full((1, spec_len), -1, dtype=torch.long)
+    sampled = greedy_tree_reject(tree, target_logits, spec_len, path_node_ids=path)
+    assert sampled.tolist() == [[0, 1, 2, 9]]
+    assert path.tolist() == [[1, 2, 3]]
+
+
 def test_greedy_tree_reject_budget_one_empty_and_draft() -> None:
     """budget=1 used to IndexError when first_child is -1 (child-1 == -2)."""
     budget = 1

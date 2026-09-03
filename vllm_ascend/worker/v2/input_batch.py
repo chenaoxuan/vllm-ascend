@@ -63,6 +63,14 @@ class AscendInputBuffers(InputBuffers):
         # define seq_lens_np for easier calculation with numpy.
         self.seq_lens_np: np.ndarray = self.seq_lens_cpu.numpy()
 
+        # Logical KV coordinates for tree spec. RoPE keeps ``positions``
+        # (depth-based); slot mapping uses this unique-per-token layout.
+        self.slot_positions: torch.Tensor = torch.zeros(
+            max_num_tokens,
+            dtype=self.positions.dtype,
+            device=device,
+        )
+
 
 @dataclass
 class AscendInputBatch(InputBatch):
@@ -83,6 +91,7 @@ class AscendInputBatch(InputBatch):
         tree_parents: torch.Tensor | None = None
         tree_first_child: torch.Tensor | None = None
         tree_next_sibling: torch.Tensor | None = None
+        slot_positions: torch.Tensor | None = None
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
@@ -152,6 +161,7 @@ class AscendInputBatch(InputBatch):
 @triton.jit
 def _prepare_tree_spec_pos_seq_lens_kernel(
     pos_ptr,
+    slot_pos_ptr,
     seq_lens_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
@@ -187,20 +197,57 @@ def _prepare_tree_spec_pos_seq_lens_kernel(
         for i in tl.range(0, query_len, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < query_len
-            pos = num_computed_tokens + block
-            tl.store(pos_ptr + start + block, pos, mask=mask)
+            linear = num_computed_tokens + block
+            tl.store(pos_ptr + start + block, linear, mask=mask)
+            tl.store(slot_pos_ptr + start + block, linear, mask=mask)
         return
 
-    # Root at num_computed; drafts use tree depth for RoPE (siblings may share pos).
-    # TODO(check): double-check KV slot_mapping gives each draft token a unique
-    # slot; tree attn mask columns are slot-ordered, not position-ordered.
+    # RoPE: root at num_computed; drafts use tree depth (siblings may share).
+    # KV slots: unique token index so reshape_and_cache does not collide.
     tl.store(pos_ptr + start, num_computed_tokens)
+    tl.store(slot_pos_ptr + start, num_computed_tokens)
     for i in tl.range(1, query_len, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < query_len
         depth = tl.load(tree_depths_ptr + req_state_idx * tree_depths_stride + block - 1, mask=mask)
-        pos = depth + num_computed_tokens
-        tl.store(pos_ptr + start + block, pos, mask=mask)
+        rope_pos = depth + num_computed_tokens
+        slot_pos = num_computed_tokens + block
+        tl.store(pos_ptr + start + block, rope_pos, mask=mask)
+        tl.store(slot_pos_ptr + start + block, slot_pos, mask=mask)
+
+
+def _prepare_tree_spec_pos_seq_lens_torch(
+    idx_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    is_prefilling: torch.Tensor,
+    num_computed_tokens: torch.Tensor,
+    tree_depths: torch.Tensor,
+    pos: torch.Tensor,
+    slot_pos: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    """CPU reference of the tree RoPE / KV-slot fill. Host ints only."""
+    num_reqs = idx_mapping.shape[0]
+    seq_lens[num_reqs:].zero_()
+    device = pos.device
+    for req_id in range(num_reqs):
+        req_state_idx = int(idx_mapping[req_id])
+        computed = int(num_computed_tokens[req_state_idx])
+        start = int(query_start_loc[req_id])
+        end = int(query_start_loc[req_id + 1])
+        query_len = end - start
+        seq_lens[req_id] = computed + query_len
+        offsets = torch.arange(query_len, device=device, dtype=pos.dtype)
+        linear = computed + offsets
+        slot_pos[start:end] = linear
+        if int(is_prefilling[req_id]) == 1:
+            pos[start:end] = linear
+            continue
+        pos[start] = computed
+        if query_len > 1:
+            depths = tree_depths[req_state_idx, : query_len - 1].to(dtype=pos.dtype)
+            pos[start + 1 : end] = computed + depths
+
 
 def prepare_tree_spec_pos_seq_lens(
     idx_mapping: torch.Tensor,
@@ -209,11 +256,26 @@ def prepare_tree_spec_pos_seq_lens(
     num_computed_tokens: torch.Tensor,
     tree_depths: torch.Tensor,
     pos: torch.Tensor,
+    slot_pos: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> None:
+    """Fill RoPE ``pos`` and unique KV ``slot_pos``. Device tensors except CPU UT."""
     num_reqs = idx_mapping.shape[0]
+    if pos.device.type == "cpu":
+        _prepare_tree_spec_pos_seq_lens_torch(
+            idx_mapping,
+            query_start_loc,
+            is_prefilling,
+            num_computed_tokens,
+            tree_depths,
+            pos,
+            slot_pos,
+            seq_lens,
+        )
+        return
     _prepare_tree_spec_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
+        slot_pos,
         seq_lens,
         idx_mapping,
         query_start_loc,

@@ -66,6 +66,14 @@ def test_greedy_tree_reject_batch_mixed_trees() -> None:
         [9, -1, -1, -1],
     ]
 
+    path = torch.full((3, spec_len), -1, dtype=torch.long)
+    greedy_tree_reject(tree, target_logits, spec_len, path_node_ids=path)
+    assert path.tolist() == [
+        [1, 2, 3],
+        [2, -1, -1],
+        [-1, -1, -1],
+    ]
+
 
 def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
     budget = 8
@@ -130,6 +138,11 @@ def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
     ]
     assert output.num_sampled.tolist() == [4, 2, 1]
     assert output.num_rejected.tolist() == [5, 7, 8]
+    assert rejection_sampler.path_node_ids.tolist() == [
+        [1, 2, 3],
+        [2, -1, -1],
+        [-1, -1, -1],
+    ]
 
 
 def test_block_tree_reject_paper_path() -> None:

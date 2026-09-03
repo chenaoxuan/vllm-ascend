@@ -102,8 +102,7 @@ class AttentionMaskBuilder:
 
             req_mask[:, :prev_kv_len + 1] = False
             # tree_visibility: True = can attend; FIA bool mask: True = masked out.
-            # Draft columns are slot-indexed (contiguous j), matching visibility.
-            # TODO(check): double-check that KV slot_mapping is also per-slot
-            # unique when siblings share the same RoPE depth (positions use depth).
+            # Draft columns are slot-indexed (contiguous j). KV slot_mapping uses
+            # unique token-index coordinates while RoPE positions stay depth-based.
             req_mask[1:, prev_kv_len + 1 : prev_kv_len + 1 + max_nodes] = ~tree_visibility[i]
         return attn_mask

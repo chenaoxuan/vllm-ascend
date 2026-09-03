@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch
 
 from tests.ut.base import TestBase
@@ -67,3 +70,19 @@ class TestAttentionMaskBuilder(TestBase):
         self.assertTrue(bool(mask[1, 0, 1, 19]))
         self.assertTrue(bool(mask[1, 0, 2, 18]))
         self.assertFalse(bool(mask[1, 0, 2, 19]))
+
+    @patch("vllm_ascend.attention.attention_mask.dflash_tree_spec_enabled", return_value=True)
+    def test_tree_attention_mask_requires_decode_classification(self, _mock):
+        """num_decode=0 (budget query misclassified as prefill) drops the tree mask."""
+        builder = AttentionMaskBuilder(torch.device("cpu"))
+        visibility = torch.eye(2, dtype=torch.bool).unsqueeze(0)
+        seq_lens = torch.tensor([10], dtype=torch.int32)
+        model_config = SimpleNamespace(runner_type="generate")
+        prefill = builder.get_attention_mask(
+            True, model_config, None, visibility, seq_lens, num_decode=0
+        )
+        decode = builder.get_attention_mask(
+            True, model_config, None, visibility, seq_lens, num_decode=1
+        )
+        self.assertEqual(prefill.shape, (2048, 2048))
+        self.assertEqual(decode.shape, (1, 1, 3, 128))

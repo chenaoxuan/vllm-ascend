@@ -1374,6 +1374,17 @@ def _get_default_max_cudagraph_capture_size(vllm_config: VllmConfig) -> int | No
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config and speculative_config.num_speculative_tokens:
         decode_query_len += speculative_config.num_speculative_tokens
+        try:
+            tree_cfg = get_ascend_config().tree_spec_config
+            if tree_cfg.enabled:
+                budget = (
+                    tree_cfg.budget
+                    if tree_cfg.budget is not None
+                    else speculative_config.num_speculative_tokens
+                )
+                decode_query_len = 1 + budget
+        except RuntimeError:
+            pass
 
     return min(max_num_seqs * decode_query_len, 512)
 

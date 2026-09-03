@@ -66,7 +66,11 @@ from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
-from vllm_ascend.worker.v2.spec_decode import init_speculator, dflash_tree_spec_enabled
+from vllm_ascend.worker.v2.spec_decode import (
+    dflash_tree_decode_query_len,
+    dflash_tree_spec_enabled,
+    init_speculator,
+)
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
@@ -195,8 +199,14 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm.
-        self.decode_query_len = self.num_speculative_steps + 1
+        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
+        # nodes, so the verify query is budget+1 rather than spec_depth+1.
+        if dflash_tree_spec_enabled(vllm_config):
+            self.decode_query_len = dflash_tree_decode_query_len(
+                self.num_speculative_steps, vllm_config
+            )
+        else:
+            self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)

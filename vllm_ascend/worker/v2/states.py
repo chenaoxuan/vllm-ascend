@@ -19,7 +19,7 @@
 
 import torch
 from vllm.v1.worker.gpu.states import RequestState
-from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled, tree_spec_budget
 
 
 class AscendRequestState(RequestState):
@@ -54,9 +54,9 @@ class AscendRequestState(RequestState):
         )
 
         if dflash_tree_spec_enabled():
-            from vllm_ascend.ascend_config import get_ascend_config
-
-            max_nodes = get_ascend_config().tree_spec_config.budget
+            max_nodes = tree_spec_budget(num_speculative_steps)
+            if max_nodes is None:
+                max_nodes = num_speculative_steps
             self.draft_tokens: torch.Tensor = torch.zeros(
                 self.max_num_reqs,
                 max_nodes,

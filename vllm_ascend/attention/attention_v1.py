@@ -63,7 +63,10 @@ from vllm_ascend.compilation.acl_graph import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import is_950, vllm_version_is, weak_ref_tensors
-from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+from vllm_ascend.worker.v2.spec_decode import (
+    dflash_tree_decode_query_len,
+    dflash_tree_spec_enabled,
+)
 
 if vllm_version_is("0.27.1"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -257,12 +260,17 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self.decode_threshold = 1
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
-                f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
-                got {self.decode_threshold}"
-            )
+            tree_enabled = dflash_tree_spec_enabled()
+            if tree_enabled:
+                # Packed tree verify is budget+1, not spec_depth+1.
+                self.decode_threshold = dflash_tree_decode_query_len(spec_token_num)
+            else:
+                self.decode_threshold += spec_token_num
+                assert self.decode_threshold <= 16, (
+                    f"decode_threshold exceeded \
+                    npu_fused_infer_attention_score TND layout's limit of 16, \
+                    got {self.decode_threshold}"
+                )
 
         self.reorder_batch_threshold = self.decode_threshold
 

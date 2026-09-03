@@ -75,6 +75,10 @@ from vllm_ascend.worker.v2.sp_utils import (
     _flashcomm_enabled,
 )
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+    compact_tree_kv_along_path,
+    iter_unique_kv_cache_tensors,
+)
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -464,6 +468,7 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
                 self.req_states.tree_depths,
                 self.input_buffers.positions,
+                self.input_buffers.slot_positions,
                 self.input_buffers.seq_lens,
             )
         else:
@@ -575,6 +580,7 @@ class NPUModelRunner(GPUModelRunner):
             input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
             input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
             input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+            input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
@@ -609,6 +615,25 @@ class NPUModelRunner(GPUModelRunner):
             for block_table in block_tables:
                 state_slots = torch.arange(1, block_table.shape[0] + 1, dtype=torch.int32, device=block_table.device)
                 block_table[:, 0].copy_(state_slots)
+        return block_tables, slot_mappings
+
+    def prepare_attn(self, input_batch):
+        """Use unique slot_positions for tree spec KV mapping; RoPE stays on positions."""
+        if self.pcp_manager is not None:
+            return self.pcp_manager.prepare_attn(input_batch)
+
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        slot_pos = getattr(input_batch, "slot_positions", None)
+        positions = slot_pos if slot_pos is not None else input_batch.positions
+        slot_mappings = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
         return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
@@ -724,6 +749,13 @@ class NPUModelRunner(GPUModelRunner):
         npu attention backends need seq_lens_cpu to work.
         so we need to copy num_computed_tokens back to cpu here.
         """
+        if dflash_tree_spec_enabled(self.vllm_config):
+            sampler = getattr(self, "rejection_sampler", None)
+            path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+            if path_node_ids is not None:
+                self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
+                sampler.path_node_ids = None
+
         super().postprocess_sampled(
             idx_mapping,
             sampled_tokens,
@@ -735,6 +767,36 @@ class NPUModelRunner(GPUModelRunner):
         # Without MTP, update_requests writes the shared NumPy/torch CPU state.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()
+
+    def _compact_accepted_tree_kv(self, idx_mapping, path_node_ids):
+        """Copy accepted-path KV from tree slots onto the linear prefix."""
+        if not hasattr(self, "kv_cache_config"):
+            return
+        ctx = self.compilation_config.static_forward_context
+        num_computed = self.req_states.num_computed_tokens.gpu
+        seen: set[int] = set()
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            caches: list[torch.Tensor] = []
+            for layer_name in group.layer_names:
+                layer = ctx.get(layer_name)
+                if layer is None:
+                    continue
+                for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
+                    ptr = tensor.untyped_storage().data_ptr()
+                    if ptr in seen:
+                        continue
+                    seen.add(ptr)
+                    caches.append(tensor)
+            if not caches:
+                continue
+            compact_tree_kv_along_path(
+                caches,
+                self.block_tables.block_tables[group_id].gpu,
+                self.block_tables.kernel_block_sizes[group_id],
+                idx_mapping,
+                num_computed,
+                path_node_ids,
+            )
 
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,

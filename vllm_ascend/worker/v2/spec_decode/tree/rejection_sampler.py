@@ -16,6 +16,7 @@ def greedy_tree_reject(
     tree: TreeLayout,
     target_logits: torch.Tensor,
     num_speculative_tokens: int,
+    path_node_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Greedy-verify a draft tree by token-id comparison on device.
 
@@ -23,7 +24,8 @@ def greedy_tree_reject(
     node id (column 0 is the already-accepted root).
 
     Returns ``[num_reqs, spec_len + 1]`` accepted token ids including bonus.
-    Unused slots are ``-1``.
+    Unused slots are ``-1``. When ``path_node_ids`` is set it is filled with
+    accepted draft node ids ``[num_reqs, spec_len]`` (``-1`` unused).
     """
     tokens = tree.tokens
     first_child = tree.first_child
@@ -38,6 +40,16 @@ def greedy_tree_reject(
         dtype=torch.long,
         device=device,
     )
+    if path_node_ids is None:
+        path_out = torch.full(
+            (num_reqs, spec_len),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+    else:
+        path_out = path_node_ids[:num_reqs, :spec_len]
+        path_out.fill_(-1)
     neg_one = torch.tensor(-1, dtype=torch.long, device=device)
 
     for req_idx in range(num_reqs):  # tl.program_id(0)
@@ -63,6 +75,7 @@ def greedy_tree_reject(
                     child,
                 )
             found = alive & (found_child >= 0)
+            path_out[req_idx, n_out] = torch.where(found, found_child, path_out[req_idx, n_out])
             current = torch.where(found, found_child, current)
             alive = found
         t = target_token_ids[req_idx, current]
@@ -148,6 +161,8 @@ def _num_sampled_and_rejected(
 class TreeRejectionSampler(RejectionSampler):
     """v2 rejection sampler that greedy-verifies a DFlash draft tree."""
 
+    path_node_ids: torch.Tensor | None = None
+
     def __call__(
         self,
         logits: torch.Tensor,
@@ -156,6 +171,7 @@ class TreeRejectionSampler(RejectionSampler):
     ) -> SamplerOutput:
         tree = _tree_from_input_batch(input_batch)
         if tree is None:
+            self.path_node_ids = None
             return super().__call__(logits, input_batch, draft_logits)
 
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
@@ -166,7 +182,19 @@ class TreeRejectionSampler(RejectionSampler):
             input_batch.num_reqs,
             node_dim,
         )
-        sampled = greedy_tree_reject(tree, target_logits, self.num_speculative_steps)
+        path_node_ids = torch.full(
+            (input_batch.num_reqs, self.num_speculative_steps),
+            -1,
+            dtype=torch.long,
+            device=logits.device,
+        )
+        sampled = greedy_tree_reject(
+            tree,
+            target_logits,
+            self.num_speculative_steps,
+            path_node_ids=path_node_ids,
+        )
+        self.path_node_ids = path_node_ids
         num_sampled, num_rejected = _num_sampled_and_rejected(
             sampled,
             input_batch,

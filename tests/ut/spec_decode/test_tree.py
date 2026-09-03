@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 import torch
 from vllm.config.compilation import CUDAGraphMode
 
+from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_kv_along_path
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.utils import (
     TreeLayout,
@@ -172,3 +174,65 @@ def test_generate_draft_stores_tree_layout() -> None:
     assert layout.first_child.data_ptr() == spec.tree_first_child.data_ptr()
     spec.model.compute_logits.assert_called_once()
     spec._run_model.assert_called_once()
+
+
+def test_tree_kv_slot_layout_and_compact() -> None:
+    """Siblings share RoPE positions but unique KV slots; compact packs the path."""
+    num_computed = 10
+    query_len = 4
+    tree_depths = torch.zeros((1, 8), dtype=torch.int32)
+    tree_depths[0, :3] = torch.tensor([1, 1, 2], dtype=torch.int32)
+    idx_mapping = torch.zeros(1, dtype=torch.int32)
+    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
+    is_prefilling = torch.zeros(1, dtype=torch.int32)
+    computed = torch.tensor([num_computed], dtype=torch.int32)
+    pos = torch.zeros(query_len, dtype=torch.int64)
+    slot_pos = torch.zeros(query_len, dtype=torch.int64)
+    seq_lens = torch.zeros(2, dtype=torch.int32)
+
+    prepare_tree_spec_pos_seq_lens(
+        idx_mapping,
+        query_start_loc,
+        is_prefilling,
+        computed,
+        tree_depths,
+        pos,
+        slot_pos,
+        seq_lens,
+    )
+    assert pos.tolist() == [10, 11, 11, 12]
+    assert slot_pos.tolist() == [10, 11, 12, 13]
+    assert seq_lens[0].tolist() == 14
+
+    block_size = 16
+    cache = torch.arange(2 * block_size, dtype=torch.float32).view(2, block_size, 1)
+    before = cache.clone()
+    block_table = torch.zeros((1, 4), dtype=torch.int32)
+    block_table[0, 1] = 1
+    path_node_ids = torch.tensor([[2, -1, -1]], dtype=torch.long)
+    compact_tree_kv_along_path(
+        [cache],
+        block_table,
+        block_size,
+        idx_mapping,
+        computed,
+        path_node_ids,
+    )
+    # node 2 lives at logical 12; accepted path depth 1 dest is logical 11.
+    assert cache[0, 11].tolist() == before[0, 12].tolist()
+    assert cache[0, 12].tolist() == before[0, 12].tolist()
+
+    # Overlapping src/dst: gather then scatter so 13→12 does not read the
+    # already-written 12→11 result.
+    cache = before.clone()
+    compact_tree_kv_along_path(
+        [cache],
+        block_table,
+        block_size,
+        idx_mapping,
+        computed,
+        torch.tensor([[2, 3, -1]], dtype=torch.long),
+    )
+    assert cache[0, 11].tolist() == before[0, 12].tolist()
+    assert cache[0, 12].tolist() == before[0, 13].tolist()
+

@@ -8,7 +8,10 @@ from vllm.config.compilation import CUDAGraphMode
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_decode_query_len
-from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_kv_along_path
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+    compact_tree_kv_along_path,
+    compact_tree_query_along_path,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.utils import (
     TreeLayout,
@@ -237,6 +240,44 @@ def test_tree_kv_slot_layout_and_compact() -> None:
     )
     assert cache[0, 11].tolist() == before[0, 12].tolist()
     assert cache[0, 12].tolist() == before[0, 13].tolist()
+
+
+def test_tree_query_compact_along_non_prefix_path() -> None:
+    """Packed siblings are not a prefix; compact gathers path rows and linear RoPE."""
+    query_len = 4
+    hidden = torch.arange(query_len * 2, dtype=torch.float32).view(query_len, 2)
+    aux = hidden.clone() + 100
+    pos = torch.tensor([10, 11, 11, 12], dtype=torch.int64)
+    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
+    before_h = hidden.clone()
+    before_aux = aux.clone()
+
+    compact_tree_query_along_path(
+        [hidden, aux],
+        query_start_loc,
+        torch.tensor([[2, -1, -1]], dtype=torch.long),
+        linearize_positions=pos,
+    )
+    assert torch.equal(hidden[0], before_h[0])
+    assert torch.equal(hidden[1], before_h[2])
+    assert torch.equal(hidden[2], before_h[2])
+    assert torch.equal(hidden[3], before_h[3])
+    assert torch.equal(aux[1], before_aux[2])
+    assert torch.equal(pos, torch.tensor([10, 11, 11, 12]))
+
+    hidden = before_h.clone()
+    pos = torch.tensor([10, 11, 11, 12], dtype=torch.int64)
+    compact_tree_query_along_path(
+        [hidden],
+        query_start_loc,
+        torch.tensor([[2, 1, -1]], dtype=torch.long),
+        linearize_positions=pos,
+    )
+    assert torch.equal(hidden[0], before_h[0])
+    assert torch.equal(hidden[1], before_h[2])
+    assert torch.equal(hidden[2], before_h[1])
+    assert torch.equal(hidden[3], before_h[3])
+    assert torch.equal(pos, torch.tensor([10, 11, 12, 12]))
 
 
 def test_tree_decode_query_len_uses_budget_not_spec_depth() -> None:

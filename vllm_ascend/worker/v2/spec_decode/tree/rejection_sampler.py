@@ -118,19 +118,14 @@ def _pack_tree_target_logits(
     ``cu_num_logits_np`` is the host prefix-sum of per-request logit counts.
     """
     vocab = logits.shape[-1]
-    num_logits = logits.shape[0]
-    if num_reqs > 0 and num_logits == num_reqs * node_dim:
-        return logits.view(num_reqs, node_dim, vocab)
-    if num_reqs > 0 and num_logits % num_reqs == 0:
-        query_len = num_logits // num_reqs
-        packed = logits.view(num_reqs, query_len, vocab)
-        if query_len == node_dim:
-            return packed
-        out = packed.new_full((num_reqs, node_dim, vocab), float("-inf"))
-        n = min(query_len, node_dim)
-        out[:, :n] = packed[:, :n]
-        return out
     out = logits.new_full((num_reqs, node_dim, vocab), float("-inf"))
+    if num_reqs == 0:
+        return out
+    # Host prefix-sum of per-request logit counts. Equal counts that merely
+    # *sum* to ``R * node_dim`` (e.g. 8+10) are not a rectangular ``[R, D, V]``.
+    counts = np.diff(np.asarray(cu_num_logits_np[: num_reqs + 1], dtype=np.int64))
+    if counts.size == num_reqs and np.all(counts == node_dim) and logits.shape[0] == num_reqs * node_dim:
+        return logits.view(num_reqs, node_dim, vocab)
     for i in range(num_reqs):
         start = int(cu_num_logits_np[i])
         end = int(cu_num_logits_np[i + 1])

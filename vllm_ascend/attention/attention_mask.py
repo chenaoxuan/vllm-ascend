@@ -17,7 +17,6 @@ import torch
 from vllm_ascend.platform import ModelConfig
 from vllm_ascend.utils import singleton
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
-from vllm_ascend.ascend_config import get_ascend_config
 
 
 def _generate_attn_mask(max_seq_len, dtype):
@@ -86,23 +85,23 @@ class AttentionMaskBuilder:
                                 tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
                                 num_decode):
-        num_reqs = tree_visibility.shape[0]
-        max_nodes = get_ascend_config().tree_spec_config.budget
-        # TODO: align query_len with actual scheduled query length
-        # (e.g. 1 + num_speculative_steps / num_scheduled_tokens). Using
-        # 1 + budget breaks prev_kv_len and FIA S1 when budget differs.
+        max_nodes = tree_visibility.shape[-1]
         query_len = 1 + max_nodes
-
-        attn_mask = torch.ones(num_decode, query_len,
-            align_up(seq_lens.max(), 128), dtype=torch.bool, device=self.device)
-        for i in range(num_decode):
-            req_mask = attn_mask[i, :, :]
-            seq_len = seq_lens[i].item()
-            prev_kv_len = seq_len - query_len
-
-            req_mask[:, :prev_kv_len + 1] = False
+        num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])
+        # seq_lens is CPU metadata in the attention builder.
+        kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
+        # Paged FIA custom mask is (B, 1, Q_S, KV_S). A 3D (B, Q, Kv) tensor
+        # looks like (Q, Kv) at bs=1 but shares the leading request's mask at bs>1.
+        attn_mask = torch.ones(
+            num_decode, 1, query_len, kv_len, dtype=torch.bool, device=self.device
+        )
+        for i in range(num_mask):
+            req_mask = attn_mask[i, 0]
+            prev_kv_len = max(int(seq_lens[i]) - query_len, 0)
+            req_mask[:, : prev_kv_len + 1] = False
             # tree_visibility: True = can attend; FIA bool mask: True = masked out.
             # Draft columns are slot-indexed (contiguous j). KV slot_mapping uses
             # unique token-index coordinates while RoPE positions stay depth-based.
-            req_mask[1:, prev_kv_len + 1 : prev_kv_len + 1 + max_nodes] = ~tree_visibility[i]
+            draft_start = prev_kv_len + 1
+            req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
         return attn_mask

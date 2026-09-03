@@ -46,3 +46,24 @@ class TestAttentionMaskBuilder(TestBase):
         attention_mask_builder = AttentionMaskBuilder(torch.device("cpu"))
         attn_mask = attention_mask_builder.get_splitfuse_attn_mask()
         self.assertEqual(attn_mask.shape, (2048, 2048))
+
+    def test_tree_attention_mask_per_request_prefix(self):
+        builder = AttentionMaskBuilder(torch.device("cpu"))
+        visibility = torch.zeros(2, 2, 2, dtype=torch.bool)
+        visibility[0, 0, 0] = True
+        visibility[1] = torch.eye(2, dtype=torch.bool)
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        mask = builder.get_tree_attention_mask(None, visibility, seq_lens, num_decode=2)
+        self.assertEqual(mask.shape, (2, 1, 3, 128))
+        # query_len=3 → prev_kv is 7 and 17; prefix+root columns are visible.
+        self.assertFalse(mask[0, 0, :, :8].any())
+        self.assertFalse(mask[1, 0, :, :18].any())
+        self.assertTrue(mask[0, 0, 0, 8:].all())
+        self.assertTrue(mask[1, 0, 0, 18:].all())
+        # req0 node1 sees slot 0; req1 is identity visibility.
+        self.assertFalse(bool(mask[0, 0, 1, 8]))
+        self.assertTrue(bool(mask[0, 0, 1, 9]))
+        self.assertFalse(bool(mask[1, 0, 1, 18]))
+        self.assertTrue(bool(mask[1, 0, 1, 19]))
+        self.assertTrue(bool(mask[1, 0, 2, 18]))
+        self.assertFalse(bool(mask[1, 0, 2, 19]))

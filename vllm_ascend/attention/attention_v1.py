@@ -1457,36 +1457,108 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         query, key, value, key, passed_value, block_size, block_table, attn_metadata, output
                     )
 
-                if dflash_tree_spec_enabled() and attn_metadata.num_prefills == 0:
-                    sparse_mode=1
+                if (
+                    dflash_tree_spec_enabled()
+                    and attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes > 0
+                ):
+                    attn_output = self._forward_tree_decode_fia(
+                        query,
+                        key,
+                        value,
+                        passed_value,
+                        block_size,
+                        block_table,
+                        attn_metadata,
+                        actual_seq_lengths_kv,
+                        num_tokens,
+                        attn_metadata.num_decodes,
+                    )
                 else:
-                    sparse_mode=3
-                attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    head_size=self.head_size,
-                    scale=self.scale,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    current_key=key,
-                    current_value=passed_value,
-                    attn_metadata=attn_metadata,
-                    is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
-                    sparse_mode=sparse_mode,
-                )
+                    attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=attn_metadata.attn_mask,
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        head_size=self.head_size,
+                        scale=self.scale,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        current_key=key,
+                        current_value=passed_value,
+                        attn_metadata=attn_metadata,
+                        is_prefill_no_cache=attn_metadata.attn_state
+                        == AscendAttentionState.PrefillNoCache,
+                        sparse_mode=3,
+                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def _forward_tree_decode_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        current_value: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        attn_metadata: AscendMetadata,
+        actual_seq_lengths_kv,
+        num_tokens: int,
+        num_decodes: int,
+    ) -> torch.Tensor:
+        """Tree decode FIA with a per-request mask.
+
+        TND + sparse_mode=1 does not honor batched custom masks (FIA TND only
+        documents sparse 0/3). DCP spec decode uses BSND for the same reason.
+        """
+        use_bsnd = num_decodes > 0 and num_tokens % num_decodes == 0
+        if use_bsnd:
+            q_len = num_tokens // num_decodes
+            fia_query = query[:num_tokens].view(num_decodes, q_len, self.num_heads, self.head_size)
+            input_layout = "BSND"
+            actual_seq_q = [q_len] * num_decodes
+        else:
+            fia_query = query[:num_tokens]
+            input_layout = "TND"
+            actual_seq_q = attn_metadata.actual_seq_lengths_q[:num_decodes]
+        if isinstance(actual_seq_lengths_kv, torch.Tensor):
+            kv_lens = actual_seq_lengths_kv[:num_decodes].tolist()
+        else:
+            kv_lens = list(actual_seq_lengths_kv[:num_decodes])
+        bt = block_table[:num_decodes] if block_table is not None else None
+        attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+            query=fia_query,
+            key=key,
+            value=value,
+            atten_mask=attn_metadata.attn_mask,
+            block_table=bt,
+            input_layout=input_layout,
+            block_size=block_size,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=kv_lens,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+            scale=self.scale,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            current_key=key,
+            current_value=current_value,
+            attn_metadata=attn_metadata,
+            is_prefill_no_cache=False,
+            sparse_mode=0,
+        )
+        return attn_output.reshape(num_tokens, self.num_heads, self.head_size)
 
     def _forward_fia_chunked_prefill_split(
         self,
@@ -1513,33 +1585,46 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # decode part
         if num_decode_tokens > 0:
             if dflash_tree_spec_enabled():
-                sparse_mode=1
+                decode_out = self._forward_tree_decode_fia(
+                    query[:num_decode_tokens],
+                    key,
+                    value,
+                    value,
+                    block_size,
+                    block_table[:num_decodes],
+                    attn_metadata,
+                    seq_lens_list[:num_decodes],
+                    num_decode_tokens,
+                    num_decodes,
+                )
+                output[:num_decode_tokens] = decode_out
             else:
-                sparse_mode=3
-            decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
-                query=query[:num_decode_tokens],
-                key=key,
-                value=value,
-                atten_mask=attn_metadata.attn_mask,
-                block_table=block_table[:num_decodes],
-                input_layout="TND",
-                block_size=block_size,
-                # cumulative offset from 0; leading num_decodes entries used as-is
-                actual_seq_lengths=actual_seq_qlen[:num_decodes],
-                actual_seq_lengths_kv=seq_lens_list[:num_decodes],
-                num_key_value_heads=self.num_kv_heads,
-                num_heads=self.num_heads,
-                head_size=self.head_size,
-                scale=self.scale,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                current_key=key,
-                current_value=value,
-                attn_metadata=attn_metadata,
-                is_prefill_no_cache=False,
-                sparse_mode=sparse_mode,
-            )
-            output[:num_decode_tokens] = decode_out.view(num_decode_tokens, self.num_heads, self.head_size)
+                decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
+                    query=query[:num_decode_tokens],
+                    key=key,
+                    value=value,
+                    atten_mask=attn_metadata.attn_mask,
+                    block_table=block_table[:num_decodes],
+                    input_layout="TND",
+                    block_size=block_size,
+                    # cumulative offset from 0; leading num_decodes entries used as-is
+                    actual_seq_lengths=actual_seq_qlen[:num_decodes],
+                    actual_seq_lengths_kv=seq_lens_list[:num_decodes],
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    head_size=self.head_size,
+                    scale=self.scale,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    current_key=key,
+                    current_value=value,
+                    attn_metadata=attn_metadata,
+                    is_prefill_no_cache=False,
+                    sparse_mode=3,
+                )
+                output[:num_decode_tokens] = decode_out.view(
+                    num_decode_tokens, self.num_heads, self.head_size
+                )
 
         # prefill part
         if attn_metadata.num_prefills > 0:

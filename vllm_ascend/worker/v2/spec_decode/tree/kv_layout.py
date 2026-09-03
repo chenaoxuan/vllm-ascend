@@ -44,6 +44,56 @@ def compact_tree_kv_along_path(
         flat[dst_slots] = gathered
 
 
+def compact_tree_query_along_path(
+    tensors: list[torch.Tensor],
+    query_start_loc: torch.Tensor,
+    path_node_ids: torch.Tensor,
+    linearize_positions: torch.Tensor | None = None,
+) -> None:
+    """Move accepted-path query rows onto the linear prefix of each request.
+
+    ``path_node_ids`` is ``[num_reqs, spec_len]`` with ``-1`` unused (device).
+    ``query_start_loc`` is ``[num_reqs + 1]`` (device). Each tensor in
+    ``tensors`` is token-major ``[num_tokens, ...]`` (hidden / aux). Root is
+    query offset 0; draft node ``node_id`` is offset ``node_id``. Invalid path
+    slots are no-ops (src = dst). Gather clones before scatter so overlapping
+    src/dst rows stay correct.
+
+    When ``linearize_positions`` is set (``[num_tokens]`` device), the same
+    destination rows are rewritten as ``root_pos + 0..k`` rather than packed
+    RoPE (siblings may share a packed position).
+    """
+    num_reqs, spec_len = path_node_ids.shape
+    if num_reqs == 0:
+        return
+    node = path_node_ids.to(dtype=torch.long)
+    qsl = query_start_loc[:num_reqs].to(dtype=torch.long)
+    root = torch.zeros((num_reqs, 1), dtype=torch.long, device=node.device)
+    src_off = torch.cat([root, node.clamp(min=0)], dim=1)
+    dst_off = torch.arange(
+        spec_len + 1, device=node.device, dtype=torch.long
+    ).expand(num_reqs, -1)
+    valid = torch.cat(
+        [
+            torch.ones((num_reqs, 1), dtype=torch.bool, device=node.device),
+            node >= 0,
+        ],
+        dim=1,
+    )
+    src_off = torch.where(valid, src_off, dst_off)
+    src_idx = qsl.unsqueeze(1) + src_off
+    dst_idx = qsl.unsqueeze(1) + dst_off
+    for tensor in tensors:
+        gathered = tensor[src_idx].clone()
+        tensor[dst_idx] = gathered
+    if linearize_positions is None:
+        return
+    base = linearize_positions[qsl].unsqueeze(1)
+    new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
+    cur = linearize_positions[dst_idx]
+    linearize_positions[dst_idx] = torch.where(valid, new_pos, cur)
+
+
 def iter_unique_kv_cache_tensors(kv_cache) -> list[torch.Tensor]:
     """Yield slot-major K/V tensors from a layer ``kv_cache`` binding."""
     if kv_cache is None:

@@ -211,6 +211,7 @@ def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
         [2, -1, -1],
         [-1, -1, -1],
     ]
+    assert torch.equal(input_batch.path_node_ids, rejection_sampler.path_node_ids)
 
 
 def test_tree_rejection_sampler_ragged_logit_counts_do_not_mix_requests() -> None:

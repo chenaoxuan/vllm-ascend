@@ -6,10 +6,14 @@ from typing import Any
 import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.input_batch import InputBatch
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     AscendDFlashSpeculator,
+)
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+    compact_tree_query_along_path,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.utils import TreeLayout, build_trees
 
@@ -111,6 +115,55 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if self.tree is None:
             raise RuntimeError("Draft tree has not been built yet.")
         return self.tree
+
+    def propose(
+        self,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        slot_mappings: dict[str, torch.Tensor],
+        last_hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        dummy_run: bool = False,
+        skip_attn_for_dummy_run: bool = False,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        is_profile: bool = False,
+    ) -> torch.Tensor:
+        path_node_ids = getattr(input_batch, "path_node_ids", None)
+        if path_node_ids is not None and not dummy_run:
+            tensors = [last_hidden_states]
+            if aux_hidden_states:
+                tensors.extend(aux_hidden_states)
+            compact_tree_query_along_path(
+                tensors,
+                input_batch.query_start_loc,
+                path_node_ids,
+                linearize_positions=input_batch.positions,
+            )
+        return super().propose(
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            num_tokens_across_dp,
+            dummy_run,
+            skip_attn_for_dummy_run,
+            mm_inputs,
+            is_profile=is_profile,
+        )
 
     def _generate_draft(
         self,

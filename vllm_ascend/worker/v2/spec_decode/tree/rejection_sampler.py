@@ -168,6 +168,7 @@ class TreeRejectionSampler(RejectionSampler):
         tree = _tree_from_input_batch(input_batch)
         if tree is None:
             self.path_node_ids = None
+            input_batch.path_node_ids = None
             return super().__call__(logits, input_batch, draft_logits)
 
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
@@ -195,6 +196,11 @@ class TreeRejectionSampler(RejectionSampler):
             sampled,
             input_batch,
             self.sampler.req_states.prefill_len.gpu,
+        )
+        # Chunked prefills zero num_sampled; keep those path rows at -1 so
+        # propose() does not scramble linear prefill hidden_states.
+        input_batch.path_node_ids = path_node_ids.masked_fill(
+            (num_sampled == 0).unsqueeze(1), -1
         )
         return SamplerOutput(
             sampled_token_ids=sampled,

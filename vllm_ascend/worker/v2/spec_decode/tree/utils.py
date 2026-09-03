@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,85 @@ def _select_topb_prefix_tree_tensor(
     return torch.sort(selected_ids, dim=-1).values
 
 
+class DominoCorrectionScorer:
+    """Domino correction head scorer for DARTree (reference CPU path).
+
+    Wraps the draft model's ``embed_proj`` correction MLP and ``prefix_gru``,
+    together with the target model's token embedding, into fixed-weight
+    projections used to bias the base logits during DARTree construction. See
+    ``DominoCorrectionScorer`` in ``E:/repos/DARTree/utils/correction.py``.
+    """
+
+    def __init__(self, draft_model, target_model, hidden_dim=None):
+        fc1, self.middle, fc2 = self._unwrap_correction_mlp(draft_model.embed_proj)
+        gru = draft_model.prefix_gru
+        if gru.num_layers != 1 or gru.bidirectional:
+            raise ValueError(
+                "Domino correction requires a single-layer unidirectional prefix_gru"
+            )
+        self.gru_hidden_dim = int(gru.hidden_size)
+        if hidden_dim is None:
+            hidden_dim = fc1.in_features - self.gru_hidden_dim
+        self.hidden_dim = int(hidden_dim)
+        if fc1.in_features != self.hidden_dim + self.gru_hidden_dim:
+            raise ValueError(
+                "Domino correction MLP input dim mismatch: got "
+                f"{fc1.in_features}, expected {self.hidden_dim + self.gru_hidden_dim}"
+            )
+        # Split the first correction linear into the (z, s) branches.
+        self.w_z = fc1.weight[:, :self.hidden_dim].detach().contiguous()  # [E, H]
+        self.w_s = fc1.weight[:, self.hidden_dim:].detach().contiguous()  # [E, G]
+        self.fc1_bias = fc1.bias.detach() if fc1.bias is not None else None
+        self.fc2_weight = fc2.weight.detach().contiguous()  # [V, E]
+        self.fc2_bias = fc2.bias.detach() if fc2.bias is not None else None
+        # GRU weights.
+        self.gru_w_ih = gru.weight_ih_l0.detach().contiguous()  # [3G, H]
+        self.gru_w_hh = gru.weight_hh_l0.detach().contiguous()  # [3G, G]
+        self.gru_b_ih = gru.bias_ih_l0.detach() if gru.bias else None
+        self.gru_b_hh = gru.bias_hh_l0.detach() if gru.bias else None
+        # Precompute token embedding @ W_ih.T into a GRU-input lookup table.
+        embed_weight = target_model.model.embed_tokens.weight  # [V, H]
+        self._gru_input_proj_table = F.linear(
+            embed_weight, self.gru_w_ih, self.gru_b_ih
+        ).contiguous()  # [V, 3G]
+
+    @staticmethod
+    def _unwrap_correction_mlp(embed_proj):
+        """Split ``embed_proj = Sequential(Linear, ..., Linear)`` into (fc1, middle, fc2)."""
+        if not isinstance(embed_proj, nn.Sequential):
+            raise TypeError(
+                "Domino correction requires draft_model.embed_proj to be nn.Sequential"
+            )
+        modules = list(embed_proj.children())
+        if len(modules) < 2:
+            raise ValueError("embed_proj must contain at least two layers")
+        if not isinstance(modules[0], nn.Linear) or not isinstance(modules[-1], nn.Linear):
+            raise ValueError("embed_proj first/last layers must be nn.Linear")
+        fc1 = modules[0]
+        middle = (
+            nn.Sequential(*modules[1:-1]) if len(modules) > 2 else nn.Identity()
+        )
+        return fc1, middle, fc2
+
+    def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+        """Project draft backbone hidden states to the correction latent (z branch)."""
+        return F.linear(parallel_hiddens, self.w_z, self.fc1_bias)
+
+    def update_hidden(
+        self, token_ids: torch.Tensor, h_state: torch.Tensor
+    ) -> torch.Tensor:
+        """Advance the GRU hidden state by one token."""
+        token_ids = token_ids.reshape(-1)
+        gi = self._gru_input_proj_table.index_select(0, token_ids)  # [B, 3G]
+        gh = F.linear(h_state, self.gru_w_hh, self.gru_b_hh)  # [B, 3G]
+        i_r, i_z, i_n = gi.chunk(3, dim=-1)
+        h_r, h_z, h_n = gh.chunk(3, dim=-1)
+        r = torch.sigmoid(i_r + h_r)
+        z = torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + r * h_n)
+        return (1.0 - z) * n + z * h_state
+
+
 def _dar_corrected_candidates(
     scorer,
     z: torch.Tensor,
@@ -247,7 +327,8 @@ def _dar_corrected_candidates(
     bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)  # [R, W, C]
     if candidate_bias is not None:
         bias = bias + candidate_bias.unsqueeze(1)
-    candidate_logits = candidate_vals.unsqueeze(1) + bias  # [R, W, C]
+    candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias  # [R, W, C]
+    candidate_logits = candidate_logits.float()  # topk / logsumexp in fp32
     top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)  # [R, W, k]
     log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)  # [R, W, 1]
     top_scores = top_vals - log_z  # [R, W, k]
@@ -266,7 +347,8 @@ def build_dar_tree(
     depth_bonus: float = -0.2,
     supertree_width: int | None = None,
     pruned: bool = True,
-    correction_scorer=None,
+    draft_model=None,
+    target_model=None,
     draft_hidden: torch.Tensor | None = None,
     root_token_ids: torch.Tensor | None = None,
     prefix_len: int = 0,
@@ -276,14 +358,14 @@ def build_dar_tree(
 
     Implements the DARTree supertree construction and global Top-B pruning
     (see ``build_dartree_supertree`` in the DARTree reference). When
-    ``correction_scorer`` is provided, candidate tokens are scored with the
-    Domino correction head (``embed_proj`` MLP bias on top of the base logits,
-    driven by the per-depth draft feature and a per-parent GRU hidden state);
-    otherwise the tree is grown from the ``log_softmax`` of ``draft_logits``
-    directly. All requests are processed together with tensor ops; the supertree
-    has the same shape for every request, so construction has no per-request
-    loop. The only Python loops are the node-level linked-list / visibility
-    fills, each batched over all requests.
+    ``draft_model`` and ``target_model`` are provided, candidate tokens are
+    scored with the Domino correction head (``embed_proj`` MLP bias on top of
+    the base logits, driven by the per-depth draft feature and a per-parent GRU
+    hidden state); otherwise the tree is grown from the ``log_softmax`` of
+    ``draft_logits`` directly. All requests are processed together with tensor
+    ops; the supertree has the same shape for every request, so construction has
+    no per-request loop. The only Python loops are the node-level
+    linked-list / visibility fills, each batched over all requests.
 
     Path scores are sums of per-node log-probs, which are prefix-monotone (a
     node never outranks its parent); this keeps the Top-B prune prefix-closed.
@@ -299,13 +381,14 @@ def build_dar_tree(
         supertree_width: per-depth supertree width for the ``pruned`` variant;
             defaults to ``topk`` when ``None``.
         pruned: whether to grow a wider supertree and prune it to ``budget``.
-        correction_scorer: optional Domino-like correction scorer exposing
-            ``project_z``, ``update_hidden``, ``w_s``, ``fc1_bias``, ``middle``,
-            ``fc2_weight`` and ``fc2_bias`` (see ``_dar_corrected_candidates``).
+        draft_model: optional Domino draft model exposing ``embed_proj`` and
+            ``prefix_gru`` (see ``DominoCorrectionScorer``).
+        target_model: optional target model exposing ``model.embed_tokens``;
+            required together with ``draft_model`` for Domino correction.
         draft_hidden: [num_reqs, spec_num, hidden] draft backbone output;
-            required when ``correction_scorer`` is set (source of ``z``).
+            required when ``draft_model`` is set (source of ``z``).
         root_token_ids: [num_reqs] already-accepted anchor token per request;
-            required when ``correction_scorer`` is set.
+            required when ``draft_model`` is set.
         prefix_len: number of leading depths scored from base logits without
             correction (mirrors ``pure_draft_prefix_len`` in the reference).
         candidate_vocab_size: number of candidate tokens gathered per depth for
@@ -328,12 +411,15 @@ def build_dar_tree(
         width = max(1, min(int(np.ceil(budget / block_size)), k, budget))
     supertree_budget = width * block_size
 
-    with_correction = correction_scorer is not None
+    with_correction = draft_model is not None and target_model is not None
     if with_correction:
         if draft_hidden is None or root_token_ids is None:
             raise ValueError(
-                "correction_scorer requires draft_hidden and root_token_ids"
+                "Domino correction requires draft_hidden and root_token_ids"
             )
+        correction_scorer = DominoCorrectionScorer(
+            draft_model, target_model, hidden_dim=draft_hidden.shape[-1]
+        )
         # Precompute the per-depth candidate tables (base values + fc2 gather).
         cand_vocab = vocab if candidate_vocab_size is None else int(candidate_vocab_size)
         candidate_count = max(int(topk), cand_vocab)
@@ -354,11 +440,11 @@ def build_dar_tree(
         z_parts = correction_scorer.project_z(
             draft_hidden[:, :block_size]
         )  # [R, spec, mid]
-        gru_hidden_dim = int(correction_scorer.w_s.shape[1])
+        gru_hidden_dim = correction_scorer.gru_hidden_dim
     else:
         logger.warning(
-            "build_dar_tree received no correction_scorer; the draft tree "
-            "will be built from uncorrected base logits."
+            "build_dar_tree received no draft_model/target_model; the draft "
+            "tree will be built from uncorrected base logits."
         )
         log_probs = torch.log_softmax(draft_logits.float(), dim=-1)  # [R, spec, vocab]
 

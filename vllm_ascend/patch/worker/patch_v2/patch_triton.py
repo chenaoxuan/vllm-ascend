@@ -1,4 +1,5 @@
 import vllm.v1.worker.gpu.spec_decode.speculator as base_speculator
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.sample.ops import topk_topp_sampler
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu import structured_outputs
@@ -19,6 +20,9 @@ from vllm_ascend.worker.v2.sample.penalties import apply_penalties, bincount
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import _prepare_dflash_inputs_kernel_ascend
 from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
     rejection_sample as npu_rejection_sample,
+)
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+    mask_rejected_dflash_context_slots,
 )
 from vllm_ascend.worker.v2.structured_outputs import _apply_grammar_bitmask_kernel
 
@@ -42,6 +46,54 @@ structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
 rejection_sampler_utils.rejection_sample = npu_rejection_sample
 rejection_sampler.rejection_sample = npu_rejection_sample
 dflash_speculator._prepare_dflash_inputs_kernel = _prepare_dflash_inputs_kernel_ascend
+
+_orig_prepare_dflash_inputs = dflash_speculator.prepare_dflash_inputs
+
+
+def prepare_dflash_inputs_ascend(
+    input_buffers,
+    query_slot_mapping,
+    context_positions,
+    context_slot_mapping,
+    sample_indices,
+    sample_pos,
+    sample_idx_mapping,
+    temperature,
+    seeds,
+    input_batch,
+    num_sampled,
+    num_rejected,
+    *args,
+    **kwargs,
+):
+    _orig_prepare_dflash_inputs(
+        input_buffers,
+        query_slot_mapping,
+        context_positions,
+        context_slot_mapping,
+        sample_indices,
+        sample_pos,
+        sample_idx_mapping,
+        temperature,
+        seeds,
+        input_batch,
+        num_sampled,
+        num_rejected,
+        *args,
+        **kwargs,
+    )
+    # Rejected suffix can still share RoPE with the compacted accepted prefix
+    # (tree siblings). Kernel is_valid_ctx PADs those rows; this is the
+    # CPU-testable counterpart and is idempotent if the kernel already PAD'd.
+    mask_rejected_dflash_context_slots(
+        context_slot_mapping,
+        input_batch.query_start_loc,
+        num_rejected,
+        PAD_SLOT_ID,
+    )
+
+
+dflash_speculator.prepare_dflash_inputs = prepare_dflash_inputs_ascend
 # triton ops that filed in ops/triton
 topk_topp_sampler.apply_top_k_top_p_triton = apply_top_k_top_p_triton
 mamba_utils.precopy_mamba_align_fused_kernel = precopy_mamba_align_fused_kernel

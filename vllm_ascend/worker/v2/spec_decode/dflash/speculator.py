@@ -217,15 +217,24 @@ if vllm_version_is("0.27.1"):
 
         last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
         query_base = req_idx * num_query_per_req
+        num_valid_ctx = valid_ctx_end - ctx_start
+        pad_slot = tl.full((), PAD_SLOT_ID, dtype=tl.int64)
+        zero_pos = tl.full((), 0, dtype=last_valid_pos.dtype)
 
         # --- Context positions / slots ---
+        # Rejected suffix must be PAD: tree siblings can share RoPE with the
+        # accepted prefix, and writing them would clobber draft KV. Matches
+        # upstream is_valid_ctx (vllm _prepare_dflash_inputs_kernel).
         for j in range(0, num_ctx):
             ctx_pos_idx = ctx_start + j
+            is_valid_ctx = j < num_valid_ctx
             ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx)
             ctx_block_num = ctx_pos // block_size
             ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
             ctx_block_id = tl.load(block_table_ptr + req_idx * block_table_stride + ctx_block_num).to(tl.int64)
             ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+            ctx_slot = tl.where(is_valid_ctx, ctx_slot, pad_slot)
+            ctx_pos = tl.where(is_valid_ctx, ctx_pos, zero_pos)
             tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
             tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
 
@@ -371,15 +380,24 @@ else:
 
         last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
         query_base = req_idx * num_query_per_req
+        num_valid_ctx = valid_ctx_end - ctx_start
+        pad_slot = tl.full((), PAD_SLOT_ID, dtype=tl.int64)
+        zero_pos = tl.full((), 0, dtype=last_valid_pos.dtype)
 
         # --- Context positions / slots ---
+        # Rejected suffix must be PAD: tree siblings can share RoPE with the
+        # accepted prefix, and writing them would clobber draft KV. Matches
+        # upstream is_valid_ctx (vllm _prepare_dflash_inputs_kernel).
         for j in range(0, num_ctx):
             ctx_pos_idx = ctx_start + j
+            is_valid_ctx = j < num_valid_ctx
             ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx)
             ctx_block_num = ctx_pos // block_size
             ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
             ctx_block_id = tl.load(block_table_ptr + req_idx * block_table_stride + ctx_block_num).to(tl.int64)
             ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+            ctx_slot = tl.where(is_valid_ctx, ctx_slot, pad_slot)
+            ctx_pos = tl.where(is_valid_ctx, ctx_pos, zero_pos)
             tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
             tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
 

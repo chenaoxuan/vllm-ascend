@@ -61,7 +61,9 @@ def compact_tree_query_along_path(
 
     When ``linearize_positions`` is set (``[num_tokens]`` device), the same
     destination rows are rewritten as ``root_pos + 0..k`` rather than packed
-    RoPE (siblings may share a packed position).
+    RoPE (siblings may share a packed position). Leftover rejected rows keep
+    their packed RoPE; DFlash context-slot writes must PAD that suffix
+    (``mask_rejected_dflash_context_slots`` / kernel ``is_valid_ctx``).
     """
     num_reqs, spec_len = path_node_ids.shape
     if num_reqs == 0:
@@ -92,6 +94,36 @@ def compact_tree_query_along_path(
     new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
     cur = linearize_positions[dst_idx]
     linearize_positions[dst_idx] = torch.where(valid, new_pos, cur)
+
+
+def mask_rejected_dflash_context_slots(
+    context_slot_mapping: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_rejected: torch.Tensor,
+    pad_slot_id: int,
+) -> None:
+    """PAD draft-context slots on each request's rejected query suffix.
+
+    After ``compact_tree_query_along_path``, accepted tokens are a linear
+    prefix of length ``query_len - num_rejected``. Leftover siblings can still
+    share RoPE with that prefix; those rows must not write draft KV.
+    All tensors are device-side. ``query_start_loc`` is ``[num_reqs + 1]``.
+    """
+    num_reqs = num_rejected.shape[0]
+    if num_reqs == 0 or context_slot_mapping.numel() == 0:
+        return
+    starts = query_start_loc[:num_reqs].to(dtype=torch.long)
+    ends = query_start_loc[1 : num_reqs + 1].to(dtype=torch.long)
+    valid_ends = ends - num_rejected.to(dtype=torch.long)
+    idx = torch.arange(
+        context_slot_mapping.shape[0],
+        device=context_slot_mapping.device,
+        dtype=torch.long,
+    )
+    req = torch.searchsorted(ends, idx, right=True).clamp(max=num_reqs - 1)
+    in_req = (idx >= starts[req]) & (idx < ends[req])
+    rejected = in_req & (idx >= valid_ends[req])
+    context_slot_mapping.masked_fill_(rejected, pad_slot_id)
 
 
 def iter_unique_kv_cache_tensors(kv_cache) -> list[torch.Tensor]:

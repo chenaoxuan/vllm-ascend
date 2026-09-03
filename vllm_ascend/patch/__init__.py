@@ -1120,6 +1120,26 @@
 #       Remove this patch once vLLM selects the Triton libdevice through a
 #       backend-dispatch mechanism.
 #
+#   3. `vllm.v1.worker.gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel`,
+#      `vllm.v1.worker.gpu.spec_decode.dflash.speculator.prepare_dflash_inputs`
+#    Why:
+#       The Ascend scalar rewrite of ``_prepare_dflash_inputs_kernel`` used to
+#       write real draft-KV slots for the whole ``num_ctx`` span. Upstream
+#       Triton uses ``is_valid_ctx`` so the rejected suffix is ``PAD_SLOT_ID``.
+#       After tree compact, leftover siblings can still share RoPE with the
+#       accepted prefix; writing them clobbers the just-accepted draft KV.
+#    How:
+#       The Ascend kernel PADs ``j >= num_valid_ctx`` (slot ``PAD_SLOT_ID``,
+#       position 0). ``prepare_dflash_inputs`` is wrapped to apply
+#       ``mask_rejected_dflash_context_slots`` on the same suffix (idempotent).
+#    Test:
+#       tests/ut/spec_decode/test_tree.py::test_tree_query_compact_along_non_prefix_path
+#    Related PR (if no, explain why):
+#       No. Plugin-side tree + DFlash slot layout; upstream already PADs.
+#    Future Plan:
+#       Drop the wrap once the Ascend kernel is the only writer and stays
+#       aligned with upstream ``is_valid_ctx``.
+#
 # ** 29. File: worker/patch_v2/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`

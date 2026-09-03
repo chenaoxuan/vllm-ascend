@@ -177,6 +177,62 @@ def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
     ]
 
 
+def test_tree_rejection_sampler_ragged_logit_counts_do_not_mix_requests() -> None:
+    """Uneven cu_num_logits must not reshape as ``[R, total // R, V]``.
+
+    Concatenating 3+1 logits and viewing as ``[2, 2, V]`` would steal req0's
+    bonus column into req1 and drop req0's bonus, which is the bs>1 mixed
+    prefill/decode packing path.
+    """
+    budget = 2
+    spec_len = 2
+    vocab_size = 8
+    tree = empty_tree_layout(2, budget, device="cpu")
+    for req in range(2):
+        tree.tokens[req, :2] = torch.tensor([1, 2])
+        tree.parents[req, :2] = torch.tensor([0, 1])
+        tree.num_nodes[req] = 2
+        tree.first_child[req, :3] = torch.tensor([1, 2, -1])
+
+    logits0 = _logits_from_greedy_ids(torch.tensor([[1, 2, 7]]), vocab_size).squeeze(0)
+    logits1 = _logits_from_greedy_ids(torch.tensor([[1]]), vocab_size).squeeze(0)
+    logits = torch.cat([logits0, logits1], dim=0)
+
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=spec_len,
+        rejection_sample_method="standard",
+        synthetic_acceptance_rates=None,
+    )
+    sampler = SimpleNamespace(
+        compute_nans=False,
+        req_states=SimpleNamespace(
+            prefill_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+        ),
+    )
+    rejection_sampler = TreeRejectionSampler(sampler, spec_config, torch.device("cpu"))
+    cu = np.array([0, 3, 4], dtype=np.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=2,
+        cu_num_logits=torch.from_numpy(cu),
+        cu_num_logits_np=cu,
+        idx_mapping=torch.arange(2, dtype=torch.int32),
+        seq_lens=torch.full((2,), 100, dtype=torch.int32),
+        tree_tokens=tree.tokens,
+        tree_depths=tree.depths,
+        tree_parents=tree.parents,
+        tree_num_nodes=tree.num_nodes,
+        tree_visibility=tree.visibility,
+        tree_first_child=tree.first_child,
+        tree_next_sibling=tree.next_sibling,
+    )
+
+    output = rejection_sampler(logits, input_batch)
+    assert output.sampled_token_ids.tolist() == [
+        [1, 2, 7],
+        [1, 0, -1],
+    ]
+
+
 def test_block_tree_reject_paper_path() -> None:
     """Reject X3 then X4 (locks p'≈0.091), then accept X2→X5 and recover Y."""
     mb = torch.tensor([0.3, 0.4, 0.3])

@@ -549,7 +549,27 @@
 #       profiling startup and per-step timing callbacks without monkey-patching
 #       `EngineCore` and the multiprocess entry point.
 #
-# ** 18. File: platform/patch_speculative_config.py**
+# ** 18. File: platform/patch_spec_decode_stats.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.spec_decode.metrics.SpecDecodingStats.observe_draft`
+#    Why:
+#       Tree spec decode schedules ``budget`` draft nodes, which can exceed
+#       ``num_speculative_tokens`` (tree depth). Upstream ``observe_draft``
+#       indexes per-position lists of length ``num_speculative_tokens``, so
+#       ``budget > num_speculative_tokens`` raises IndexError in
+#       ``Scheduler.make_spec_decoding_stats``.
+#    How：
+#       Replace ``observe_draft`` so scalar draft/accepted totals still count
+#       every node, while per-position updates clamp to the existing list
+#       length (chain-depth logging / Prometheus counters stay aligned).
+#    Related PR (if no, explain why):
+#       No, vllm-ascend tree spec; upstream stats assume chain drafts.
+#    Future Plan:
+#       Remove this patch when upstream ``observe_draft`` accepts
+#       ``num_draft_tokens > num_spec_tokens`` without growing per-pos
+#       vectors, or when tree spec is upstreamed with matching metrics.
+#
+# ** 19. File: platform/patch_speculative_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.speculative.SpeculativeConfig.hf_config_override`
 #    Why:
@@ -654,7 +674,7 @@
 #       Remove this patch once `torch.accelerator` correctly routes to the NPU
 #       backend for these memory APIs.
 #
-# ** 21. File: platform/patch_tool_choice_none_content.py**
+# ** 22. File: platform/patch_tool_choice_none_content.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionResponse`
 #      `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionStreamResponse`
@@ -670,7 +690,7 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains PR #44105.
 #
-# ** 22. File: platform/patch_use_v2_model_runner.py**
+# ** 23. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
 #    Why:

@@ -64,14 +64,15 @@ def greedy_tree_reject(
             found_child = neg_one
             for _ in range(budget):
                 valid = alive & (found_child < 0) & (child >= 0)
+                slot = (child - 1).clamp(min=0)
                 found_child = torch.where(
-                    valid & (tokens[req_idx, child - 1] == t),
+                    valid & (tokens[req_idx, slot] == t),
                     child,
                     found_child,
                 )
                 child = torch.where(
                     valid & (found_child < 0),
-                    next_sibling[req_idx, child].to(torch.long),
+                    next_sibling[req_idx, child.clamp(min=0)].to(torch.long),
                     child,
                 )
             found = alive & (found_child >= 0)

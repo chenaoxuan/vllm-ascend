@@ -75,6 +75,38 @@ def test_greedy_tree_reject_batch_mixed_trees() -> None:
     ]
 
 
+def test_greedy_tree_reject_budget_one_empty_and_draft() -> None:
+    """budget=1 used to IndexError when first_child is -1 (child-1 == -2)."""
+    budget = 1
+    spec_len = 1
+    vocab_size = 10
+    tree = empty_tree_layout(3, budget, device="cpu")
+
+    tree.tokens[1, 0] = 3
+    tree.parents[1, 0] = 0
+    tree.num_nodes[1] = 1
+    tree.first_child[1, 0] = 1
+
+    tree.tokens[2, 0] = 3
+    tree.parents[2, 0] = 0
+    tree.num_nodes[2] = 1
+    tree.first_child[2, 0] = 1
+
+    target_ids = torch.zeros(3, budget + 1, dtype=torch.long)
+    target_ids[0, 0] = 7
+    target_ids[1, 0] = 3
+    target_ids[1, 1] = 8
+    target_ids[2, 0] = 9
+    target_logits = _logits_from_greedy_ids(target_ids, vocab_size)
+
+    sampled = greedy_tree_reject(tree, target_logits, spec_len)
+    assert sampled.tolist() == [
+        [7, -1],
+        [3, 8],
+        [9, -1],
+    ]
+
+
 def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
     budget = 8
     spec_len = 3

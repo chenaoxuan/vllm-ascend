@@ -258,10 +258,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
+        self.tree_spec_enabled = dflash_tree_spec_enabled()
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
-            tree_enabled = dflash_tree_spec_enabled()
-            if tree_enabled:
+            if self.tree_spec_enabled:
                 # Packed tree verify is budget+1, not spec_depth+1.
                 self.decode_threshold = dflash_tree_decode_query_len(spec_token_num)
             else:
@@ -295,9 +295,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
     ) -> tuple[int, int, int, int]:
+        # Tree decode_threshold is 1+budget. A first prefill shorter than that
+        # (e.g. "what is your name" with budget=4) must stay a prefill, or FIA
+        # tree-decode BSND runs without page attention.
+        treat_short_as_decode = True
+        if self.tree_spec_enabled and common_attn_metadata.is_prefilling is not None:
+            treat_short_as_decode = False
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
+            treat_short_extends_as_decodes=treat_short_as_decode,
         )
 
     def _build_backend_metadata(
@@ -1465,10 +1472,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         query, key, value, key, passed_value, block_size, block_table, attn_metadata, output
                     )
 
+                # FIA enables page attention only when block_table is set.
+                # PrefillNoCache keeps 3D dense K/V; BSND 4D query then hits
+                # "value'dim should equal to query's dim".
                 if (
                     dflash_tree_spec_enabled()
                     and attn_metadata.num_prefills == 0
                     and attn_metadata.num_decodes > 0
+                    and block_table is not None
+                    and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
                 ):
                     attn_output = self._forward_tree_decode_fia(
                         query,
@@ -1529,7 +1541,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
         TND + sparse_mode=1 does not honor batched custom masks (FIA TND only
         documents sparse 0/3). DCP spec decode uses BSND for the same reason.
         """
-        use_bsnd = num_decodes > 0 and num_tokens % num_decodes == 0
+        use_bsnd = (
+            block_table is not None
+            and num_decodes > 0
+            and num_tokens % num_decodes == 0
+        )
         if use_bsnd:
             q_len = num_tokens // num_decodes
             fia_query = query[:num_tokens].view(num_decodes, q_len, self.num_heads, self.head_size)

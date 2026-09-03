@@ -11,6 +11,7 @@ from vllm_ascend.worker.v2.spec_decode import dflash_tree_decode_query_len
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
     compact_tree_query_along_path,
+    mask_rejected_dflash_context_slots,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.tree.utils import (
@@ -278,6 +279,30 @@ def test_tree_query_compact_along_non_prefix_path() -> None:
     assert torch.equal(hidden[2], before_h[1])
     assert torch.equal(hidden[3], before_h[3])
     assert torch.equal(pos, torch.tensor([10, 11, 12, 12]))
+
+    # path=[1] with a same-depth leftover sibling: compact leaves the sibling
+    # on the rejected suffix sharing RoPE 11. DFlash must PAD that suffix so
+    # it cannot clobber the accepted node's draft KV slot.
+    hidden = before_h.clone()
+    pos = torch.tensor([10, 11, 11, 12], dtype=torch.int64)
+    compact_tree_query_along_path(
+        [hidden],
+        query_start_loc,
+        torch.tensor([[1, -1, -1]], dtype=torch.long),
+        linearize_positions=pos,
+    )
+    assert torch.equal(hidden[0], before_h[0])
+    assert torch.equal(hidden[1], before_h[1])
+    assert torch.equal(hidden[2], before_h[2])
+    assert torch.equal(pos, torch.tensor([10, 11, 11, 12]))
+    slots = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+    mask_rejected_dflash_context_slots(
+        slots,
+        query_start_loc,
+        torch.tensor([2], dtype=torch.int32),
+        pad_slot_id=-1,
+    )
+    assert torch.equal(slots, torch.tensor([100, 101, -1, -1]))
 
 
 def test_tree_decode_query_len_uses_budget_not_spec_depth() -> None:

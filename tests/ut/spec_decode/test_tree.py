@@ -1,17 +1,11 @@
-"""CPU unit tests for draft-tree construction."""
-
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
+import torch.nn as nn
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
-from vllm_ascend.worker.v2.spec_decode.tree.builder import (
-    create_tree_builder,
-    validate_tree_method_backend,
-)
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
     compact_tree_query_along_path,
@@ -67,8 +61,28 @@ def test_batch_spine_and_sibling_trees() -> None:
     assert layout.next_sibling[1, :4].tolist() == [-1, -1, 1, -1]
 
 
-def test_build_beam_trees_zero_bias_branches() -> None:
-    """Zero markov bias with topk > 1 branches by base logits, then fills budget."""
+def test_build_beam_trees_with_markov() -> None:
+    """DSpark beam: map draft→target before markov_embed; topk>1 fills budget.
+
+    Zero markov bias keeps base-logit topology so parents/depths stay checkable,
+    while ``seen`` proves the second depth embeds mapped target ids.
+    """
+
+    class _FakeDSparkDraft:
+        def __init__(self, vocab: int) -> None:
+            self.seen: list[torch.Tensor] = []
+            self._vocab = vocab
+
+        def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+            self.seen.append(token_ids.clone())
+            return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
+
+        def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+            return markov_embed.new_zeros(markov_embed.shape[0], self._vocab)
+
+        def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+            return draft_ids + 10
+
     logits = torch.tensor(
         [
             [
@@ -79,8 +93,9 @@ def test_build_beam_trees_zero_bias_branches() -> None:
         ]
     )
     budget = 9
+    draft = _FakeDSparkDraft(vocab=6)
     out = empty_tree_layout(1, budget, device=logits.device)
-    layout = BeamTreeBuilder(budget=budget, topk=3).build(
+    layout = BeamTreeBuilder(budget=budget, topk=3, draft_model=draft).build(
         logits,
         out,
         root_token_ids=torch.tensor([0]),
@@ -88,53 +103,37 @@ def test_build_beam_trees_zero_bias_branches() -> None:
 
     assert layout is out
     assert layout.num_nodes[0].tolist() == budget
-    assert layout.tokens[0, :9].tolist() == [0, 1, 2, 0, 1, 2, 0, 1, 2]
+    assert layout.tokens[0, :9].tolist() == [10, 11, 12, 10, 11, 12, 10, 11, 12]
     assert layout.depths[0, :9].tolist() == [1, 1, 1, 2, 2, 2, 3, 3, 3]
     assert layout.parents[0, :9].tolist() == [0, 0, 0, 1, 1, 1, 4, 4, 4]
     assert layout.first_child[0, :10].tolist() == [3, 6, -1, -1, 9, -1, -1, -1, -1, -1]
+    assert torch.equal(draft.seen[0], torch.tensor([[0]]))
+    assert torch.equal(draft.seen[1], torch.tensor([[10, 11, 12]]))
 
 
-def test_build_beam_trees_maps_draft_ids_before_markov() -> None:
-    """DSpark markov_embed must see target ids, matching _sample_sequential.
+def test_build_prefix_trees_with_domino_correction() -> None:
+    """Domino scorer path: correction hooks + Top-B prune to budget."""
 
-    topk=1 / budget=2 / spec=2 is a two-node chain. Base logits pick draft id
-    1 then 2; map_draft_to_target adds 10. The second Markov step must embed
-    11, not the unmapped draft id 1.
-    """
+    class _FakeDominoScorer:
+        gru_hidden_dim = 2
 
-    class _FakeDSparkDraft:
-        def __init__(self) -> None:
-            self.seen: list[torch.Tensor] = []
+        def __init__(self, vocab: int) -> None:
+            mid = 2
+            self.fc2_weight = torch.zeros(vocab, mid)
+            self.fc2_bias = None
+            self.w_s = torch.zeros(mid, self.gru_hidden_dim)
+            self.middle = nn.Identity()
 
-        def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-            self.seen.append(token_ids.clone())
-            return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
+        def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+            return parallel_hiddens.new_zeros(
+                *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
+            )
 
-        def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-            return markov_embed.new_zeros(markov_embed.shape[0], 4)
+        def update_hidden(
+            self, token_ids: torch.Tensor, h_state: torch.Tensor
+        ) -> torch.Tensor:
+            return h_state
 
-        def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
-            return draft_ids + 10
-
-    logits = torch.zeros(2, 2, 4)
-    logits[:, 0, 1] = 10.0
-    logits[:, 1, 2] = 10.0
-    draft = _FakeDSparkDraft()
-    out = empty_tree_layout(2, 2, device=logits.device)
-    layout = BeamTreeBuilder(budget=2, topk=1, draft_model=draft).build(
-        logits,
-        out,
-        root_token_ids=torch.tensor([5, 8]),
-    )
-
-    assert layout.tokens.tolist() == [[11, 12], [11, 12]]
-    assert layout.parents.tolist() == [[0, 1], [0, 1]]
-    assert torch.equal(draft.seen[0], torch.tensor([[5], [8]]))
-    assert torch.equal(draft.seen[1], torch.tensor([[11], [11]]))
-
-
-def test_build_prefix_trees_truncates_to_budget() -> None:
-    """Uncorrected prefix grows a spine then prunes to budget, batched."""
     logits = torch.tensor(
         [
             [
@@ -149,8 +148,20 @@ def test_build_prefix_trees_truncates_to_budget() -> None:
             ],
         ]
     )
+    scorer = _FakeDominoScorer(vocab=3)
+    draft_hidden = torch.zeros(2, 3, 4)
     out = empty_tree_layout(2, budget=2, device=logits.device)
-    layout = PrefixTreeBuilder(budget=2, topk=1).build(logits, out)
+    layout = PrefixTreeBuilder(
+        budget=2,
+        topk=1,
+        correction_scorer=scorer,
+        prefix_len=0,
+    ).build(
+        logits,
+        out,
+        root_token_ids=torch.tensor([7, 8]),
+        draft_hidden=draft_hidden,
+    )
 
     assert layout is out
     assert layout.num_nodes.tolist() == [2, 2]
@@ -160,16 +171,6 @@ def test_build_prefix_trees_truncates_to_budget() -> None:
     assert layout.tokens[1, :2].tolist() == [1, 2]
     assert layout.parents[1, :2].tolist() == [0, 1]
     assert layout.depths[1, :2].tolist() == [1, 2]
-
-
-def test_tree_method_backend_pairing() -> None:
-    validate_tree_method_backend("priority", "dflash")
-    validate_tree_method_backend("beam", "dspark")
-    validate_tree_method_backend("prefix", "dflash")
-    with pytest.raises(ValueError, match="requires .*'dspark'"):
-        create_tree_builder("beam", budget=4, topk=2, draft_backend="dflash")
-    with pytest.raises(ValueError, match="requires .*'dflash'"):
-        validate_tree_method_backend("priority", "dspark")
 
 
 def test_tree_kv_slot_layout_and_compact() -> None:

@@ -5,6 +5,7 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
@@ -114,10 +115,10 @@ def _pack_tree_target_logits(
 
 
 class TreeRejectionSampler(RejectionSampler):
-    """v2 rejection sampler that greedy-verifies a DFlash draft tree.
+    """v2 rejection sampler for a DFlash draft tree.
 
-    ``block_tree_reject`` is implemented for a later switch; this class still
-    calls ``greedy_tree_reject``.
+    ``tree_spec_config.rejection_sampler`` selects ``greedy_tree_reject`` or
+    ``block_tree_reject`` (``magicmtp``).
     """
 
     path_node_ids: torch.Tensor | None = None
@@ -152,12 +153,22 @@ class TreeRejectionSampler(RejectionSampler):
             dtype=torch.long,
             device=logits.device,
         )
-        sampled = greedy_tree_reject(
-            tree,
-            target_logits,
-            self.num_speculative_steps,
-            path_node_ids=path_node_ids,
-        )
+        method = get_ascend_config().tree_spec_config.rejection_sampler
+        if method == "magicmtp":
+            sampled = block_tree_reject(
+                tree,
+                target_logits,
+                draft_logits,
+                self.num_speculative_steps,
+                path_node_ids=path_node_ids,
+            )
+        else:
+            sampled = greedy_tree_reject(
+                tree,
+                target_logits,
+                self.num_speculative_steps,
+                path_node_ids=path_node_ids,
+            )
         num_reqs = input_batch.num_reqs
         num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
         cu = input_batch.cu_num_logits[: num_reqs + 1]
@@ -302,6 +313,7 @@ def _write_path(
     parents: torch.Tensor,
     tokens: torch.Tensor,
     y: torch.Tensor,
+    path_node_ids: torch.Tensor | None = None,
 ) -> None:
     device = sampled.device
     zero = torch.zeros((), dtype=torch.long, device=device)
@@ -324,6 +336,10 @@ def _write_path(
         safe = (cur - 1).clamp(min=0)
         tok = torch.where(is_node, tokens[safe], pad)
         sampled[req_idx, slot] = torch.where(write, tok, sampled[req_idx, slot])
+        if path_node_ids is not None:
+            path_node_ids[req_idx, slot] = torch.where(
+                write, cur, path_node_ids[req_idx, slot]
+            )
         d = torch.where(is_node, d - 1, d)
         cur = torch.where(is_node, parents[safe].to(torch.long), cur)
 
@@ -335,20 +351,25 @@ def block_tree_reject(
     num_speculative_tokens: int,
     etas: torch.Tensor | None = None,
     recover_u: torch.Tensor | None = None,
+    path_node_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MagicMTP Block Verify on a draft tree, from leaf to root.
 
-    Not yet selected by ``TreeRejectionSampler``; greedy is the live path.
+    这是 MagicMTP 在树上的扩展。
+
     ``target_logits`` is ``[num_reqs, budget + 1, vocab]``, node 0 = root.
     ``draft_logits`` is ``[num_reqs, spec_num, vocab]`` (DFlash depth rows) or
     ``None`` (q=1, one-hot residual). No temperature / top-k / top-p.
 
     Accepts the whole root→leaf block, or rejects the leaf and updates residual
     ``M_b`` / ``M_s`` / ``p`` at the parent. Recovers a single token ``Y`` from
-    ``M_b`` at the accepted prefix.
+    ``M_b`` at the accepted prefix. Works with a single draft node (no
+    ``max_spec_len`` gate).
 
     ``etas`` is ``[num_reqs, max_visits]`` accept/reject draws. ``recover_u``
     is ``[num_reqs]`` for the final ``Y``. Unused outputs are ``-1``.
+    When ``path_node_ids`` is set it is filled with accepted draft node ids
+    ``[num_reqs, spec_len]`` (``-1`` unused).
     """
     tokens = tree.tokens
     device = tokens.device
@@ -369,6 +390,11 @@ def block_tree_reject(
         dtype=torch.long,
         device=device,
     )
+    if path_node_ids is None:
+        path_out = None
+    else:
+        path_out = path_node_ids[:num_reqs, :spec_len]
+        path_out.fill_(-1)
     zero_long = torch.zeros((), dtype=torch.long, device=device)
     vocab_idx = torch.arange(vocab, device=device)
 
@@ -429,6 +455,8 @@ def block_tree_reject(
             )
 
         y = _sample_token(mb[tau], recover_u[req_idx])
-        _write_path(sampled, req_idx, spec_len, tau, par, tok, y)
+        _write_path(
+            sampled, req_idx, spec_len, tau, par, tok, y, path_node_ids=path_out
+        )
 
     return sampled

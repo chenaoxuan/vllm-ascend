@@ -98,6 +98,14 @@ class AscendRequestState(RequestState):
                 dtype=torch.int32,
                 device=device,
             )
+            self.tree_proposal_logits: torch.Tensor | None = None
+            if get_ascend_config().tree_spec_config.rejection_sampler == "magicmtp":
+                self.tree_proposal_logits = torch.full(
+                    (self.max_num_reqs, max_nodes + 1, vocab_size),
+                    float("-inf"),
+                    dtype=torch.float32,
+                    device=device,
+                )
 
 
     def add_request(

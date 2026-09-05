@@ -42,6 +42,7 @@ class BeamTreeBuilder(TreeBuilder):
         *,
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
+        proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
         budget = self.budget
         topk = self.topk
@@ -59,11 +60,29 @@ class BeamTreeBuilder(TreeBuilder):
         pool_parents = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
         pool_depth = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
 
+        # Temp proposal indexed by root=0 and pool slot i -> i+1. Remapped later.
+        max_pool = spec_num * k * k
+        prop_temp = None
+        if proposal_logits is not None:
+            prop_temp = draft_logits.new_full(
+                (num_reqs, max_pool + 1, vocab), float("-inf")
+            )
+
         for depth in range(spec_num):
             batch = frontier_tokens.size(1)
             step_logits = _markov_correct_logits(
                 draft_model, draft_logits[:, depth], frontier_tokens
             )
+            if prop_temp is not None:
+                req_idx = torch.arange(num_reqs, device=device)
+                for j in range(batch):
+                    parent_pool = frontier_pools[:, j]
+                    temp_id = torch.where(
+                        parent_pool < 0,
+                        torch.zeros((), dtype=torch.long, device=device),
+                        parent_pool + 1,
+                    ).clamp(max=prop_temp.shape[1] - 1)
+                    prop_temp[req_idx, temp_id] = step_logits[:, j]
             log_probs = torch.log_softmax(step_logits.float(), dim=-1)
             top_vals, top_ids = log_probs.topk(k, dim=-1)
             if draft_model is not None:
@@ -130,4 +149,18 @@ class BeamTreeBuilder(TreeBuilder):
 
         tokens = torch.gather(pool_tokens, 1, packed)
         depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
-        return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+        finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+
+        if proposal_logits is not None and prop_temp is not None:
+            proposal_logits.fill_(float("-inf"))
+            proposal_logits[:, 0] = prop_temp[:, 0]
+            req_idx = torch.arange(num_reqs, device=device)
+            for pool_idx in range(num_pool):
+                final_id = remap[:, pool_idx]
+                has = final_id > 0
+                proposal_logits[req_idx, final_id.clamp(min=0)] = torch.where(
+                    has.unsqueeze(-1),
+                    prop_temp[:, pool_idx + 1],
+                    proposal_logits[req_idx, final_id.clamp(min=0)],
+                )
+        return out

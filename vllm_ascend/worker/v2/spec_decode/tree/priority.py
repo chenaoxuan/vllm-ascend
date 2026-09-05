@@ -3,7 +3,10 @@ import heapq
 import numpy as np
 import torch
 
-from vllm_ascend.worker.v2.spec_decode.tree.builder import TreeBuilder
+from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+    TreeBuilder,
+    fill_shared_depth_proposal_logits,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
 
 
@@ -20,6 +23,7 @@ class PriorityTreeBuilder(TreeBuilder):
         *,
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
+        proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
         budget = self.budget
         topk = self.topk
@@ -62,16 +66,27 @@ class PriorityTreeBuilder(TreeBuilder):
             out.first_child.fill_(-1)
             out.next_sibling.fill_(-1)
             out.num_nodes.zero_()
+            if proposal_logits is not None:
+                proposal_logits.fill_(float("-inf"))
             return out
 
         if np.all(num_nodes_np == num_nodes):
-            return finalize_tree_layout(
+            finalize_tree_layout(
                 out,
                 tokens[:, :num_nodes],
                 depths[:, :num_nodes],
                 parent_ids[:, :num_nodes],
                 num_nodes,
             )
+            if proposal_logits is not None:
+                fill_shared_depth_proposal_logits(
+                    proposal_logits,
+                    draft_logits,
+                    out.parents,
+                    out.depths,
+                    num_nodes,
+                )
+            return out
 
         # Per-request sizes differ: finalize each row (pad width is not shared).
         out.tokens.fill_(-1)
@@ -81,6 +96,8 @@ class PriorityTreeBuilder(TreeBuilder):
         out.first_child.fill_(-1)
         out.next_sibling.fill_(-1)
         out.num_nodes.zero_()
+        if proposal_logits is not None:
+            proposal_logits.fill_(float("-inf"))
         for req_idx in range(num_reqs):
             n = int(num_nodes_np[req_idx])
             if n == 0:
@@ -101,6 +118,14 @@ class PriorityTreeBuilder(TreeBuilder):
                 parent_ids[req_idx : req_idx + 1, :n],
                 n,
             )
+            if proposal_logits is not None:
+                fill_shared_depth_proposal_logits(
+                    proposal_logits[req_idx : req_idx + 1],
+                    draft_logits[req_idx : req_idx + 1],
+                    out.parents[req_idx : req_idx + 1],
+                    out.depths[req_idx : req_idx + 1],
+                    n,
+                )
         return out
 
 

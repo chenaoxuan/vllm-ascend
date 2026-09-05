@@ -208,7 +208,8 @@ def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
     mb = torch.tensor([0.3, 0.4, 0.3])
     ms = torch.tensor([0.6, 0.3, 0.1])
     target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
-    draft = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 2, 3).contiguous()
+    # Node-indexed proposal (budget+1=6), same M_s on every node as the paper fixture.
+    proposal = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
     logits = target.reshape(6, 3)
 
     tree = empty_tree_layout(1, 5, device="cpu")
@@ -248,6 +249,7 @@ def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
         tree_visibility=tree.visibility,
         tree_first_child=tree.first_child,
         tree_next_sibling=tree.next_sibling,
+        tree_proposal_logits=proposal,
     )
 
     with patch(
@@ -260,9 +262,42 @@ def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
             return block_tree_reject(*args, **kwargs)
 
         wrapped.side_effect = _fixed_block
-        output = rejection_sampler(logits, input_batch, draft_logits=draft)
+        # draft_logits deliberately None: MagicMTP must use tree_proposal_logits.
+        output = rejection_sampler(logits, input_batch, draft_logits=None)
 
     assert wrapped.called
     assert output.sampled_token_ids.tolist() == [[2, 0, 0]]
     assert rejection_sampler.path_node_ids.tolist() == [[2, 5]]
     assert torch.equal(input_batch.path_node_ids, rejection_sampler.path_node_ids)
+
+
+def test_block_tree_reject_node_indexed_proposal() -> None:
+    """Node-indexed proposal logits (budget+1) match the depth-indexed paper path."""
+    mb = torch.tensor([0.3, 0.4, 0.3])
+    ms = torch.tensor([0.6, 0.3, 0.1])
+    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+    proposal = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+
+    tree = empty_tree_layout(1, 5, device="cpu")
+    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
+    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
+    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
+    tree.num_nodes[0] = 5
+    tree.first_child[0, 0] = 1
+    tree.next_sibling[0, 1] = 2
+    tree.first_child[0, 1] = 3
+    tree.next_sibling[0, 3] = 4
+    tree.first_child[0, 2] = 5
+
+    path_node_ids = torch.full((1, 2), -1, dtype=torch.long)
+    sampled = block_tree_reject(
+        tree,
+        target,
+        proposal,
+        2,
+        etas=torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]]),
+        recover_u=torch.zeros(1),
+        path_node_ids=path_node_ids,
+    )
+    assert sampled.tolist() == [[2, 0, 0]]
+    assert path_node_ids.tolist() == [[2, 5]]

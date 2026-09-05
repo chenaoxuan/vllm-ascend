@@ -15,6 +15,51 @@ METHOD_REQUIRED_BACKEND: dict[str, str] = {
 }
 
 
+def fill_shared_depth_proposal_logits(
+    proposal_logits: torch.Tensor,
+    draft_logits: torch.Tensor,
+    parents: torch.Tensor,
+    depths: torch.Tensor,
+    num_nodes: int,
+) -> None:
+    """Write depth-shared draft rows into node-indexed ``proposal_logits``.
+
+    ``proposal_logits`` is ``[R, budget + 1, V]`` (node id axis). Column ``j`` is
+    the proposal used to sample children of node ``j``. For parallel-draft
+    builders without per-parent correction, every parent at depth ``d`` shares
+    ``draft_logits[:, d]``.
+    """
+    num_reqs, spec_num, _vocab = draft_logits.shape
+    device = draft_logits.device
+    proposal_logits.fill_(float("-inf"))
+    proposal_logits[:, 0] = draft_logits[:, 0]
+    if num_nodes <= 0:
+        return
+    req_idx = torch.arange(num_reqs, device=device)
+    for slot in range(num_nodes):
+        depth = depths[:, slot].to(torch.long)
+        parent = parents[:, slot].to(torch.long)
+        valid = depth > 0
+        row = (depth - 1).clamp(min=0, max=spec_num - 1)
+        parent_logits = draft_logits[req_idx, row]
+        safe_parent = parent.clamp(min=0, max=proposal_logits.shape[1] - 1)
+        proposal_logits[req_idx, safe_parent] = torch.where(
+            valid.unsqueeze(-1),
+            parent_logits,
+            proposal_logits[req_idx, safe_parent],
+        )
+        # Node itself as a future parent: depth-d row proposes depth d+1.
+        node = slot + 1
+        as_parent = valid & (depth < spec_num)
+        child_row = depth.clamp(min=0, max=spec_num - 1)
+        node_logits = draft_logits[req_idx, child_row]
+        proposal_logits[req_idx, node] = torch.where(
+            as_parent.unsqueeze(-1),
+            node_logits,
+            proposal_logits[req_idx, node],
+        )
+
+
 class TreeBuilder(ABC):
     """Base for draft-tree topology builders.
 
@@ -23,7 +68,9 @@ class TreeBuilder(ABC):
     ``tree_spec_config.method``.
 
     ``build()`` writes into ``out`` and returns it. Subclasses ignore kwargs
-    they do not need (no probing fallbacks).
+    they do not need (no probing fallbacks). When ``proposal_logits`` is set
+    (``[R, budget + 1, V]``), builders fill the actual expansion distribution
+    at each node (raw depth rows, or Domino / Markov corrected).
     """
 
     required_backend: ClassVar[str]
@@ -41,6 +88,7 @@ class TreeBuilder(ABC):
         *,
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
+        proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
         """Expand ``draft_logits`` [R, spec_num, vocab] into ``out``."""
 

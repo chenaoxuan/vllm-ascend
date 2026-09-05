@@ -544,7 +544,7 @@ def build_multi_order_trees(
 
         new_ids = torch.arange(
             start, start + take, dtype=torch.long, device=device
-        ).unsqueeze(0)
+        ).unsqueeze(0).expand(num_reqs, -1)  # [R, take]
         if take < width:
             new_ids = torch.cat(
                 [

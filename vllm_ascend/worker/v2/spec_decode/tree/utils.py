@@ -58,13 +58,13 @@ def empty_tree_layout(
     )
 
 
-def build_best_first_trees(
+def build_heap_trees(
     draft_logits: torch.Tensor,
     budget: int,
     topk: int,
     out: TreeLayout,
 ) -> TreeLayout:
-    """Expand shared-depth DFlash logits into a best-first draft tree.
+    """Expand shared-depth DFlash logits into a heap (best-first) draft tree.
 
     Path scores are sums of log-softmax values along the unique token ranks
     chosen at each depth. Results are written into out and returned.
@@ -90,7 +90,7 @@ def build_best_first_trees(
     next_sibling_np = np.full((num_reqs, budget + 1), -1, dtype=np.int32)
 
     for req_idx in range(num_reqs):
-        node_count = _expand_one_tree(
+        node_count = _expand_one_heap_tree(
             top_log_probs_np[req_idx],
             top_token_ids_np[req_idx],
             budget,
@@ -113,7 +113,7 @@ def build_best_first_trees(
     return out
 
 
-def _expand_one_tree(
+def _expand_one_heap_tree(
     top_log_probs: np.ndarray,
     top_token_ids: np.ndarray,
     budget: int,
@@ -264,6 +264,7 @@ class DominoCorrectionScorer:
         if not isinstance(modules[0], nn.Linear) or not isinstance(modules[-1], nn.Linear):
             raise ValueError("embed_proj first/last layers must be nn.Linear")
         fc1 = modules[0]
+        fc2 = modules[-1]
         middle = (
             nn.Sequential(*modules[1:-1]) if len(modules) > 2 else nn.Identity()
         )
@@ -338,7 +339,7 @@ def _dar_corrected_candidates(
     return top_scores, sel_ids
 
 
-def build_dar_tree(
+def build_multi_order_trees(
     draft_logits: torch.Tensor,
     budget: int,
     topk: int,
@@ -353,6 +354,7 @@ def build_dar_tree(
     root_token_ids: torch.Tensor | None = None,
     prefix_len: int = 0,
     candidate_vocab_size: int | None = None,
+    correction_scorer: DominoCorrectionScorer | None = None,
 ) -> TreeLayout:
     """Expand base logits into DARTrees, batched over requests.
 
@@ -392,7 +394,9 @@ def build_dar_tree(
         prefix_len: number of leading depths scored from base logits without
             correction (mirrors ``pure_draft_prefix_len`` in the reference).
         candidate_vocab_size: number of candidate tokens gathered per depth for
-            the correction scorer; defaults to ``vocab``.
+            the correction scorer; defaults to ``topk``.
+        correction_scorer: optional prebuilt ``DominoCorrectionScorer`` so the
+            GRU lookup table is not rebuilt every draft step.
     """
     num_reqs, block_size, vocab = draft_logits.shape
     device = draft_logits.device
@@ -411,19 +415,15 @@ def build_dar_tree(
         width = max(1, min(int(np.ceil(budget / block_size)), k, budget))
     supertree_budget = width * block_size
 
-    with_correction = draft_model is not None and target_model is not None
+    with_correction = correction_scorer is not None or (
+        draft_model is not None and target_model is not None
+    )
     if with_correction:
-        if draft_hidden is None or root_token_ids is None:
-            raise ValueError(
-                "Domino correction requires draft_hidden and root_token_ids"
+        if correction_scorer is None:
+            correction_scorer = DominoCorrectionScorer(
+                draft_model, target_model, hidden_dim=draft_hidden.shape[-1]
             )
-        correction_scorer = DominoCorrectionScorer(
-            draft_model, target_model, hidden_dim=draft_hidden.shape[-1]
-        )
-        # Precompute the per-depth candidate tables (base values + fc2 gather).
-        cand_vocab = vocab if candidate_vocab_size is None else int(candidate_vocab_size)
-        candidate_count = max(int(topk), cand_vocab)
-        candidate_count = max(1, min(candidate_count, vocab))
+        candidate_count = k if candidate_vocab_size is None else min(vocab, int(candidate_vocab_size))
         base_float = draft_logits.float()
         candidate_vals, candidate_ids = torch.topk(
             base_float, k=candidate_count, dim=-1
@@ -442,10 +442,6 @@ def build_dar_tree(
         )  # [R, spec, mid]
         gru_hidden_dim = correction_scorer.gru_hidden_dim
     else:
-        logger.warning(
-            "build_dar_tree received no draft_model/target_model; the draft "
-            "tree will be built from uncorrected base logits."
-        )
         log_probs = torch.log_softmax(draft_logits.float(), dim=-1)  # [R, spec, vocab]
 
     # Node buffers. Node 0 is the root (parent -1); non-root node i+1 has
@@ -590,12 +586,16 @@ def build_dar_tree(
 
     # Write the TreeLayout. Node-level linked-list / visibility fills are
     # sequential over node slots but batched over all requests.
+    out.tokens.fill_(-1)
+    out.depths.zero_()
+    out.parents.fill_(-1)
+    out.visibility.zero_()
+    out.first_child.fill_(-1)
+    out.next_sibling.fill_(-1)
     out.tokens[:, :node_count] = tokens.to(out.tokens.dtype)
     out.depths[:, :node_count] = depths.to(out.depths.dtype)
     out.parents[:, :node_count] = parent_ids.to(out.parents.dtype)
     out.num_nodes[:] = node_count
-    out.first_child[:, :node_count + 1].fill_(-1)
-    out.next_sibling[:, :node_count + 1].fill_(-1)
     for i in range(node_count):
         node_id = i + 1
         parent_id = parent_ids[:, i]  # [R]
@@ -632,25 +632,30 @@ def _markov_correct_logits(
     depth_logits: torch.Tensor,
     frontier_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the DSpark markov logit-bias correction to one depth's base logits.
+    """Apply optional DSpark markov logit-bias to one depth's base logits.
 
-    Mirrors the existing Ascend DSpark drafting loop
-    (``vllm_ascend/spec_decode/llm_base_proposer.py``): the bias is computed from
-    the frontier (previous) token via ``markov_embed`` + ``markov_bias`` and added
-    to the base logits.
+    When ``draft_model`` is set, mirrors the Ascend DSpark drafting loop
+    (``vllm_ascend/spec_decode/llm_base_proposer.py``): bias from the frontier
+    token via ``markov_embed`` + ``markov_bias``. When ``draft_model`` is None,
+    expand the shared-depth base logits across the frontier.
 
     Args:
-        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
+        draft_model: DSpark draft exposing ``markov_embed`` / ``markov_bias``, or
+            None to skip correction.
         depth_logits: [R, vocab] uncorrected base logits of this depth.
         frontier_tokens: [R, batch] token ids of the frontier nodes (the "previous"
             tokens), one per frontier node per request.
 
     Returns:
-        [R, batch, vocab] corrected logits, one row per frontier node.
+        [R, batch, vocab] logits, one row per frontier node.
     """
     base = depth_logits.unsqueeze(1)  # [R, 1, vocab]
-    markov_emb = draft_model.markov_embed(frontier_tokens)      # [R, batch, markov_rank]
-    return base + draft_model.markov_bias(markov_emb)           # [R, batch, vocab]
+    if draft_model is None:
+        return base.expand(-1, frontier_tokens.size(1), -1)
+    markov_emb = draft_model.markov_embed(frontier_tokens)  # [R, batch, markov_rank]
+    # NPU unquantized gemm is 2D-only; flatten then restore the frontier layout.
+    bias = draft_model.markov_bias(markov_emb.reshape(-1, markov_emb.shape[-1]))
+    return base + bias.view(*markov_emb.shape[:-1], -1)
 
 
 def build_beam_trees(
@@ -658,168 +663,34 @@ def build_beam_trees(
     budget: int,
     topk: int,
     out: TreeLayout,
-    draft_model,
     root_token_ids: torch.Tensor,
+    draft_model=None,
 ) -> TreeLayout:
-    """Expand DSpark draft logits into a beam draft tree.
+    """Expand shared-depth draft logits into a beam (PCTree) draft tree.
 
-    Each depth applies Markov bias from the parent token, keeps the top-``topk``
-    children of the current frontier, then truncates the pool to ``budget``
-    nodes. Requests are batched in one pass.
+    Each depth optionally applies Markov bias from the parent token, keeps the
+    top-``topk`` children of the current frontier, then truncates the pool to
+    ``budget`` nodes. Requests are batched in one pass.
 
     Args:
         draft_logits: [num_reqs, spec_num, vocab] shared-depth draft base logits.
         budget: maximum number of non-root nodes per request.
         topk: number of candidate tokens kept at each depth.
         out: TreeLayout to fill in place.
-        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
-        root_token_ids: [num_reqs] already-accepted anchor token per request, used
-            as the depth-0 "previous" token for the markov bias.
+        root_token_ids: [num_reqs] already-accepted anchor token per request.
+        draft_model: optional DSpark draft exposing ``markov_embed`` /
+            ``markov_bias``; None uses base logits only.
     """
     num_reqs, spec_num, vocab = draft_logits.shape
     k = max(1, min(topk, vocab))
     device = draft_logits.device
 
-    # Frontier = the set of nodes at the current depth. Root has no pool slot.
-    frontier_tokens = root_token_ids.unsqueeze(1)  # [R, 1]
-    frontier_scores = torch.zeros(num_reqs, 1, dtype=torch.float32, device=device)
-    frontier_pools = torch.full((num_reqs, 1), -1, dtype=torch.long, device=device)
-
-    pool_tokens = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
-    pool_scores = torch.empty(num_reqs, 0, dtype=torch.float32, device=device)
-    pool_parents = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
-    pool_depth = torch.empty(num_reqs, 0, dtype=torch.long, device=device)
-
-    for depth in range(spec_num):
-        batch = frontier_tokens.size(1)
-        step_logits = _markov_correct_logits(draft_model, draft_logits[:, depth], frontier_tokens)  # [R, batch, vocab]
-        log_probs = torch.log_softmax(step_logits.float(), dim=-1)
-        top_vals, top_ids = log_probs.topk(k, dim=-1)  # [R, batch, k]
-        candidate_scores = frontier_scores.unsqueeze(-1) + top_vals  # [R, batch, k]
-        num_candidates = batch * k
-
-        pool_tokens = torch.cat([pool_tokens, top_ids.reshape(num_reqs, -1)], dim=-1)
-        pool_scores = torch.cat([pool_scores, candidate_scores.reshape(num_reqs, -1)], dim=-1)
-        pool_parents = torch.cat([pool_parents, frontier_pools.repeat_interleave(k, dim=-1)], dim=-1)
-        pool_depth = torch.cat(
-            [pool_depth, torch.full((num_reqs, num_candidates), depth, dtype=torch.long, device=device)],
-            dim=-1,
-        )
-
-        keep = min(k, num_candidates)
-        cand_flat = candidate_scores.reshape(num_reqs, -1)  # [R, num_candidates]
-        top_ids_flat = top_ids.reshape(num_reqs, -1)        # [R, num_candidates]
-        selected = cand_flat.topk(keep, dim=-1).indices     # [R, keep]
-        frontier_tokens = torch.gather(top_ids_flat, 1, selected)
-        frontier_scores = torch.gather(cand_flat, 1, selected)
-        frontier_pools = (pool_tokens.size(-1) - num_candidates) + selected
-
-    # Re-rank the whole pool by (depth asc, score desc) and keep budget nodes.
-    num_pool = pool_tokens.size(-1)
-    num_selected = min(int(budget), num_pool)
-    order = torch.argsort(pool_depth, dim=-1, stable=True)  # [R, num_pool]
-    order = torch.gather(
-        order, 1,
-        torch.argsort(torch.gather(pool_scores, 1, order), dim=-1, descending=True, stable=True),
-    )
-    selected = order[:, :num_selected]
-    packed = selected.sort(dim=-1).values                   # [R, num_selected]
-    num_nodes = num_selected
-
-    remap = torch.zeros(num_reqs, num_pool, dtype=torch.long, device=device)
-    node_ids = torch.arange(1, num_nodes + 1, dtype=torch.long, device=device).unsqueeze(0)
-    remap.scatter_(1, packed, node_ids.expand(num_reqs, num_nodes))
-    pool_parent_packed = torch.gather(pool_parents, 1, packed)
-    non_root = pool_parent_packed >= 0
-    raw_parent = torch.gather(remap, 1, pool_parent_packed.clamp(min=0))
-    parent_indices = torch.where(non_root, raw_parent, torch.zeros_like(raw_parent))  # [R, num_nodes]
-
-    out.tokens[:, :num_nodes] = torch.gather(pool_tokens, 1, packed)
-    out.depths[:, :num_nodes] = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
-    out.parents[:, :num_nodes] = parent_indices.to(torch.int32)
-    out.num_nodes[:] = num_nodes
-
-    # first_child / next_sibling: linked-list, sequential over node slots (batched over R).
-    for i in range(num_nodes):
-        node_id = i + 1
-        parent_id = parent_indices[:, i]  # [R]
-        cur_first = torch.gather(out.first_child, 1, parent_id.unsqueeze(1)).squeeze(1)  # [R]
-        out.next_sibling[:, node_id] = cur_first
-        out.first_child.scatter_(
-            1, parent_id.unsqueeze(1),
-            torch.full((num_reqs, 1), node_id, dtype=torch.int32, device=device),
-        )
-
-    # visibility: a node sees its parent's visible set plus itself (batched over R).
-    for i in range(num_nodes):
-        parent_id = parent_indices[:, i]  # [R]
-        if i > 0:
-            src_idx = (parent_id - 1).clamp(min=0)  # [R]
-            parent_vis = torch.gather(
-                out.visibility[:, :num_nodes, :i],
-                1,
-                src_idx.unsqueeze(1).unsqueeze(-1).expand(-1, 1, i),
-            ).squeeze(1)  # [R, i]
-            out.visibility[:, i, :i] = torch.where(
-                (parent_id > 0).unsqueeze(-1), parent_vis, out.visibility[:, i, :i]
-            )
-        out.visibility[:, i, i] = True
-
-    return out
-
-
-def _markov_correct_logits(
-    draft_model,
-    depth_logits: torch.Tensor,
-    frontier_tokens: torch.Tensor,
-) -> torch.Tensor:
-    """Apply the DSpark markov logit-bias correction to one depth's base logits.
-
-    Mirrors the existing Ascend DSpark drafting loop
-    (``vllm_ascend/spec_decode/llm_base_proposer.py``): the bias is computed from
-    the frontier (previous) token via ``markov_embed`` + ``markov_bias`` and added
-    to the base logits.
-
-    Args:
-        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
-        depth_logits: [R, vocab] uncorrected base logits of this depth.
-        frontier_tokens: [R, batch] token ids of the frontier nodes (the "previous"
-            tokens), one per frontier node per request.
-
-    Returns:
-        [R, batch, vocab] corrected logits, one row per frontier node.
-    """
-    base = depth_logits.unsqueeze(1)  # [R, 1, vocab]
-    markov_emb = draft_model.markov_embed(frontier_tokens)      # [R, batch, markov_rank]
-    return base + draft_model.markov_bias(markov_emb)           # [R, batch, vocab]
-
-
-def build_beam_trees(
-    draft_logits: torch.Tensor,
-    budget: int,
-    topk: int,
-    out: TreeLayout,
-    draft_model,
-    root_token_ids: torch.Tensor,
-) -> TreeLayout:
-    """Expand DSpark draft logits into a beam draft tree.
-
-    Each depth applies Markov bias from the parent token, keeps the top-``topk``
-    children of the current frontier, then truncates the pool to ``budget``
-    nodes. Requests are batched in one pass.
-
-    Args:
-        draft_logits: [num_reqs, spec_num, vocab] shared-depth draft base logits.
-        budget: maximum number of non-root nodes per request.
-        topk: number of candidate tokens kept at each depth.
-        out: TreeLayout to fill in place.
-        draft_model: DSpark draft model exposing ``markov_embed`` / ``markov_bias``.
-        root_token_ids: [num_reqs] already-accepted anchor token per request, used
-            as the depth-0 "previous" token for the markov bias.
-    """
-    num_reqs, spec_num, vocab = draft_logits.shape
-    k = max(1, min(topk, vocab))
-    device = draft_logits.device
+    out.first_child.fill_(-1)
+    out.next_sibling.fill_(-1)
+    out.visibility.zero_()
+    out.tokens.fill_(-1)
+    out.depths.zero_()
+    out.parents.fill_(-1)
 
     # Frontier = the set of nodes at the current depth. Root has no pool slot.
     frontier_tokens = root_token_ids.unsqueeze(1)  # [R, 1]

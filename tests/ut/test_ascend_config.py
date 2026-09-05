@@ -37,6 +37,7 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
+    TreeSpecConfig,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -189,6 +190,7 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
         self.assertFalse(ascend_config.tree_spec_config.enabled)
+        self.assertIsNone(ascend_config.tree_spec_config.method)
         self.assertIsNone(ascend_config.tree_spec_config.budget)
         self.assertIsNone(ascend_config.tree_spec_config.topk)
 
@@ -258,13 +260,29 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "budget": 8, "topk": 4},
+            "tree_spec_config": {"enabled": True, "method": "heap", "budget": 8, "topk": 4},
             "refresh": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertTrue(ascend_config.tree_spec_config.enabled)
+        self.assertEqual(ascend_config.tree_spec_config.method, "heap")
         self.assertEqual(ascend_config.tree_spec_config.budget, 8)
         self.assertEqual(ascend_config.tree_spec_config.topk, 4)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_tree_spec_requires_method(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "tree_spec_config": {"enabled": True, "budget": 8, "topk": 4},
+            "refresh": True,
+        }
+        with self.assertRaisesRegex(ValueError, "tree_spec_config.method is required"):
+            init_ascend_config(test_vllm_config)
+
+    def test_tree_spec_config_rejects_unknown_method(self):
+        with self.assertRaisesRegex(ValueError, "tree_spec_config.method must be one of"):
+            TreeSpecConfig(enabled=True, method="best_first", budget=8, topk=4)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

@@ -26,12 +26,20 @@ def init_speculator(
 ):
     """Override GPU init_speculator for Ascend NPUs.
 
-    DFlash uses ``AscendTreeSpeculator`` when
+    DFlash and Qwen3 DSpark use ``AscendTreeSpeculator`` when
     ``additional_config.tree_spec_config.enabled`` is true.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.use_dspark():
+        if dflash_tree_spec_enabled(vllm_config) and _is_qwen3_dspark(
+            speculative_config
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
         )
@@ -64,6 +72,12 @@ def init_speculator(
 
         return AscendEagleSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
+
+
+def _is_qwen3_dspark(speculative_config) -> bool:
+    draft = getattr(speculative_config, "draft_model_config", None)
+    arches = getattr(draft, "architectures", None) or ()
+    return "Qwen3DSparkModel" in arches
 
 
 def dflash_tree_spec_enabled(vllm_config: VllmConfig=None) -> bool:

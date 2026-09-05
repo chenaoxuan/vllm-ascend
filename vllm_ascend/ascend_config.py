@@ -342,6 +342,7 @@ class AscendConfig:
             },
             "tree_spec_config": {
                 "enabled": false,
+                "method": null,
                 "budget": null,
                 "topk": null
             },
@@ -862,15 +863,20 @@ class TreeSpecConfig:
 
     When ``enabled`` is true, the v2 DFlash speculator expands shared depth
     logits into a draft tree instead of a single linear draft chain, and
-    ``budget`` / ``topk`` are required. Target verify walks the tree with
-    greedy token-id matching.
+    ``method`` / ``budget`` / ``topk`` are required. Target verify walks the
+    tree with greedy token-id matching.
+
+    ``method`` selects the builder: ``heap``, ``beam`` (applies the DSpark
+    markov head when the draft is Qwen3 DSpark), or ``multi_order`` (applies
+    Domino ``embed_proj`` / ``prefix_gru`` when the draft is
+    ``projector_type=domino``). There is no default; it must be set when
+    enabled.
 
     ``budget`` is the per-request node budget excluding the already-accepted
     root; it must be >= ``num_speculative_tokens``.
 
     ``topk`` is the per-depth candidate count: how many logits are kept at each
-    mask position before best-first expansion. It is independent of
-    ``budget``.
+    mask position before expansion. It is independent of ``budget``.
 
     Usage::
 
@@ -879,6 +885,7 @@ class TreeSpecConfig:
             additional_config={
                 "tree_spec_config": {
                     "enabled": True,
+                    "method": "heap",
                     "budget": 8,
                     "topk": 4,
                 }
@@ -886,12 +893,25 @@ class TreeSpecConfig:
         )
     """
 
+    SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("heap", "beam", "multi_order")
+
     enabled: bool = False
+    method: str | None = None
     budget: int | None = None
     topk: int | None = None
 
     @model_validator(mode="after")
     def _validate(self):
+        if self.method is not None and self.method not in self.SUPPORTED_METHODS:
+            raise ValueError(
+                f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "
+                f"got {self.method!r}"
+            )
+        if self.enabled and self.method is None:
+            raise ValueError(
+                "tree_spec_config.method is required when enabled "
+                f"(one of {self.SUPPORTED_METHODS})"
+            )
         if self.enabled and (self.budget is None or self.topk is None):
             raise ValueError(
                 "tree_spec_config.budget and tree_spec_config.topk are required when enabled"

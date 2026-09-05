@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
+from vllm_ascend.worker.v2.spec_decode.tree.builder import create_tree_builder
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
     compact_tree_query_along_path,
@@ -173,6 +174,57 @@ def test_build_prefix_trees_with_domino_correction() -> None:
     assert layout.depths[1, :2].tolist() == [1, 2]
 
 
+def test_build_prefix_trees_separates_candidate_size_from_topk() -> None:
+    """Domino shortlist C is independent of expansion k (C=4, k=2)."""
+
+    class _FakeDominoScorer:
+        gru_hidden_dim = 2
+
+        def __init__(self, vocab: int) -> None:
+            mid = 2
+            self.fc2_weight = torch.zeros(vocab, mid)
+            # Rank-4 base token; only reachable when C > k.
+            self.fc2_weight[3] = 20.0
+            self.fc2_bias = None
+            self.w_s = torch.ones(mid, self.gru_hidden_dim)
+            self.middle = nn.Identity()
+
+        def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+            return parallel_hiddens.new_ones(
+                *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
+            )
+
+        def update_hidden(
+            self, token_ids: torch.Tensor, h_state: torch.Tensor
+        ) -> torch.Tensor:
+            return h_state
+
+    logits = torch.tensor([[[10.0, 9.0, 8.0, 7.0, 0.0], [10.0, 9.0, 8.0, 7.0, 0.0]]])
+    out = empty_tree_layout(1, budget=4, device=logits.device)
+    proposal = torch.full((1, 5, 5), float("-inf"))
+    layout = create_tree_builder(
+        method="prefix",
+        budget=4,
+        topk=2,
+        draft_backend="dflash",
+        correction_scorer=_FakeDominoScorer(vocab=5),
+        prefix_len=0,
+        params={"candidate_size": 4},
+    ).build(
+        logits,
+        out,
+        root_token_ids=torch.tensor([0]),
+        draft_hidden=torch.zeros(1, 2, 4),
+        proposal_logits=proposal,
+    )
+
+    assert layout is out
+    assert layout.depths[0, :2].tolist() == [1, 1]
+    assert layout.parents[0, :2].tolist() == [0, 0]
+    assert 3 in layout.tokens[0, :2].tolist()
+    assert torch.isfinite(proposal[0, 0]).sum().tolist() == 4
+
+
 def test_builders_fill_corrected_proposal_logits() -> None:
     """MagicMTP proposal buffer stores Domino / Markov corrected logits, not raw."""
 
@@ -248,7 +300,6 @@ def test_builders_fill_corrected_proposal_logits() -> None:
         topk=3,
         correction_scorer=_FakeDominoScorer(3),
         prefix_len=0,
-        pruned=False,
     ).build(
         dom_logits,
         dom_out,
@@ -426,7 +477,7 @@ def test_prefix_domino_shift_label_samples_bonus_hidden() -> None:
             self.use_local_argmax_reduction = False
             self.draft_tokens = torch.zeros(2, num_spec, dtype=torch.long)
 
-        tree_cfg = SimpleNamespace(method=method, budget=8, topk=4)
+        tree_cfg = SimpleNamespace(method=method, budget=8, topk=4, params={})
         with (
             patch.object(AscendDFlashSpeculator, "__init__", _parent_init),
             patch(

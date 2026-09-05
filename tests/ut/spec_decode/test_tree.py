@@ -1,5 +1,8 @@
 """CPU unit tests for DFlash draft-tree construction."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
@@ -282,3 +285,70 @@ def test_tree_query_compact_along_non_prefix_path() -> None:
         pad_slot_id=-1,
     )
     assert torch.equal(slots, torch.tensor([100, 101, -1, -1]))
+
+
+def test_multi_order_domino_shift_label_samples_bonus_hidden() -> None:
+    """Domino+shift_label uses N queries and samples the bonus as slot 0.
+
+    heap / no-shift_label keep vanilla DFlash 1+N (mask-only) sampling.
+    """
+    from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
+        AscendDFlashSpeculator,
+    )
+    from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+        AscendTreeSpeculator,
+    )
+
+    num_spec = 4
+    device = torch.device("cpu")
+
+    def _speculator(method: str, *, shift_label: bool, projector: str | None):
+        hf = SimpleNamespace(
+            dflash_config={
+                "projector_type": projector,
+                "shift_label": shift_label,
+                "pure_draft_prefix_len": 1,
+            }
+        )
+        vllm_config = SimpleNamespace(
+            speculative_config=SimpleNamespace(
+                num_speculative_tokens=num_spec,
+                use_dflash=lambda: True,
+                use_dspark=lambda: False,
+                draft_model_config=SimpleNamespace(hf_config=hf),
+            )
+        )
+
+        def _parent_init(self, vllm_config, device):
+            self.vllm_config = vllm_config
+            self.device = device
+            self.speculative_config = vllm_config.speculative_config
+            self.num_speculative_steps = num_spec
+            self.max_num_reqs = 2
+            self.sample_from_anchor = False
+            self.num_query_per_req = 1 + num_spec
+            self.use_local_argmax_reduction = False
+            self.draft_tokens = torch.zeros(2, num_spec, dtype=torch.long)
+
+        tree_cfg = SimpleNamespace(method=method, budget=8, topk=4)
+        with (
+            patch.object(AscendDFlashSpeculator, "__init__", _parent_init),
+            patch(
+                "vllm_ascend.worker.v2.spec_decode.tree.speculator.get_ascend_config",
+                return_value=SimpleNamespace(tree_spec_config=tree_cfg),
+            ),
+        ):
+            return AscendTreeSpeculator(vllm_config, device)
+
+    domino = _speculator("multi_order", shift_label=True, projector="domino")
+    assert domino.sample_from_anchor is True
+    assert domino.num_query_per_req == num_spec
+    assert domino._domino_shift_label is True
+
+    heap = _speculator("heap", shift_label=True, projector="domino")
+    assert heap.sample_from_anchor is False
+    assert heap.num_query_per_req == 1 + num_spec
+
+    no_shift = _speculator("multi_order", shift_label=False, projector="domino")
+    assert no_shift.sample_from_anchor is False
+    assert no_shift.num_query_per_req == 1 + num_spec

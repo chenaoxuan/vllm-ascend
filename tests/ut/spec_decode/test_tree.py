@@ -90,6 +90,48 @@ def test_build_beam_trees_zero_bias_branches() -> None:
     assert layout.first_child[0, :10].tolist() == [3, 6, -1, -1, 9, -1, -1, -1, -1, -1]
 
 
+def test_build_beam_trees_maps_draft_ids_before_markov() -> None:
+    """DSpark markov_embed must see target ids, matching _sample_sequential.
+
+    topk=1 / budget=2 / spec=2 is a two-node chain. Base logits pick draft id
+    1 then 2; map_draft_to_target adds 10. The second Markov step must embed
+    11, not the unmapped draft id 1.
+    """
+
+    class _FakeDSparkDraft:
+        def __init__(self) -> None:
+            self.seen: list[torch.Tensor] = []
+
+        def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+            self.seen.append(token_ids.clone())
+            return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
+
+        def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+            return markov_embed.new_zeros(markov_embed.shape[0], 4)
+
+        def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+            return draft_ids + 10
+
+    logits = torch.zeros(2, 2, 4)
+    logits[:, 0, 1] = 10.0
+    logits[:, 1, 2] = 10.0
+    draft = _FakeDSparkDraft()
+    out = empty_tree_layout(2, 2, device=logits.device)
+    layout = build_beam_trees(
+        logits,
+        budget=2,
+        topk=1,
+        out=out,
+        root_token_ids=torch.tensor([5, 8]),
+        draft_model=draft,
+    )
+
+    assert layout.tokens.tolist() == [[11, 12], [11, 12]]
+    assert layout.parents.tolist() == [[0, 1], [0, 1]]
+    assert torch.equal(draft.seen[0], torch.tensor([[5], [8]]))
+    assert torch.equal(draft.seen[1], torch.tensor([[11], [11]]))
+
+
 def test_build_multi_order_trees_truncates_to_budget() -> None:
     """Uncorrected multi_order grows a spine then prunes to budget, batched."""
     logits = torch.tensor(

@@ -1,22 +1,25 @@
-"""CPU unit tests for DFlash draft-tree construction."""
+"""CPU unit tests for draft-tree construction."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
+from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
+from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+    create_tree_builder,
+    validate_tree_method_backend,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     compact_tree_kv_along_path,
     compact_tree_query_along_path,
     mask_rejected_dflash_context_slots,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.utils import (
-    build_beam_trees,
-    build_heap_trees,
-    build_multi_order_trees,
-    empty_tree_layout,
-)
+from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.prefix import PrefixTreeBuilder
+from vllm_ascend.worker.v2.spec_decode.tree.priority import PriorityTreeBuilder
 
 
 def test_batch_spine_and_sibling_trees() -> None:
@@ -35,7 +38,7 @@ def test_batch_spine_and_sibling_trees() -> None:
         ]
     )
     out = empty_tree_layout(2, 3, device=logits.device)
-    layout = build_heap_trees(logits, budget=3, topk=3, out=out)
+    layout = PriorityTreeBuilder(budget=3, topk=3).build(logits, out)
 
     assert layout is out
     assert layout.num_nodes.tolist() == [3, 3]
@@ -77,11 +80,9 @@ def test_build_beam_trees_zero_bias_branches() -> None:
     )
     budget = 9
     out = empty_tree_layout(1, budget, device=logits.device)
-    layout = build_beam_trees(
+    layout = BeamTreeBuilder(budget=budget, topk=3).build(
         logits,
-        budget=budget,
-        topk=3,
-        out=out,
+        out,
         root_token_ids=torch.tensor([0]),
     )
 
@@ -120,13 +121,10 @@ def test_build_beam_trees_maps_draft_ids_before_markov() -> None:
     logits[:, 1, 2] = 10.0
     draft = _FakeDSparkDraft()
     out = empty_tree_layout(2, 2, device=logits.device)
-    layout = build_beam_trees(
+    layout = BeamTreeBuilder(budget=2, topk=1, draft_model=draft).build(
         logits,
-        budget=2,
-        topk=1,
-        out=out,
+        out,
         root_token_ids=torch.tensor([5, 8]),
-        draft_model=draft,
     )
 
     assert layout.tokens.tolist() == [[11, 12], [11, 12]]
@@ -135,8 +133,8 @@ def test_build_beam_trees_maps_draft_ids_before_markov() -> None:
     assert torch.equal(draft.seen[1], torch.tensor([[11], [11]]))
 
 
-def test_build_multi_order_trees_truncates_to_budget() -> None:
-    """Uncorrected multi_order grows a spine then prunes to budget, batched."""
+def test_build_prefix_trees_truncates_to_budget() -> None:
+    """Uncorrected prefix grows a spine then prunes to budget, batched."""
     logits = torch.tensor(
         [
             [
@@ -152,7 +150,7 @@ def test_build_multi_order_trees_truncates_to_budget() -> None:
         ]
     )
     out = empty_tree_layout(2, budget=2, device=logits.device)
-    layout = build_multi_order_trees(logits, budget=2, topk=1, out=out)
+    layout = PrefixTreeBuilder(budget=2, topk=1).build(logits, out)
 
     assert layout is out
     assert layout.num_nodes.tolist() == [2, 2]
@@ -162,6 +160,16 @@ def test_build_multi_order_trees_truncates_to_budget() -> None:
     assert layout.tokens[1, :2].tolist() == [1, 2]
     assert layout.parents[1, :2].tolist() == [0, 1]
     assert layout.depths[1, :2].tolist() == [1, 2]
+
+
+def test_tree_method_backend_pairing() -> None:
+    validate_tree_method_backend("priority", "dflash")
+    validate_tree_method_backend("beam", "dspark")
+    validate_tree_method_backend("prefix", "dflash")
+    with pytest.raises(ValueError, match="requires .*'dspark'"):
+        create_tree_builder("beam", budget=4, topk=2, draft_backend="dflash")
+    with pytest.raises(ValueError, match="requires .*'dflash'"):
+        validate_tree_method_backend("priority", "dspark")
 
 
 def test_tree_kv_slot_layout_and_compact() -> None:
@@ -287,10 +295,10 @@ def test_tree_query_compact_along_non_prefix_path() -> None:
     assert torch.equal(slots, torch.tensor([100, 101, -1, -1]))
 
 
-def test_multi_order_domino_shift_label_samples_bonus_hidden() -> None:
+def test_prefix_domino_shift_label_samples_bonus_hidden() -> None:
     """Domino+shift_label uses N queries and samples the bonus as slot 0.
 
-    heap / no-shift_label keep vanilla DFlash 1+N (mask-only) sampling.
+    priority / no-shift_label keep vanilla DFlash 1+N (mask-only) sampling.
     """
     from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
         AscendDFlashSpeculator,
@@ -340,15 +348,15 @@ def test_multi_order_domino_shift_label_samples_bonus_hidden() -> None:
         ):
             return AscendTreeSpeculator(vllm_config, device)
 
-    domino = _speculator("multi_order", shift_label=True, projector="domino")
+    domino = _speculator("prefix", shift_label=True, projector="domino")
     assert domino.sample_from_anchor is True
     assert domino.num_query_per_req == num_spec
     assert domino._domino_shift_label is True
 
-    heap = _speculator("heap", shift_label=True, projector="domino")
-    assert heap.sample_from_anchor is False
-    assert heap.num_query_per_req == 1 + num_spec
+    priority = _speculator("priority", shift_label=True, projector="domino")
+    assert priority.sample_from_anchor is False
+    assert priority.num_query_per_req == 1 + num_spec
 
-    no_shift = _speculator("multi_order", shift_label=False, projector="domino")
+    no_shift = _speculator("prefix", shift_label=False, projector="domino")
     assert no_shift.sample_from_anchor is False
     assert no_shift.num_query_per_req == 1 + num_spec

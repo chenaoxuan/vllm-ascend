@@ -260,12 +260,12 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "method": "heap", "budget": 8, "topk": 4},
+            "tree_spec_config": {"enabled": True, "method": "priority", "budget": 8, "topk": 4},
             "refresh": True,
         }
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertTrue(ascend_config.tree_spec_config.enabled)
-        self.assertEqual(ascend_config.tree_spec_config.method, "heap")
+        self.assertEqual(ascend_config.tree_spec_config.method, "priority")
         self.assertEqual(ascend_config.tree_spec_config.budget, 8)
         self.assertEqual(ascend_config.tree_spec_config.topk, 4)
 

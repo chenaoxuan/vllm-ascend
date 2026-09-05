@@ -7,7 +7,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
     TreeRejectionSampler,
     block_tree_reject,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.utils import empty_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
 
 
 def _logits_from_greedy_ids(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:

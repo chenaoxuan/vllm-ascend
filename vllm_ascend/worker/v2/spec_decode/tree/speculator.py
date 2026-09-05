@@ -11,13 +11,12 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     AscendDFlashSpeculator,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
-from vllm_ascend.worker.v2.spec_decode.tree.utils import (
-    TreeLayout,
-    build_beam_trees,
-    build_heap_trees,
-    build_multi_order_trees,
+from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+    create_tree_builder,
+    validate_tree_method_backend,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
+from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +31,15 @@ def _hf_dflash_config(hf_config) -> dict:
 
 
 class AscendTreeSpeculator(AscendDFlashSpeculator):
-    """DFlash speculator that expands mask-token logits into a draft tree.
+    """Parallel-draft tree host (DFlash or DSpark draft) + topology builder.
 
     Draft model forward is one parallel pass. Tree construction replaces
-    per-position single-token sampling.
+    per-position single-token sampling via ``self.tree_builder``.
 
     Domino checkpoints with ``shift_label=true`` use an N-query layout
-    (bonus + N-1 masks) and sample the bonus hidden as draft slot 0, matching
-    DARTree. Vanilla DFlash / heap / beam keep the 1+N mask-only layout.
+    (bonus + N-1 masks) and sample the bonus hidden as draft slot 0.
+    Vanilla DFlash / priority / beam keep the 1+N mask-only layout (beam uses
+    DSpark's own query layout).
 
     ``propose()`` still returns flattened non-root tokens so the existing
     runner call stays valid. The tree itself is ``self.tree`` after
@@ -52,7 +52,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         # DFlashSpeculator.__init__ rejects dflash_config.sample_from_anchor.
         # Clear that so super() can run. DSpark and Domino+shift_label then
         # set the instance flags (N queries, sample the bonus as slot 0).
-        # Target verify is still 1+budget and does not depend on this layout.
         draft_hf = vllm_config.speculative_config.draft_model_config.hf_config
         dflash_cfg = getattr(draft_hf, "dflash_config", None)
         if isinstance(dflash_cfg, dict) and dflash_cfg.get("sample_from_anchor"):
@@ -76,15 +75,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.method = tree_cfg.method
         self.budget = tree_cfg.budget
         self.topk = tree_cfg.topk
-        self._beam_draft_model = None
+        self.draft_backend = (
+            "dspark" if self.speculative_config.use_dspark() else "dflash"
+        )
+        validate_tree_method_backend(self.method, self.draft_backend)
+
+        self.tree_builder = None
         self._domino_scorer = None
         self._domino_prefix_len = 0
-        # DFlashSpeculator forbids sample_from_anchor on the HF flag, but
-        # Domino+shift_label still needs the bonus hidden as slot 0.
         dflash_cfg = _hf_dflash_config(draft_hf)
         self._domino_shift_label = (
-            self.method == "multi_order"
-            and self.speculative_config.use_dflash()
+            self.method == "prefix"
+            and self.draft_backend == "dflash"
             and dflash_cfg.get("projector_type") == "domino"
             and bool(dflash_cfg.get("shift_label", False))
         )
@@ -139,15 +141,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
         self.tree = self._load_layout_from_buffers(self.max_num_reqs)
         logger.info(
-            "DFlash tree speculator enabled: method=%s budget=%s topk=%s "
+            "Tree speculator enabled: method=%s budget=%s topk=%s "
             "depth=%s sample_from_anchor=%s num_query_per_req=%s "
-            "domino_shift_label=%s",
+            "draft_backend=%s domino_shift_label=%s",
             self.method,
             self.budget,
             self.topk,
             self.num_speculative_steps,
             self.sample_from_anchor,
             self.num_query_per_req,
+            self.draft_backend,
             self._domino_shift_label,
         )
 
@@ -156,7 +159,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        if self.speculative_config.use_dspark():
+        if self.draft_backend == "dspark":
             from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 
             return load_dspark_model(target_model, self.vllm_config)
@@ -167,32 +170,40 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._bind_correction_heads(target_model)
 
     def _bind_correction_heads(self, target_model: nn.Module) -> None:
-        """Resolve markov / Domino heads once after the draft is loaded."""
-        from vllm_ascend.worker.v2.spec_decode.tree.utils import (
+        """Resolve Domino heads (prefix) then construct the tree builder."""
+        from vllm_ascend.worker.v2.spec_decode.tree.prefix import (
             DominoCorrectionScorer,
         )
 
         model = self.model
-        if self.method == "beam" and self.speculative_config.use_dspark():
-            self._beam_draft_model = model
+        draft_model = None
+        if self.method == "beam":
+            draft_model = model
         if (
-            self.method == "multi_order"
-            and self.speculative_config.use_dflash()
-            and model.projector_type == "domino"
+            self.method == "prefix"
+            and getattr(model, "projector_type", None) == "domino"
         ):
             self._domino_prefix_len = int(model.pure_draft_prefix_len)
-            # Text-only targets (Qwen3ForCausalLM) have no get_language_model;
-            # multimodal wrappers do. Same fallback as load_dflash_model.
             language_model = (
                 target_model.get_language_model()
                 if hasattr(target_model, "get_language_model")
                 else target_model
             )
             self._domino_scorer = DominoCorrectionScorer(model, language_model)
+
+        self.tree_builder = create_tree_builder(
+            method=self.method,
+            budget=self.budget,
+            topk=self.topk,
+            draft_backend=self.draft_backend,
+            draft_model=draft_model,
+            correction_scorer=self._domino_scorer,
+            prefix_len=self._domino_prefix_len,
+        )
         logger.info(
-            "DFlash tree correction heads: markov=%s domino=%s prefix_len=%s "
+            "Tree correction heads: markov=%s domino=%s prefix_len=%s "
             "shift_label=%s",
-            self._beam_draft_model is not None,
+            draft_model is not None,
             self._domino_scorer is not None,
             self._domino_prefix_len,
             self._domino_shift_label,
@@ -201,7 +212,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if cudagraph_mode != CUDAGraphMode.NONE:
             logger.warning(
-                "DFlash tree speculator builds the draft tree on CPU; "
+                "Tree speculator builds the draft tree on CPU; "
                 "disabling full ACL graphs for the draft query."
             )
         super().init_cudagraph_manager(CUDAGraphMode.NONE)
@@ -264,7 +275,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        # [all_tokens, dim] all_tokens include the anchor token
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,
@@ -273,49 +283,25 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        # sample_from_anchor (Domino shift_label): slot 0 is the bonus hidden.
-        # Otherwise skip the bonus slot (vanilla DFlash 1+N).
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        if self._beam_draft_model is not None:
+        if self.method == "beam":
             logits = self.model.compute_draft_logits(sample_hidden_states)
         else:
             logits = self.model.compute_logits(sample_hidden_states)
-        # [bs, spec_num, vocab_size]
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
-        if self.method == "heap":
-            build_heap_trees(logits, self.budget, self.topk, layout)
-        elif self.method == "beam":
-            nqp = self.num_query_per_req
-            root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
-                num_reqs, nqp
-            )[:, 0]
-            build_beam_trees(
-                logits,
-                self.budget,
-                self.topk,
-                layout,
-                root_token_ids,
-                self._beam_draft_model,
-            )
-        elif self.method == "multi_order":
-            nqp = self.num_query_per_req
-            root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
-                num_reqs, nqp
-            )[:, 0]
-            build_multi_order_trees(
-                logits,
-                self.budget,
-                self.topk,
-                layout,
-                draft_hidden=sample_hidden_states.view(
-                    num_reqs, self.num_speculative_steps, -1
-                ),
-                root_token_ids=root_token_ids,
-                prefix_len=self._domino_prefix_len,
-                correction_scorer=self._domino_scorer,
-            )
-        self.tree = layout
+        nqp = self.num_query_per_req
+        root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
+            num_reqs, nqp
+        )[:, 0]
+        self.tree = self.tree_builder.build(
+            logits,
+            layout,
+            root_token_ids=root_token_ids,
+            draft_hidden=sample_hidden_states.view(
+                num_reqs, self.num_speculative_steps, -1
+            ),
+        )
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

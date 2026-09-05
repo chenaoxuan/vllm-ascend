@@ -5,7 +5,7 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
-from vllm_ascend.worker.v2.spec_decode.tree.utils import TreeLayout
+from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
 

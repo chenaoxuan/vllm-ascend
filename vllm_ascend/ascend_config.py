@@ -859,18 +859,26 @@ class AscendConfig:
 
 @config
 class TreeSpecConfig:
-    """DFlash draft-tree construction from ``additional_config.tree_spec_config``.
+    """Draft-tree construction from ``additional_config.tree_spec_config``.
 
-    When ``enabled`` is true, the v2 DFlash speculator expands shared depth
-    logits into a draft tree instead of a single linear draft chain, and
+    When ``enabled`` is true, the v2 parallel-draft tree host expands shared
+    depth logits into a draft tree instead of a single linear draft chain, and
     ``method`` / ``budget`` / ``topk`` are required. Target verify walks the
     tree with greedy token-id matching.
 
-    ``method`` selects the builder: ``heap``, ``beam`` (applies the DSpark
-    markov head when the draft is Qwen3 DSpark), or ``multi_order`` (applies
-    Domino ``embed_proj`` / ``prefix_gru`` when the draft is
-    ``projector_type=domino``; ``shift_label=true`` samples the bonus hidden
-    as draft slot 0). There is no default; it must be set when enabled.
+    ``method`` selects the topology builder and must match the speculative
+    draft backend:
+
+    - ``priority``: best-first expansion (requires ``dflash``)
+    - ``beam``: level-wise beam / PCTree (requires ``dspark``; Markov head
+      when the draft is Qwen3 DSpark)
+    - ``prefix``: uniform-width supertree + prefix-closed Top-B prune
+      (requires ``dflash``; Domino ``embed_proj`` / ``prefix_gru`` when
+      ``projector_type=domino``; ``shift_label=true`` samples the bonus
+      hidden as draft slot 0)
+
+    There is no default; ``method`` must be set when enabled. Pairing with
+    ``speculative_config`` is checked when the tree builder is created.
 
     ``budget`` is the per-request node budget excluding the already-accepted
     root; it must be >= ``num_speculative_tokens``.
@@ -885,7 +893,7 @@ class TreeSpecConfig:
             additional_config={
                 "tree_spec_config": {
                     "enabled": True,
-                    "method": "heap",
+                    "method": "priority",
                     "budget": 8,
                     "topk": 4,
                 }
@@ -893,7 +901,7 @@ class TreeSpecConfig:
         )
     """
 
-    SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("heap", "beam", "multi_order")
+    SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("priority", "beam", "prefix")
 
     enabled: bool = False
     method: str | None = None

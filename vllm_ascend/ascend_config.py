@@ -869,8 +869,8 @@ class TreeSpecConfig:
     ``method`` selects the builder: ``heap``, ``beam`` (applies the DSpark
     markov head when the draft is Qwen3 DSpark), or ``multi_order`` (applies
     Domino ``embed_proj`` / ``prefix_gru`` when the draft is
-    ``projector_type=domino``). There is no default; it must be set when
-    enabled.
+    ``projector_type=domino``; ``shift_label=true`` samples the bonus hidden
+    as draft slot 0). There is no default; it must be set when enabled.
 
     ``budget`` is the per-request node budget excluding the already-accepted
     root; it must be >= ``num_speculative_tokens``.

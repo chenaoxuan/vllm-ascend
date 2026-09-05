@@ -1,5 +1,4 @@
 import logging
-from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -23,11 +22,24 @@ from vllm_ascend.worker.v2.spec_decode.tree.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _hf_dflash_config(hf_config) -> dict:
+    raw = getattr(hf_config, "dflash_config", None)
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    return vars(raw)
+
+
 class AscendTreeSpeculator(AscendDFlashSpeculator):
     """DFlash speculator that expands mask-token logits into a draft tree.
 
-    Draft model forward is unchanged (one parallel pass). Tree construction
-    replaces per-position single-token sampling.
+    Draft model forward is one parallel pass. Tree construction replaces
+    per-position single-token sampling.
+
+    Domino checkpoints with ``shift_label=true`` use an N-query layout
+    (bonus + N-1 masks) and sample the bonus hidden as draft slot 0, matching
+    DARTree. Vanilla DFlash / heap / beam keep the 1+N mask-only layout.
 
     ``propose()`` still returns flattened non-root tokens so the existing
     runner call stays valid. The tree itself is ``self.tree`` after
@@ -38,9 +50,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # DFlashSpeculator.__init__ rejects dflash_config.sample_from_anchor.
-        # Clear that so super() can run, then restore DSpark's hf_config flag
-        # (default True: N queries, sample from the anchor). Target verify is
-        # still 1+budget and does not depend on the draft query layout.
+        # Clear that so super() can run. DSpark and Domino+shift_label then
+        # set the instance flags (N queries, sample the bonus as slot 0).
+        # Target verify is still 1+budget and does not depend on this layout.
         draft_hf = vllm_config.speculative_config.draft_model_config.hf_config
         dflash_cfg = getattr(draft_hf, "dflash_config", None)
         if isinstance(dflash_cfg, dict) and dflash_cfg.get("sample_from_anchor"):
@@ -67,6 +79,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._beam_draft_model = None
         self._domino_scorer = None
         self._domino_prefix_len = 0
+        # DFlashSpeculator forbids sample_from_anchor on the HF flag, but
+        # Domino+shift_label still needs the bonus hidden as slot 0.
+        dflash_cfg = _hf_dflash_config(draft_hf)
+        self._domino_shift_label = (
+            self.method == "multi_order"
+            and self.speculative_config.use_dflash()
+            and dflash_cfg.get("projector_type") == "domino"
+            and bool(dflash_cfg.get("shift_label", False))
+        )
+        if self._domino_shift_label:
+            self.sample_from_anchor = True
+            self.num_query_per_req = self.num_speculative_steps
         if self.budget < self.num_speculative_steps:
             raise ValueError(
                 "tree_spec_config.budget must be >= num_speculative_tokens "
@@ -116,13 +140,15 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.tree = self._load_layout_from_buffers(self.max_num_reqs)
         logger.info(
             "DFlash tree speculator enabled: method=%s budget=%s topk=%s "
-            "depth=%s sample_from_anchor=%s num_query_per_req=%s",
+            "depth=%s sample_from_anchor=%s num_query_per_req=%s "
+            "domino_shift_label=%s",
             self.method,
             self.budget,
             self.topk,
             self.num_speculative_steps,
             self.sample_from_anchor,
             self.num_query_per_req,
+            self._domino_shift_label,
         )
 
     def load_draft_model(
@@ -155,16 +181,21 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             and model.projector_type == "domino"
         ):
             self._domino_prefix_len = int(model.pure_draft_prefix_len)
-            embed = target_model.get_language_model().model.embed_tokens
-            self._domino_scorer = DominoCorrectionScorer(
-                model,
-                SimpleNamespace(model=SimpleNamespace(embed_tokens=embed)),
+            # Text-only targets (Qwen3ForCausalLM) have no get_language_model;
+            # multimodal wrappers do. Same fallback as load_dflash_model.
+            language_model = (
+                target_model.get_language_model()
+                if hasattr(target_model, "get_language_model")
+                else target_model
             )
+            self._domino_scorer = DominoCorrectionScorer(model, language_model)
         logger.info(
-            "DFlash tree correction heads: markov=%s domino=%s prefix_len=%s",
+            "DFlash tree correction heads: markov=%s domino=%s prefix_len=%s "
+            "shift_label=%s",
             self._beam_draft_model is not None,
             self._domino_scorer is not None,
             self._domino_prefix_len,
+            self._domino_shift_label,
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -242,8 +273,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        # sample_indices follow prepare_dflash_inputs: all N slots when
-        # sample_from_anchor, otherwise skip the bonus slot (DFlash 1+N).
+        # sample_from_anchor (Domino shift_label): slot 0 is the bonus hidden.
+        # Otherwise skip the bonus slot (vanilla DFlash 1+N).
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         if self._beam_draft_model is not None:
             logits = self.model.compute_draft_logits(sample_hidden_states)

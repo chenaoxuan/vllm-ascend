@@ -193,6 +193,7 @@ class TestAscendConfig(TestBase):
         self.assertIsNone(ascend_config.tree_spec_config.method)
         self.assertIsNone(ascend_config.tree_spec_config.budget)
         self.assertIsNone(ascend_config.tree_spec_config.topk)
+        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -268,6 +269,28 @@ class TestAscendConfig(TestBase):
         self.assertEqual(ascend_config.tree_spec_config.method, "priority")
         self.assertEqual(ascend_config.tree_spec_config.budget, 8)
         self.assertEqual(ascend_config.tree_spec_config.topk, 4)
+        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_tree_spec_rejection_sampler_magicmtp(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "tree_spec_config": {
+                "enabled": True,
+                "method": "priority",
+                "budget": 8,
+                "topk": 4,
+                "rejection_sampler": "magicmtp",
+            },
+            "refresh": True,
+        }
+        ascend_config = init_ascend_config(test_vllm_config)
+        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "magicmtp")
+
+    def test_tree_spec_config_rejects_unknown_rejection_sampler(self):
+        with self.assertRaisesRegex(ValueError, "tree_spec_config.rejection_sampler must be one of"):
+            TreeSpecConfig(enabled=True, method="priority", budget=8, topk=4, rejection_sampler="block")
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
@@ -283,6 +306,54 @@ class TestAscendConfig(TestBase):
     def test_tree_spec_config_rejects_unknown_method(self):
         with self.assertRaisesRegex(ValueError, "tree_spec_config.method must be one of"):
             TreeSpecConfig(enabled=True, method="best_first", budget=8, topk=4)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_tree_spec_backend_pairing(self, mock_fix_incompatible_config):
+        def _spec(method: str):
+            return SimpleNamespace(
+                method=method,
+                use_dspark=lambda: method == "dspark",
+                use_dflash=lambda: method == "dflash",
+            )
+
+        for tree_method, draft_method in (
+            ("priority", "dflash"),
+            ("prefix", "dflash"),
+            ("beam", "dspark"),
+        ):
+            test_vllm_config = VllmConfig()
+            test_vllm_config.speculative_config = _spec(draft_method)
+            test_vllm_config.additional_config = {
+                "tree_spec_config": {
+                    "enabled": True,
+                    "method": tree_method,
+                    "budget": 8,
+                    "topk": 4,
+                },
+                "refresh": True,
+            }
+            ascend_config = init_ascend_config(test_vllm_config)
+            self.assertEqual(ascend_config.tree_spec_config.method, tree_method)
+
+        for tree_method, draft_method in (
+            ("priority", "dspark"),
+            ("prefix", "dspark"),
+            ("beam", "dflash"),
+        ):
+            test_vllm_config = VllmConfig()
+            test_vllm_config.speculative_config = _spec(draft_method)
+            test_vllm_config.additional_config = {
+                "tree_spec_config": {
+                    "enabled": True,
+                    "method": tree_method,
+                    "budget": 8,
+                    "topk": 4,
+                },
+                "refresh": True,
+            }
+            with self.assertRaisesRegex(ValueError, "requires .*speculative_config method"):
+                init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

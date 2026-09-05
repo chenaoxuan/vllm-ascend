@@ -344,7 +344,8 @@ class AscendConfig:
                 "enabled": false,
                 "method": null,
                 "budget": null,
-                "topk": null
+                "topk": null,
+                "rejection_sampler": "greedy"
             },
             "sparse_kv_offload_config": {
                 "enabled": false,
@@ -863,28 +864,30 @@ class TreeSpecConfig:
 
     When ``enabled`` is true, the v2 parallel-draft tree host expands shared
     depth logits into a draft tree instead of a single linear draft chain, and
-    ``method`` / ``budget`` / ``topk`` are required. Target verify walks the
-    tree with greedy token-id matching.
+    ``method`` / ``budget`` / ``topk`` are required. Target verify is selected
+    by ``rejection_sampler``.
 
-    ``method`` selects the topology builder and must match the speculative
-    draft backend:
+    ``method`` selects the topology builder and must match
+    ``speculative_config.method`` (draft backend):
 
-    - ``priority``: best-first expansion (requires ``dflash``)
-    - ``beam``: level-wise beam / PCTree (requires ``dspark``; Markov head
-      when the draft is Qwen3 DSpark)
-    - ``prefix``: uniform-width supertree + prefix-closed Top-B prune
-      (requires ``dflash``; Domino ``embed_proj`` / ``prefix_gru`` when
-      ``projector_type=domino``; ``shift_label=true`` samples the bonus
-      hidden as draft slot 0)
+    - ``priority`` → ``dflash`` (best-first expansion)
+    - ``beam`` → ``dspark`` (level-wise beam / PCTree; Markov on Qwen3 DSpark)
+    - ``prefix`` → ``dflash`` (uniform-width supertree + Top-B prune; Domino
+      ``embed_proj`` / ``prefix_gru`` when ``projector_type=domino``;
+      ``shift_label=true`` samples the bonus hidden as draft slot 0)
 
-    There is no default; ``method`` must be set when enabled. Pairing with
-    ``speculative_config`` is checked when the tree builder is created.
+    There is no default; ``method`` must be set when enabled. Pairing is
+    checked in ``init_ascend_config`` (when ``speculative_config`` is set)
+    and again when the tree builder is created.
 
     ``budget`` is the per-request node budget excluding the already-accepted
     root; it must be >= ``num_speculative_tokens``.
 
     ``topk`` is the per-depth candidate count: how many logits are kept at each
     mask position before expansion. It is independent of ``budget``.
+
+    ``rejection_sampler`` selects tree verify: ``greedy`` (token-id match) or
+    ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
 
     Usage::
 
@@ -896,17 +899,20 @@ class TreeSpecConfig:
                     "method": "priority",
                     "budget": 8,
                     "topk": 4,
+                    "rejection_sampler": "magicmtp",
                 }
             },
         )
     """
 
     SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("priority", "beam", "prefix")
+    SUPPORTED_REJECTION_SAMPLERS: ClassVar[tuple[str, ...]] = ("greedy", "magicmtp")
 
     enabled: bool = False
     method: str | None = None
     budget: int | None = None
     topk: int | None = None
+    rejection_sampler: str = "greedy"
 
     @model_validator(mode="after")
     def _validate(self):
@@ -914,6 +920,11 @@ class TreeSpecConfig:
             raise ValueError(
                 f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "
                 f"got {self.method!r}"
+            )
+        if self.rejection_sampler not in self.SUPPORTED_REJECTION_SAMPLERS:
+            raise ValueError(
+                f"tree_spec_config.rejection_sampler must be one of "
+                f"{self.SUPPORTED_REJECTION_SAMPLERS}, got {self.rejection_sampler!r}"
             )
         if self.enabled and self.method is None:
             raise ValueError(
@@ -929,6 +940,22 @@ class TreeSpecConfig:
         if self.topk is not None and self.topk < 1:
             raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
         return self
+
+    def _validate_method_backend(self, vllm_config) -> None:
+        """Raise if ``method`` does not match ``speculative_config`` draft backend."""
+        if not self.enabled or self.method is None:
+            return
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+            validate_tree_method_backend,
+        )
+
+        draft_backend = (
+            "dspark" if speculative_config.use_dspark() else "dflash"
+        )
+        validate_tree_method_backend(self.method, draft_backend)
 
 
 @config
@@ -1472,6 +1499,7 @@ def init_ascend_config(vllm_config):
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config.tree_spec_config._validate_method_backend(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -22,7 +23,17 @@ def _logits_from_greedy_ids(token_ids: torch.Tensor, vocab_size: int) -> torch.T
     return logits
 
 
-def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
+def _mock_tree_ascend_config(rejection_sampler: str = "greedy"):
+    return SimpleNamespace(
+        tree_spec_config=SimpleNamespace(rejection_sampler=rejection_sampler),
+    )
+
+
+@patch(
+    "vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler.get_ascend_config",
+    return_value=_mock_tree_ascend_config("greedy"),
+)
+def test_tree_rejection_sampler_call_uses_greedy_tree_reject(_mock_cfg) -> None:
     budget = 8
     spec_len = 3
     vocab_size = 10
@@ -93,7 +104,11 @@ def test_tree_rejection_sampler_call_uses_greedy_tree_reject() -> None:
     assert torch.equal(input_batch.path_node_ids, rejection_sampler.path_node_ids)
 
 
-def test_tree_rejection_sampler_ragged_logit_counts_do_not_mix_requests() -> None:
+@patch(
+    "vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler.get_ascend_config",
+    return_value=_mock_tree_ascend_config("greedy"),
+)
+def test_tree_rejection_sampler_ragged_logit_counts_do_not_mix_requests(_mock_cfg) -> None:
     """Uneven cu_num_logits must not reshape as ``[R, total // R, V]``.
 
     Concatenating 3+1 logits and viewing as ``[2, 2, V]`` would steal req0's
@@ -168,6 +183,7 @@ def test_block_tree_reject_paper_path() -> None:
     tree.next_sibling[0, 3] = 4
     tree.first_child[0, 2] = 5
 
+    path_node_ids = torch.full((1, 2), -1, dtype=torch.long)
     sampled = block_tree_reject(
         tree,
         target,
@@ -176,7 +192,77 @@ def test_block_tree_reject_paper_path() -> None:
         # 0.7 ∈ (7/11, 1): correct p(X4)≈0.636 rejects; p(X4)=1 (wiped p') would accept.
         etas=torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]]),
         recover_u=torch.zeros(1),
+        path_node_ids=path_node_ids,
     )
     # X1 pruned after X4; accept X2=c, X5=a; Y from M_b at X5, u=0 -> a
     assert sampled.tolist() == [[2, 0, 0]]
+    assert path_node_ids.tolist() == [[2, 5]]
 
+
+@patch(
+    "vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler.get_ascend_config",
+    return_value=_mock_tree_ascend_config("magicmtp"),
+)
+def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
+    """TreeRejectionSampler routes to block_tree_reject when configured."""
+    mb = torch.tensor([0.3, 0.4, 0.3])
+    ms = torch.tensor([0.6, 0.3, 0.1])
+    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+    draft = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 2, 3).contiguous()
+    logits = target.reshape(6, 3)
+
+    tree = empty_tree_layout(1, 5, device="cpu")
+    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
+    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
+    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
+    tree.num_nodes[0] = 5
+    tree.first_child[0, 0] = 1
+    tree.next_sibling[0, 1] = 2
+    tree.first_child[0, 1] = 3
+    tree.next_sibling[0, 3] = 4
+    tree.first_child[0, 2] = 5
+
+    spec_config = SimpleNamespace(
+        num_speculative_tokens=2,
+        rejection_sample_method="standard",
+        synthetic_acceptance_rates=None,
+    )
+    sampler = SimpleNamespace(
+        compute_nans=False,
+        req_states=SimpleNamespace(
+            prefill_len=SimpleNamespace(gpu=torch.zeros(1, dtype=torch.int32)),
+        ),
+    )
+    rejection_sampler = TreeRejectionSampler(sampler, spec_config, torch.device("cpu"))
+    cu = np.array([0, 6], dtype=np.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        cu_num_logits=torch.from_numpy(cu),
+        cu_num_logits_np=cu,
+        idx_mapping=torch.arange(1, dtype=torch.int32),
+        seq_lens=torch.full((1,), 100, dtype=torch.int32),
+        tree_tokens=tree.tokens,
+        tree_depths=tree.depths,
+        tree_parents=tree.parents,
+        tree_num_nodes=tree.num_nodes,
+        tree_visibility=tree.visibility,
+        tree_first_child=tree.first_child,
+        tree_next_sibling=tree.next_sibling,
+    )
+
+    with patch(
+        "vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler.block_tree_reject",
+        wraps=block_tree_reject,
+    ) as wrapped:
+        def _fixed_block(*args, **kwargs):
+            kwargs["etas"] = torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]])
+            kwargs["recover_u"] = torch.zeros(1)
+            return block_tree_reject(*args, **kwargs)
+
+        wrapped.side_effect = _fixed_block
+        output = rejection_sampler(logits, input_batch, draft_logits=draft)
+
+    assert wrapped.called
+    assert output.sampled_token_ids.tolist() == [[2, 0, 0]]
+    assert rejection_sampler.path_node_ids.tolist() == [[2, 5]]
+    assert torch.equal(input_batch.path_node_ids, rejection_sampler.path_node_ids)

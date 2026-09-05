@@ -117,11 +117,13 @@ def create_tree_builder(
     draft_model=None,
     correction_scorer=None,
     prefix_len: int = 0,
-    depth_bonus: float = -0.2,
-    supertree_width: int | None = None,
-    pruned: bool = True,
+    params: dict | None = None,
 ) -> TreeBuilder:
-    """Construct the builder for ``method`` after backend pairing check."""
+    """Construct the builder for ``method`` after backend pairing check.
+
+    ``params`` is forwarded to prefix (``candidate_size`` only).
+    Priority and beam ignore it.
+    """
     validate_tree_method_backend(method, draft_backend)
     if method == "priority":
         from vllm_ascend.worker.v2.spec_decode.tree.priority import (
@@ -141,9 +143,7 @@ def create_tree_builder(
             topk,
             correction_scorer=correction_scorer,
             prefix_len=prefix_len,
-            depth_bonus=depth_bonus,
-            supertree_width=supertree_width,
-            pruned=pruned,
+            params=params,
         )
     raise ValueError(
         f"tree_spec_config.method must be one of {SUPPORTED_TREE_METHODS}, "

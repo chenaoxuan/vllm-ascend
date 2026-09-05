@@ -21,7 +21,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, model_validator
+from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
@@ -345,7 +345,8 @@ class AscendConfig:
                 "method": null,
                 "budget": null,
                 "topk": null,
-                "rejection_sampler": "greedy"
+                "rejection_sampler": "greedy",
+                "params": {}
             },
             "sparse_kv_offload_config": {
                 "enabled": false,
@@ -883,8 +884,17 @@ class TreeSpecConfig:
     ``budget`` is the per-request node budget excluding the already-accepted
     root; it must be >= ``num_speculative_tokens``.
 
-    ``topk`` is the per-depth candidate count: how many logits are kept at each
-    mask position before expansion. It is independent of ``budget``.
+    ``topk`` is the per-depth expansion width **k**: how many children each
+    parent keeps. It is independent of ``budget``.
+
+    ``params`` is an open dict for method-specific knobs. Unknown keys are
+    kept (builders ignore what they do not recognize). Prefix reads:
+
+    - ``candidate_size`` (C): Domino shortlist size. Missing/None → ``C = k``
+      (same as the old ``candidate_count = k``). Otherwise
+      ``C = min(int(candidate_size), vocab)``, then clamp ``C >= k``.
+      Expansion width is always ``k`` (aligned with ``topk``); the
+      supertree is then Top-B pruned to ``budget``.
 
     ``rejection_sampler`` selects tree verify: ``greedy`` (token-id match) or
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
@@ -896,10 +906,13 @@ class TreeSpecConfig:
             additional_config={
                 "tree_spec_config": {
                     "enabled": True,
-                    "method": "priority",
-                    "budget": 8,
+                    "method": "prefix",
+                    "budget": 16,
                     "topk": 4,
                     "rejection_sampler": "magicmtp",
+                    "params": {
+                        "candidate_size": 8,
+                    },
                 }
             },
         )
@@ -907,12 +920,23 @@ class TreeSpecConfig:
 
     SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("priority", "beam", "prefix")
     SUPPORTED_REJECTION_SAMPLERS: ClassVar[tuple[str, ...]] = ("greedy", "magicmtp")
+    PREFIX_PARAM_KEYS: ClassVar[frozenset[str]] = frozenset({"candidate_size"})
 
     enabled: bool = False
     method: str | None = None
     budget: int | None = None
     topk: int | None = None
     rejection_sampler: str = "greedy"
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _params_must_be_dict(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"tree_spec_config.params must be a dict, got {type(value).__name__}."
+            )
+        return value
 
     @model_validator(mode="after")
     def _validate(self):
@@ -939,6 +963,13 @@ class TreeSpecConfig:
             raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
         if self.topk is not None and self.topk < 1:
             raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
+        unknown = set(self.params) - self.PREFIX_PARAM_KEYS
+        if unknown:
+            logger.warning_once(
+                "tree_spec_config.params has unrecognized keys %s; "
+                "current builders ignore them.",
+                sorted(unknown),
+            )
         return self
 
     def _validate_method_backend(self, vllm_config) -> None:

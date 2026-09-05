@@ -194,6 +194,7 @@ class TestAscendConfig(TestBase):
         self.assertIsNone(ascend_config.tree_spec_config.budget)
         self.assertIsNone(ascend_config.tree_spec_config.topk)
         self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
+        self.assertEqual(ascend_config.tree_spec_config.params, {})
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -354,6 +355,29 @@ class TestAscendConfig(TestBase):
             }
             with self.assertRaisesRegex(ValueError, "requires .*speculative_config method"):
                 init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_tree_spec_params(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "tree_spec_config": {
+                "enabled": True,
+                "method": "prefix",
+                "budget": 16,
+                "topk": 2,
+                "params": {
+                    "candidate_size": 4,
+                    "unknown_for_later": 1,
+                },
+            },
+            "refresh": True,
+        }
+        params = init_ascend_config(test_vllm_config).tree_spec_config.params
+        self.assertEqual(params["candidate_size"], 4)
+        self.assertEqual(params["unknown_for_later"], 1)
+        with self.assertRaisesRegex(ValueError, "tree_spec_config.params must be a dict"):
+            TreeSpecConfig(enabled=True, method="prefix", budget=8, topk=2, params=["not-a-dict"])
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

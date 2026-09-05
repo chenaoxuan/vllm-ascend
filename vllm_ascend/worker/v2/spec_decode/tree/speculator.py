@@ -37,8 +37,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     _speculator_name = "DFlashTree"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Tree query layout keeps the anchor as the bonus token. DSpark drafts
-        # may set sample_from_anchor; force the DFlash 1+N layout before super().
+        # DFlashSpeculator.__init__ rejects dflash_config.sample_from_anchor.
+        # Clear that so super() can run, then restore DSpark's hf_config flag
+        # (default True: N queries, sample from the anchor). Target verify is
+        # still 1+budget and does not depend on the draft query layout.
         draft_hf = vllm_config.speculative_config.draft_model_config.hf_config
         dflash_cfg = getattr(draft_hf, "dflash_config", None)
         if isinstance(dflash_cfg, dict) and dflash_cfg.get("sample_from_anchor"):
@@ -46,6 +48,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         elif dflash_cfg is not None and getattr(dflash_cfg, "sample_from_anchor", False):
             dflash_cfg.sample_from_anchor = False
         super().__init__(vllm_config, device)
+        if self.speculative_config.use_dspark():
+            self.sample_from_anchor = getattr(draft_hf, "sample_from_anchor", True)
+            if self.sample_from_anchor:
+                self.num_query_per_req = self.num_speculative_steps
+            else:
+                self.num_query_per_req = 1 + self.num_speculative_steps
         if self.use_local_argmax_reduction:
             raise ValueError(
                 "DFlash tree speculator needs full draft logits; "
@@ -107,11 +115,14 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
         self.tree = self._load_layout_from_buffers(self.max_num_reqs)
         logger.info(
-            "DFlash tree speculator enabled: method=%s budget=%s topk=%s depth=%s",
+            "DFlash tree speculator enabled: method=%s budget=%s topk=%s "
+            "depth=%s sample_from_anchor=%s num_query_per_req=%s",
             self.method,
             self.budget,
             self.topk,
             self.num_speculative_steps,
+            self.sample_from_anchor,
+            self.num_query_per_req,
         )
 
     def load_draft_model(
@@ -231,7 +242,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             cudagraph_runtime_mode,
         )
         num_sample = num_reqs * self.num_speculative_steps
-        # skip the anchor and only use the masked pos(true draft pos)
+        # sample_indices follow prepare_dflash_inputs: all N slots when
+        # sample_from_anchor, otherwise skip the bonus slot (DFlash 1+N).
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         if self._beam_draft_model is not None:
             logits = self.model.compute_draft_logits(sample_hidden_states)
@@ -255,11 +267,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 root_token_ids,
                 self._beam_draft_model,
             )
-            if self._beam_draft_model is not None:
-                mapped = self.model.map_draft_to_target(layout.tokens.clamp(min=0))
-                layout.tokens.copy_(
-                    torch.where(layout.tokens >= 0, mapped, layout.tokens)
-                )
         elif self.method == "multi_order":
             nqp = self.num_query_per_req
             root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(

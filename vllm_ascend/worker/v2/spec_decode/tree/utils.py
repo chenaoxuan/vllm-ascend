@@ -634,17 +634,17 @@ def _markov_correct_logits(
 ) -> torch.Tensor:
     """Apply optional DSpark markov logit-bias to one depth's base logits.
 
-    When ``draft_model`` is set, mirrors the Ascend DSpark drafting loop
-    (``vllm_ascend/spec_decode/llm_base_proposer.py``): bias from the frontier
-    token via ``markov_embed`` + ``markov_bias``. When ``draft_model`` is None,
-    expand the shared-depth base logits across the frontier.
+    When ``draft_model`` is set, mirrors ``DSparkSpeculator._sample_sequential``:
+    bias from the previous **target-vocab** token via ``markov_embed`` +
+    ``markov_bias``. When ``draft_model`` is None, expand the shared-depth base
+    logits across the frontier.
 
     Args:
         draft_model: DSpark draft exposing ``markov_embed`` / ``markov_bias``, or
             None to skip correction.
         depth_logits: [R, vocab] uncorrected base logits of this depth.
-        frontier_tokens: [R, batch] token ids of the frontier nodes (the "previous"
-            tokens), one per frontier node per request.
+        frontier_tokens: [R, batch] target-vocab ids of the frontier nodes (the
+            previous tokens), one per frontier node per request.
 
     Returns:
         [R, batch, vocab] logits, one row per frontier node.
@@ -672,14 +672,18 @@ def build_beam_trees(
     top-``topk`` children of the current frontier, then truncates the pool to
     ``budget`` nodes. Requests are batched in one pass.
 
+    Selected ids live in draft vocab. When ``draft_model`` is set they are
+    remapped with ``map_draft_to_target`` before the next Markov step and
+    before writing ``out.tokens``, matching ``_sample_sequential``.
+
     Args:
         draft_logits: [num_reqs, spec_num, vocab] shared-depth draft base logits.
         budget: maximum number of non-root nodes per request.
         topk: number of candidate tokens kept at each depth.
         out: TreeLayout to fill in place.
-        root_token_ids: [num_reqs] already-accepted anchor token per request.
+        root_token_ids: [num_reqs] already-accepted anchor token (target vocab).
         draft_model: optional DSpark draft exposing ``markov_embed`` /
-            ``markov_bias``; None uses base logits only.
+            ``markov_bias`` / ``map_draft_to_target``; None uses base logits only.
     """
     num_reqs, spec_num, vocab = draft_logits.shape
     k = max(1, min(topk, vocab))
@@ -706,7 +710,9 @@ def build_beam_trees(
         batch = frontier_tokens.size(1)
         step_logits = _markov_correct_logits(draft_model, draft_logits[:, depth], frontier_tokens)  # [R, batch, vocab]
         log_probs = torch.log_softmax(step_logits.float(), dim=-1)
-        top_vals, top_ids = log_probs.topk(k, dim=-1)  # [R, batch, k]
+        top_vals, top_ids = log_probs.topk(k, dim=-1)  # [R, batch, k] draft ids
+        if draft_model is not None:
+            top_ids = draft_model.map_draft_to_target(top_ids)
         candidate_scores = frontier_scores.unsqueeze(-1) + top_vals  # [R, batch, k]
         num_candidates = batch * k
 

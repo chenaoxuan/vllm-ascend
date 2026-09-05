@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -155,7 +154,15 @@ def _scatter_parent_proposal(
 
 
 class PrefixTreeBuilder(TreeBuilder):
-    """DARTree-style uniform-width supertree + prefix-closed Top-B prune."""
+    """DARTree-style uniform-width supertree + prefix-closed Top-B prune.
+
+    Expansion **k** and beam **width** both come from ``topk``
+    (``k = min(topk, vocab, budget)``). Domino shortlist **C** is
+    ``params["candidate_size"]`` (missing/None → ``C = k``; else clamp
+    ``C = max(k, min(int(C), vocab))``). If the expanded supertree
+    exceeds ``budget``, ``_select_topb_nodes`` prunes it (hard-coded
+    ``depth_bonus=-0.2``).
+    """
 
     required_backend = "dflash"
     method = "prefix"
@@ -167,16 +174,14 @@ class PrefixTreeBuilder(TreeBuilder):
         *,
         correction_scorer: DominoCorrectionScorer | None = None,
         prefix_len: int = 0,
-        depth_bonus: float = -0.2,
-        supertree_width: int | None = None,
-        pruned: bool = True,
+        params: dict | None = None,
     ):
         super().__init__(budget, topk)
+        params = params if params is not None else {}
         self.correction_scorer = correction_scorer
         self.prefix_len = prefix_len
-        self.depth_bonus = depth_bonus
-        self.supertree_width = supertree_width
-        self.pruned = pruned
+        self.depth_bonus = -0.2
+        self.candidate_size = params.get("candidate_size")
 
     def build(
         self,
@@ -195,18 +200,16 @@ class PrefixTreeBuilder(TreeBuilder):
         num_reqs, spec_num, vocab = draft_logits.shape
         device = draft_logits.device
         k = min(topk, vocab, budget)
-
-        if self.pruned:
-            width = self.supertree_width if self.supertree_width is not None else k
-            width = min(int(width), k)
-        else:
-            width = min(int(np.ceil(budget / spec_num)), k, budget)
-        width = max(1, width)
+        width = k
         supertree_budget = width * spec_num
 
         with_correction = correction_scorer is not None
         if with_correction:
-            candidate_count = k
+            raw_c = self.candidate_size
+            if raw_c is None:
+                candidate_count = k
+            else:
+                candidate_count = max(k, min(int(raw_c), vocab))
             base_float = draft_logits.float()
             candidate_vals, candidate_ids = torch.topk(
                 base_float, k=candidate_count, dim=-1

@@ -75,6 +75,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.method = tree_cfg.method
         self.budget = tree_cfg.budget
         self.topk = tree_cfg.topk
+        self.params = tree_cfg.params
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
         )
@@ -214,6 +215,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             draft_model=draft_model,
             correction_scorer=self._domino_scorer,
             prefix_len=self._domino_prefix_len,
+            params=self.params,
         )
         logger.info(
             "Tree correction heads: markov=%s domino=%s prefix_len=%s "

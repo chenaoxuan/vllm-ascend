@@ -895,6 +895,8 @@ class TreeSpecConfig:
       ``C = min(int(candidate_size), vocab)``, then clamp ``C >= k``.
       Expansion width is always ``k`` (aligned with ``topk``); the
       supertree is then Top-B pruned to ``budget``.
+    - ``score_ckpt``: occupancy head path. Missing → current log-q occupancy.
+    - ``dump_path``: directory for occupancy_v1 shards after greedy.
 
     ``rejection_sampler`` selects tree verify: ``greedy`` (token-id match) or
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
@@ -920,7 +922,9 @@ class TreeSpecConfig:
 
     SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("priority", "beam", "prefix")
     SUPPORTED_REJECTION_SAMPLERS: ClassVar[tuple[str, ...]] = ("greedy", "magicmtp")
-    PREFIX_PARAM_KEYS: ClassVar[frozenset[str]] = frozenset({"candidate_size"})
+    PREFIX_PARAM_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"candidate_size", "score_ckpt", "dump_path"}
+    )
 
     enabled: bool = False
     method: str | None = None

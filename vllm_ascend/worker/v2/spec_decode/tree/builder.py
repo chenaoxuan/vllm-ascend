@@ -121,7 +121,7 @@ def create_tree_builder(
 ) -> TreeBuilder:
     """Construct the builder for ``method`` after backend pairing check.
 
-    ``params`` is forwarded to prefix (``candidate_size`` only).
+    ``params`` is forwarded to prefix (``candidate_size`` / occupancy).
     Priority and beam ignore it.
     """
     validate_tree_method_backend(method, draft_backend)

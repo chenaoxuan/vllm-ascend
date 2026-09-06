@@ -368,6 +368,8 @@ class TestAscendConfig(TestBase):
                 "topk": 2,
                 "params": {
                     "candidate_size": 4,
+                    "score_ckpt": "/tmp/occupancy.pt",
+                    "dump_path": "/tmp/occupancy_dumps",
                     "unknown_for_later": 1,
                 },
             },
@@ -375,6 +377,8 @@ class TestAscendConfig(TestBase):
         }
         params = init_ascend_config(test_vllm_config).tree_spec_config.params
         self.assertEqual(params["candidate_size"], 4)
+        self.assertEqual(params["score_ckpt"], "/tmp/occupancy.pt")
+        self.assertEqual(params["dump_path"], "/tmp/occupancy_dumps")
         self.assertEqual(params["unknown_for_later"], 1)
         with self.assertRaisesRegex(ValueError, "tree_spec_config.params must be a dict"):
             TreeSpecConfig(enabled=True, method="prefix", budget=8, topk=2, params=["not-a-dict"])

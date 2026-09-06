@@ -323,6 +323,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             ),
             proposal_logits=proposal,
         )
+        from vllm_ascend.worker.v2.spec_decode.tree.training_tree.dump import (
+            set_pending_stash,
+        )
+
+        set_pending_stash(getattr(self.tree_builder, "dump_stash", None))
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

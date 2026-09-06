@@ -193,6 +193,16 @@ class TreeRejectionSampler(RejectionSampler):
         )
         self.path_node_ids = path_node_ids
         input_batch.path_node_ids = path_node_ids
+        from vllm_ascend.worker.v2.spec_decode.tree.training_tree.dump import (
+            flush_occupancy_dump,
+            take_pending_stash,
+        )
+
+        stash = take_pending_stash()
+        if stash is not None and method == "greedy":
+            gold = sampled[:, : self.num_speculative_steps]
+            gold = gold.masked_fill((num_sampled == 0).unsqueeze(1), -1)
+            flush_occupancy_dump(stash, path_node_ids, gold)
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=None,

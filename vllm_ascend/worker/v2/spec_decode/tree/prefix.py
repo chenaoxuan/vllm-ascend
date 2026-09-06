@@ -4,6 +4,15 @@ import torch.nn.functional as F
 
 from vllm_ascend.worker.v2.spec_decode.tree.builder import TreeBuilder
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.training_tree.dump import (
+    empty_parent_stash,
+    remap_stash_parents,
+    scatter_parent_rows,
+)
+from vllm_ascend.worker.v2.spec_decode.tree.training_tree.features import (
+    load_occupancy_ckpt,
+    rank_by_occupancy,
+)
 
 
 def _select_topb_nodes(
@@ -106,12 +115,16 @@ def _prefix_corrected_candidates(
     candidate_weight: torch.Tensor,
     candidate_bias: torch.Tensor | None,
     k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    occupancy_head=None,
+    depth: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Prefix-only Domino candidate correction for one depth (not Markov).
 
-    Returns ``(top_scores, sel_ids, candidate_logits)`` where
-    ``candidate_logits`` is ``[R, width, C]`` over the base top-C set (the
-    actual Domino proposal before the width×k top cut).
+    Returns ``(top_scores, sel_ids, candidate_logits, log_q, cand_ids)``.
+    ``candidate_logits`` / ``log_q`` / ``cand_ids`` are ``[R, width, C]``
+    over the base top-C set (proposal before the width×k cut). With an
+    occupancy head, ``top_scores`` are ℓ over the selected k; otherwise
+    they are C-normalized log q of those k.
     """
     s_proj = F.linear(parent_hidden, scorer.w_s, None)
     mid = scorer.middle(z.unsqueeze(1) + s_proj)
@@ -120,13 +133,19 @@ def _prefix_corrected_candidates(
         bias = bias + candidate_bias.unsqueeze(1)
     candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias
     candidate_logits = candidate_logits.float()
-    top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
     log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)
-    top_scores = top_vals - log_z
+    log_q = candidate_logits - log_z
     width = parent_hidden.size(1)
     cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
-    sel_ids = torch.gather(cand_ids, 2, top_ids)
-    return top_scores, sel_ids, candidate_logits
+    if occupancy_head is not None:
+        top_scores, sel_ids = rank_by_occupancy(
+            log_q, cand_ids, k, occupancy_head, depth
+        )
+    else:
+        top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
+        top_scores = top_vals - log_z
+        sel_ids = torch.gather(cand_ids, 2, top_ids)
+    return top_scores, sel_ids, candidate_logits, log_q, cand_ids
 
 
 def _scatter_parent_proposal(
@@ -157,7 +176,9 @@ class PrefixTreeBuilder(TreeBuilder):
     ``params["candidate_size"]`` (missing/None → ``C = k``; else clamp
     ``C = max(k, min(int(C), vocab))``). If the expanded supertree
     exceeds ``budget``, ``_select_topb_nodes`` prunes it (hard-coded
-    ``depth_bonus=-0.2``).
+    ``depth_bonus=-0.2`` unless ``params.score_ckpt`` is loaded).
+    ``params.score_ckpt`` replaces occupancy with ℓ; ``params.dump_path``
+    stashes C-wide log q for greedy gold-parent dump.
     """
 
     required_backend = "dflash"
@@ -178,6 +199,24 @@ class PrefixTreeBuilder(TreeBuilder):
         self.prefix_len = prefix_len
         self.depth_bonus = -0.2
         self.candidate_size = params.get("candidate_size")
+        self.dump_path = params.get("dump_path")
+        self.dump_stash = None
+        self.occupancy_head = None
+        self._occupancy_meta = None
+        ckpt = params.get("score_ckpt")
+        if ckpt:
+            raw_c = self.candidate_size
+            c_run = int(raw_c) if raw_c is not None else int(topk)
+            head, meta = load_occupancy_ckpt(
+                str(ckpt),
+                topk=int(topk),
+                budget=int(budget),
+                candidate_size=c_run,
+            )
+            if head is not None:
+                self.occupancy_head = head
+                self._occupancy_meta = meta
+                self.depth_bonus = 0.0
 
     def build(
         self,
@@ -198,6 +237,23 @@ class PrefixTreeBuilder(TreeBuilder):
         k = min(topk, vocab, budget)
         width = k
         supertree_budget = width * spec_num
+        occupancy_head = self.occupancy_head
+        if occupancy_head is not None:
+            meta = self._occupancy_meta or {}
+            raw_c = self.candidate_size
+            c_run = int(raw_c) if raw_c is not None else k
+            c_run = max(k, min(c_run, vocab))
+            if (
+                int(meta.get("C", -1)) != c_run
+                or int(meta.get("topk", -1)) != topk
+                or int(meta.get("budget", -1)) != budget
+                or int(meta.get("spec_num", -1)) != spec_num
+            ):
+                occupancy_head = None
+                depth_bonus = -0.2
+            else:
+                occupancy_head = occupancy_head.to(device=device)  # H2D once if needed
+                depth_bonus = 0.0
 
         with_correction = correction_scorer is not None
         if with_correction:
@@ -255,6 +311,23 @@ class PrefixTreeBuilder(TreeBuilder):
             )
             hidden_states[:, 0] = root_hidden
 
+        dump_stash = None
+        self.dump_stash = None
+        if self.dump_path and with_correction:
+            dump_stash = empty_parent_stash(
+                num_reqs,
+                supertree_budget + 1,
+                candidate_count,
+                device,
+                meta={
+                    "C": int(candidate_count),
+                    "topk": int(topk),
+                    "budget": int(budget),
+                    "spec_num": int(spec_num),
+                },
+                dump_path=str(self.dump_path),
+            )
+
         frontier = torch.zeros((num_reqs, width), dtype=torch.long, device=device)
         frontier_len = 1
         num_nodes = 0
@@ -285,18 +358,31 @@ class PrefixTreeBuilder(TreeBuilder):
                             prop_temp, frontier, valid_parent, full
                         )
                 else:
-                    top_scores, cand_ids, cand_logits = _prefix_corrected_candidates(
-                        correction_scorer,
-                        z_parts[:, depth_slot],
-                        parent_hidden,
-                        candidate_vals[:, depth_slot],
-                        candidate_ids[:, depth_slot],
-                        candidate_weight[:, depth_slot],
-                        candidate_bias[:, depth_slot]
-                        if candidate_bias is not None
-                        else None,
-                        k,
+                    top_scores, cand_ids, cand_logits, log_q, cids_c = (
+                        _prefix_corrected_candidates(
+                            correction_scorer,
+                            z_parts[:, depth_slot],
+                            parent_hidden,
+                            candidate_vals[:, depth_slot],
+                            candidate_ids[:, depth_slot],
+                            candidate_weight[:, depth_slot],
+                            candidate_bias[:, depth_slot]
+                            if candidate_bias is not None
+                            else None,
+                            k,
+                            occupancy_head=occupancy_head,
+                            depth=child_depth,
+                        )
                     )
+                    if dump_stash is not None:
+                        scatter_parent_rows(
+                            dump_stash,
+                            frontier,
+                            log_q,
+                            cids_c,
+                            child_depth,
+                            valid_parent,
+                        )
                     if prop_temp is not None:
                         full = draft_logits.new_full(
                             (num_reqs, width, vocab), float("-inf")
@@ -392,6 +478,10 @@ class PrefixTreeBuilder(TreeBuilder):
                     kept_ids.unsqueeze(-1).expand(-1, -1, vocab),
                 )
                 proposal_logits[:, 1 : budget + 1] = gathered
+            if dump_stash is not None:
+                dump_stash = remap_stash_parents(
+                    dump_stash, old_to_new, budget + 1
+                )
             num_nodes = budget
         else:
             tokens = tokens[:, :num_nodes]
@@ -401,4 +491,5 @@ class PrefixTreeBuilder(TreeBuilder):
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, : num_nodes + 1] = prop_temp[:, : num_nodes + 1]
 
+        self.dump_stash = dump_stash
         return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)

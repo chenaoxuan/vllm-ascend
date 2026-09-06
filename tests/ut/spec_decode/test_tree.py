@@ -15,6 +15,10 @@ from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
 from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
 from vllm_ascend.worker.v2.spec_decode.tree.prefix import PrefixTreeBuilder
 from vllm_ascend.worker.v2.spec_decode.tree.priority import PriorityTreeBuilder
+from vllm_ascend.worker.v2.spec_decode.tree.training_tree.features import (
+    SCHEMA,
+    OccupancyHead,
+)
 
 
 def test_batch_spine_and_sibling_trees() -> None:
@@ -432,6 +436,101 @@ def test_tree_query_compact_along_non_prefix_path() -> None:
         pad_slot_id=-1,
     )
     assert torch.equal(slots, torch.tensor([100, 101, -1, -1]))
+
+
+class _FakeDominoScorer:
+    gru_hidden_dim = 2
+
+    def __init__(self, vocab: int) -> None:
+        mid = 2
+        self.fc2_weight = torch.zeros(vocab, mid)
+        self.fc2_bias = None
+        self.w_s = torch.zeros(mid, self.gru_hidden_dim)
+        self.middle = nn.Identity()
+
+    def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+        return parallel_hiddens.new_zeros(
+            *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
+        )
+
+    def update_hidden(
+        self, token_ids: torch.Tensor, h_state: torch.Tensor
+    ) -> torch.Tensor:
+        return h_state
+
+
+def _write_invert_logq_ckpt(path, *, c: int, topk: int, budget: int, spec_num: int) -> None:
+    head = OccupancyHead()
+    with torch.no_grad():
+        head.fc1.weight.zero_()
+        head.fc1.bias.zero_()
+        head.fc1.weight[0, 0] = -10.0
+        head.fc2.weight.zero_()
+        head.fc2.bias.zero_()
+        head.fc2.weight[0, 0] = 1.0
+    torch.save(
+        {
+            "schema": SCHEMA,
+            "meta": {"C": c, "topk": topk, "budget": budget, "spec_num": spec_num},
+            "state_dict": head.state_dict(),
+            "feat_dim": 5,
+        },
+        path,
+    )
+
+
+def test_prefix_occupancy_ckpt_ranks_by_ell(tmp_path) -> None:
+    """score_ckpt ranks by ℓ (not log q); proposal stays Domino; greedy still token-match."""
+    ckpt = tmp_path / "occupancy.pt"
+    _write_invert_logq_ckpt(ckpt, c=3, topk=1, budget=1, spec_num=1)
+
+    logits = torch.tensor([[[10.0, 9.0, 0.0]]])
+    hidden = torch.zeros(1, 1, 4)
+    root = torch.tensor([0])
+    baseline = PrefixTreeBuilder(
+        budget=1,
+        topk=1,
+        correction_scorer=_FakeDominoScorer(3),
+        prefix_len=0,
+    ).build(
+        logits.clone(),
+        empty_tree_layout(1, 1, device=logits.device),
+        root_token_ids=root,
+        draft_hidden=hidden,
+    )
+    assert baseline.tokens[0, 0].tolist() == 0
+
+    proposal = torch.full((1, 2, 3), float("-inf"))
+    ranked = PrefixTreeBuilder(
+        budget=1,
+        topk=1,
+        correction_scorer=_FakeDominoScorer(3),
+        prefix_len=0,
+        params={"candidate_size": 3, "score_ckpt": str(ckpt)},
+    ).build(
+        logits,
+        empty_tree_layout(1, 1, device=logits.device),
+        root_token_ids=root,
+        draft_hidden=hidden,
+        proposal_logits=proposal,
+    )
+    assert ranked.tokens[0, 0].tolist() == 2
+    assert torch.isfinite(proposal[0, 0]).all()
+    assert proposal[0, 0].argmax().tolist() == 0
+
+    mismatch = PrefixTreeBuilder(
+        budget=1,
+        topk=1,
+        correction_scorer=_FakeDominoScorer(3),
+        prefix_len=0,
+        params={"candidate_size": 3, "score_ckpt": str(ckpt)},
+    ).build(
+        torch.tensor([[[10.0, 9.0, 0.0], [0.0, 0.0, 0.0]]]),
+        empty_tree_layout(1, 1, device=logits.device),
+        root_token_ids=root,
+        draft_hidden=torch.zeros(1, 2, 4),
+    )
+    assert mismatch.tokens[0, 0].tolist() == 0
 
 
 def test_prefix_domino_shift_label_samples_bonus_hidden() -> None:

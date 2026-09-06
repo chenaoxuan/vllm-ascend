@@ -63,6 +63,12 @@ def configure_tree_timer(
         _REGISTERED = True
 
 
+def set_tree_timer_backend(backend: str) -> None:
+    """Update printed backend label (``torch`` / ``triton``)."""
+    global _BACKEND
+    _BACKEND = backend
+
+
 def tree_timer_enabled() -> bool:
     return _ENABLED or _env_enabled()
 

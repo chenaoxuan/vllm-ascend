@@ -56,15 +56,72 @@ def greedy_tree_reject(
     buffer (filled with PAD).
     """
     from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+    from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
     with tree_time("greedy_tree_reject"):
-        return _greedy_tree_reject_impl(
+        if use_tree_triton(target_logits.device):
+            return _greedy_tree_reject_triton(
+                tree,
+                target_logits,
+                num_speculative_tokens,
+                path_node_ids=path_node_ids,
+                sampled_token_ids=sampled_token_ids,
+            )
+        return greedy_tree_reject_torch(
             tree,
             target_logits,
             num_speculative_tokens,
             path_node_ids=path_node_ids,
             sampled_token_ids=sampled_token_ids,
         )
+
+
+def _greedy_tree_reject_triton(
+    tree: TreeLayout,
+    target_logits: torch.Tensor,
+    num_speculative_tokens: int,
+    path_node_ids: torch.Tensor | None = None,
+    sampled_token_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from vllm_ascend.ops.triton.spec_decode.tree.greedy_reject import (
+        greedy_tree_reject_triton,
+    )
+
+    tokens = tree.tokens
+    device = tokens.device
+    num_reqs, _budget = tokens.shape
+    spec_len = num_speculative_tokens
+    target_token_ids = target_logits.argmax(dim=-1)
+    if sampled_token_ids is None:
+        sampled_token_ids = torch.full(
+            (num_reqs, spec_len + 1),
+            _PAD_TOKEN_ID,
+            dtype=torch.long,
+            device=device,
+        )
+    else:
+        sampled_token_ids = sampled_token_ids[:num_reqs, : spec_len + 1]
+        sampled_token_ids.fill_(_PAD_TOKEN_ID)
+    if path_node_ids is None:
+        path_out = torch.full(
+            (num_reqs, spec_len), -1, dtype=torch.long, device=device
+        )
+    else:
+        path_out = path_node_ids[:num_reqs, :spec_len]
+        path_out.fill_(-1)
+    greedy_tree_reject_triton(
+        tokens.contiguous(),
+        tree.first_child.contiguous(),
+        tree.next_sibling.contiguous(),
+        target_token_ids.contiguous(),
+        sampled_token_ids,
+        path_out,
+        spec_len,
+    )
+    return sampled_token_ids
+
+
+# Python / Torch golden retained for UT and CPU.
 
 
 def _greedy_tree_reject_impl(
@@ -136,6 +193,9 @@ def _greedy_tree_reject_impl(
         )
 
     return sampled_token_ids
+
+
+greedy_tree_reject_torch = _greedy_tree_reject_impl
 
 
 def _pack_tree_target_logits(

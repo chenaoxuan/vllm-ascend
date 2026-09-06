@@ -99,6 +99,10 @@ class AttentionMaskBuilder:
     def _get_tree_attention_mask_impl(self, tree_visibility: torch.Tensor,
                                      seq_lens: torch.Tensor,
                                      num_decode):
+        from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
+            use_tree_triton,
+        )
+
         max_nodes = tree_visibility.shape[-1]
         query_len = 1 + max_nodes
         num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])
@@ -119,6 +123,21 @@ class AttentionMaskBuilder:
             )
             self._tree_mask_caps = (num_decode, query_len, kv_len)
         attn_mask = self._tree_attn_mask[:num_decode, :, :query_len, :kv_len]
+        if use_tree_triton(self.device):
+            from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
+                fill_tree_attention_mask_triton,
+            )
+
+            prev = torch.empty(num_mask, dtype=torch.int32, device=self.device)
+            for i in range(num_mask):
+                prev[i] = int(seq_lens[i]) - query_len
+            # H2D: small [num_mask] host ints for FIA mask builder.
+            fill_tree_attention_mask_triton(
+                attn_mask[:num_mask], tree_visibility[:num_mask], prev
+            )
+            if num_decode > num_mask:
+                attn_mask[num_mask:].fill_(True)
+            return attn_mask
         attn_mask.fill_(True)
         for i in range(num_mask):
             req_mask = attn_mask[i, 0]

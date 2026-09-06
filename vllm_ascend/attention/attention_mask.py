@@ -39,6 +39,9 @@ class AttentionMaskBuilder:
         self._seq_len_cached = 0
         self.device = device
         self.chunked_prefill_attn_mask = None
+        # Growable tree-decode FIA mask; reused via fill_ + slice.
+        self._tree_attn_mask: torch.Tensor | None = None
+        self._tree_mask_caps = (0, 0, 0)  # (num_decode, query_len, kv_len)
 
     def get_attn_mask(self, max_seq_len: int, dtype: torch.dtype):
         if self.attn_mask_cache is None or max_seq_len > self._seq_len_cached:
@@ -89,9 +92,20 @@ class AttentionMaskBuilder:
         kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
         # Paged FIA custom mask is (B, 1, Q_S, KV_S). A 3D (B, Q, Kv) tensor
         # looks like (Q, Kv) at bs=1 but shares the leading request's mask at bs>1.
-        attn_mask = torch.ones(
-            num_decode, 1, query_len, kv_len, dtype=torch.bool, device=self.device
-        )
+        cap_b, cap_q, cap_kv = self._tree_mask_caps
+        if (
+            self._tree_attn_mask is None
+            or num_decode > cap_b
+            or query_len > cap_q
+            or kv_len > cap_kv
+            or self._tree_attn_mask.device != self.device
+        ):
+            self._tree_attn_mask = torch.empty(
+                num_decode, 1, query_len, kv_len, dtype=torch.bool, device=self.device
+            )
+            self._tree_mask_caps = (num_decode, query_len, kv_len)
+        attn_mask = self._tree_attn_mask[:num_decode, :, :query_len, :kv_len]
+        attn_mask.fill_(True)
         for i in range(num_mask):
             req_mask = attn_mask[i, 0]
             prev_kv_len = int(seq_lens[i]) - query_len

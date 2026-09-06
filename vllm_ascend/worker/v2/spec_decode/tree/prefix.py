@@ -134,6 +134,7 @@ def _scatter_parent_proposal(
     parent_ids: torch.Tensor,
     valid_parent: torch.Tensor,
     full_logits: torch.Tensor,
+    req_idx: torch.Tensor | None = None,
 ) -> None:
     """Write ``full_logits[r, j]`` into ``proposal_logits[r, parent_ids[r, j]]``.
 
@@ -142,7 +143,10 @@ def _scatter_parent_proposal(
     num_reqs, width, _vocab = full_logits.shape
     device = full_logits.device
     full_logits = full_logits.to(dtype=proposal_logits.dtype)
-    req_idx = torch.arange(num_reqs, device=device)
+    if req_idx is None:
+        req_idx = torch.arange(num_reqs, device=device)
+    else:
+        req_idx = req_idx[:num_reqs]
     for j in range(width):
         write = valid_parent[:, j]
         pid = parent_ids[:, j].clamp(min=0, max=proposal_logits.shape[1] - 1)
@@ -182,6 +186,99 @@ class PrefixTreeBuilder(TreeBuilder):
         self.prefix_len = prefix_len
         self.depth_bonus = -0.2
         self.candidate_size = params.get("candidate_size")
+        # Growable scratch reused across propose() calls.
+        self._scratch_reqs = 0
+        self._scratch_vocab = 0
+        self._scratch_spec = 0
+        self._scratch_gru = 0
+        self._tokens_buf: torch.Tensor | None = None
+        self._depths_buf: torch.Tensor | None = None
+        self._parents_buf: torch.Tensor | None = None
+        self._path_scores_buf: torch.Tensor | None = None
+        self._frontier_buf: torch.Tensor | None = None
+        self._prop_temp_buf: torch.Tensor | None = None
+        self._prop_layer_buf: torch.Tensor | None = None
+        self._hidden_buf: torch.Tensor | None = None
+        self._old_to_new_buf: torch.Tensor | None = None
+        self._req_arange: torch.Tensor | None = None
+        self._width_arange: torch.Tensor | None = None
+        self._node_arange: torch.Tensor | None = None
+        self._budget_ids: torch.Tensor | None = None
+        self._frontier_pad: torch.Tensor | None = None
+
+    def _ensure_scratch(
+        self,
+        num_reqs: int,
+        vocab: int,
+        spec_num: int,
+        device: torch.device,
+        *,
+        need_proposal: bool,
+        gru_hidden_dim: int = 0,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        k = min(self.topk, vocab, self.budget)
+        width = k
+        supertree_budget = width * spec_num
+        max_nodes = supertree_budget + 1
+        grow = (
+            self._tokens_buf is None
+            or num_reqs > self._scratch_reqs
+            or vocab > self._scratch_vocab
+            or spec_num > self._scratch_spec
+            or gru_hidden_dim > self._scratch_gru
+            or self._tokens_buf.device != device
+        )
+        if grow:
+            self._scratch_reqs = max(num_reqs, self._scratch_reqs)
+            self._scratch_vocab = max(vocab, self._scratch_vocab)
+            self._scratch_spec = max(spec_num, self._scratch_spec)
+            self._scratch_gru = max(gru_hidden_dim, self._scratch_gru)
+            r = self._scratch_reqs
+            v = self._scratch_vocab
+            s = self._scratch_spec
+            w = min(self.topk, v, self.budget)
+            sb = w * s
+            mn = sb + 1
+            self._tokens_buf = torch.empty((r, sb), dtype=torch.long, device=device)
+            self._depths_buf = torch.empty((r, sb), dtype=torch.long, device=device)
+            self._parents_buf = torch.empty((r, mn), dtype=torch.long, device=device)
+            self._path_scores_buf = torch.empty(
+                (r, mn), dtype=torch.float32, device=device
+            )
+            self._frontier_buf = torch.empty((r, w), dtype=torch.long, device=device)
+            self._frontier_pad = torch.zeros((r, w), dtype=torch.long, device=device)
+            self._old_to_new_buf = torch.empty((r, mn), dtype=torch.long, device=device)
+            self._req_arange = torch.arange(r, device=device, dtype=torch.long)
+            self._width_arange = torch.arange(w, device=device, dtype=torch.long)
+            self._node_arange = torch.arange(mn + 1, device=device, dtype=torch.long)
+            self._budget_ids = torch.arange(
+                1, self.budget + 1, device=device, dtype=torch.long
+            )
+            if need_proposal:
+                # Proposal buffers stay FP32 (NPU IndexPut rejects BF16 selfRef).
+                self._prop_temp_buf = torch.empty(
+                    (r, mn, v), dtype=torch.float32, device=device
+                )
+                self._prop_layer_buf = torch.empty(
+                    (r, w, v), dtype=torch.float32, device=device
+                )
+            if gru_hidden_dim > 0:
+                self._hidden_buf = torch.empty(
+                    (r, mn, self._scratch_gru), dtype=dtype, device=device
+                )
+        elif need_proposal and self._prop_temp_buf is None:
+            r = self._scratch_reqs
+            v = self._scratch_vocab
+            w = min(self.topk, v, self.budget)
+            sb = w * self._scratch_spec
+            mn = sb + 1
+            self._prop_temp_buf = torch.empty(
+                (r, mn, v), dtype=torch.float32, device=device
+            )
+            self._prop_layer_buf = torch.empty(
+                (r, w, v), dtype=torch.float32, device=device
+            )
 
     def build(
         self,
@@ -202,8 +299,22 @@ class PrefixTreeBuilder(TreeBuilder):
         k = min(topk, vocab, budget)
         width = k
         supertree_budget = width * spec_num
+        need_proposal = proposal_logits is not None
 
         with_correction = correction_scorer is not None
+        gru_hidden_dim = (
+            correction_scorer.gru_hidden_dim if with_correction else 0
+        )
+        self._ensure_scratch(
+            num_reqs,
+            vocab,
+            spec_num,
+            device,
+            need_proposal=need_proposal,
+            gru_hidden_dim=gru_hidden_dim,
+            dtype=draft_logits.dtype,
+        )
+
         if with_correction:
             raw_c = self.candidate_size
             if raw_c is None:
@@ -224,48 +335,37 @@ class PrefixTreeBuilder(TreeBuilder):
                     0, flat_cids
                 ).view(num_reqs, spec_num, candidate_count)
             z_parts = correction_scorer.project_z(draft_hidden[:, :spec_num])
-            gru_hidden_dim = correction_scorer.gru_hidden_dim
         else:
             log_probs = torch.log_softmax(draft_logits.float(), dim=-1)
 
         max_nodes = supertree_budget + 1
-        tokens = torch.full(
-            (num_reqs, supertree_budget), -1, dtype=torch.long, device=device
-        )
-        depths = torch.zeros(
-            (num_reqs, supertree_budget), dtype=torch.long, device=device
-        )
-        parents = torch.zeros((num_reqs, max_nodes), dtype=torch.long, device=device)
-        path_scores = torch.zeros(
-            (num_reqs, max_nodes), dtype=torch.float32, device=device
-        )
+        tokens = self._tokens_buf[:num_reqs, :supertree_budget]
+        tokens.fill_(-1)
+        depths = self._depths_buf[:num_reqs, :supertree_budget]
+        depths.zero_()
+        parents = self._parents_buf[:num_reqs, :max_nodes]
+        parents.zero_()
+        path_scores = self._path_scores_buf[:num_reqs, :max_nodes]
+        path_scores.zero_()
         prop_temp = None
-        if proposal_logits is not None:
-            # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
-            prop_temp = torch.full(
-                (num_reqs, max_nodes, vocab),
-                float("-inf"),
-                dtype=torch.float32,
-                device=device,
-            )
+        if need_proposal:
+            prop_temp = self._prop_temp_buf[:num_reqs, :max_nodes, :vocab]
+            prop_temp.fill_(float("-inf"))
         hidden_states = None
         if with_correction:
-            root_h0 = torch.zeros(
-                (num_reqs, gru_hidden_dim), dtype=draft_logits.dtype, device=device
-            )
+            hidden_states = self._hidden_buf[:num_reqs, :max_nodes, :gru_hidden_dim]
+            hidden_states.zero_()
             root_hidden = correction_scorer.update_hidden(
-                root_token_ids.reshape(-1), root_h0
-            )
-            hidden_states = torch.zeros(
-                (num_reqs, max_nodes, gru_hidden_dim),
-                dtype=root_hidden.dtype,
-                device=device,
+                root_token_ids.reshape(-1), hidden_states[:, 0]
             )
             hidden_states[:, 0] = root_hidden
 
-        frontier = torch.zeros((num_reqs, width), dtype=torch.long, device=device)
+        frontier = self._frontier_buf[:num_reqs, :width]
+        frontier.zero_()
         frontier_len = 1
         num_nodes = 0
+        width_arange = self._width_arange[:width]
+        req_idx = self._req_arange[:num_reqs]
         for child_depth in range(1, spec_num + 1):
             if num_nodes >= supertree_budget:
                 break
@@ -273,7 +373,7 @@ class PrefixTreeBuilder(TreeBuilder):
             if take <= 0:
                 break
             depth_slot = child_depth - 1
-            valid_parent = torch.arange(width, device=device)[None, :] < frontier_len
+            valid_parent = width_arange[None, :] < frontier_len
 
             if with_correction:
                 parent_hidden = torch.gather(
@@ -290,7 +390,7 @@ class PrefixTreeBuilder(TreeBuilder):
                     if prop_temp is not None:
                         full = logits.unsqueeze(1).expand(-1, width, -1)
                         _scatter_parent_proposal(
-                            prop_temp, frontier, valid_parent, full
+                            prop_temp, frontier, valid_parent, full, req_idx=req_idx
                         )
                 else:
                     top_scores, cand_ids, cand_logits = _prefix_corrected_candidates(
@@ -306,18 +406,14 @@ class PrefixTreeBuilder(TreeBuilder):
                         k,
                     )
                     if prop_temp is not None:
-                        full = torch.full(
-                            (num_reqs, width, vocab),
-                            float("-inf"),
-                            dtype=torch.float32,
-                            device=device,
-                        )
+                        full = self._prop_layer_buf[:num_reqs, :width, :vocab]
+                        full.fill_(float("-inf"))
                         ids = candidate_ids[:, depth_slot].unsqueeze(1).expand(
                             -1, width, -1
                         )
                         full.scatter_(2, ids, cand_logits.to(full.dtype))
                         _scatter_parent_proposal(
-                            prop_temp, frontier, valid_parent, full
+                            prop_temp, frontier, valid_parent, full, req_idx=req_idx
                         )
             else:
                 top_vals, top_ids = torch.topk(log_probs[:, depth_slot, :], k=k, dim=-1)
@@ -330,7 +426,9 @@ class PrefixTreeBuilder(TreeBuilder):
                         .unsqueeze(1)
                         .expand(-1, width, -1)
                     )
-                    _scatter_parent_proposal(prop_temp, frontier, valid_parent, full)
+                    _scatter_parent_proposal(
+                        prop_temp, frontier, valid_parent, full, req_idx=req_idx
+                    )
 
             top_scores = torch.where(
                 valid_parent[:, :, None],
@@ -362,20 +460,14 @@ class PrefixTreeBuilder(TreeBuilder):
                 hidden_states[:, start : start + take] = child_hidden
 
             new_ids = (
-                torch.arange(start, start + take, dtype=torch.long, device=device)
+                self._node_arange[start : start + take]
                 .unsqueeze(0)
                 .expand(num_reqs, -1)
             )
             if take < width:
-                new_ids = torch.cat(
-                    [
-                        new_ids,
-                        torch.zeros(
-                            (num_reqs, width - take), dtype=torch.long, device=device
-                        ),
-                    ],
-                    dim=-1,
-                )
+                pad = self._frontier_pad[:num_reqs, : width - take]
+                pad.zero_()
+                new_ids = torch.cat([new_ids, pad], dim=-1)
             frontier = new_ids
             frontier_len = take
             num_nodes += take
@@ -390,15 +482,12 @@ class PrefixTreeBuilder(TreeBuilder):
             tokens = torch.gather(tokens, 1, kept_ids - 1)
             depths = torch.gather(depths, 1, kept_ids - 1)
             old_parents = torch.gather(parents, 1, kept_ids)
-            old_to_new = torch.zeros(
-                (num_reqs, num_nodes + 1), dtype=torch.long, device=device
-            )
-            new_ids = torch.arange(
-                1, budget + 1, dtype=torch.long, device=device
-            ).unsqueeze(0)
+            old_to_new = self._old_to_new_buf[:num_reqs, : num_nodes + 1]
+            old_to_new.zero_()
+            new_ids = self._budget_ids.unsqueeze(0)
             old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, budget))
             parent_ids = torch.gather(old_to_new, 1, old_parents)
-            if proposal_logits is not None and prop_temp is not None:
+            if need_proposal and prop_temp is not None:
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, 0] = prop_temp[:, 0]
                 # Remap kept nodes' proposal rows into final ids 1..budget.
@@ -413,7 +502,7 @@ class PrefixTreeBuilder(TreeBuilder):
             tokens = tokens[:, :num_nodes]
             depths = depths[:, :num_nodes]
             parent_ids = parents[:, 1 : num_nodes + 1]
-            if proposal_logits is not None and prop_temp is not None:
+            if need_proposal and prop_temp is not None:
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, : num_nodes + 1] = prop_temp[:, : num_nodes + 1]
 

@@ -170,10 +170,13 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self.tree_proposal_logits is not None,
         )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
+        from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
+            use_tree_triton,
+        )
 
         configure_tree_timer(
             enabled=bool(tree_cfg.enable_timer),
-            backend="torch",
+            backend="triton" if use_tree_triton(device) else "torch",
             meta={
                 "method": self.method,
                 "budget": self.budget,

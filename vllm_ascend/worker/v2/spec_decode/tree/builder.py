@@ -14,6 +14,8 @@ METHOD_REQUIRED_BACKEND: dict[str, str] = {
     "prefix": "dflash",
 }
 
+_shared_req_arange: torch.Tensor | None = None
+
 
 def fill_shared_depth_proposal_logits(
     proposal_logits: torch.Tensor,
@@ -29,6 +31,7 @@ def fill_shared_depth_proposal_logits(
     builders without per-parent correction, every parent at depth ``d`` shares
     ``draft_logits[:, d]``.
     """
+    global _shared_req_arange
     num_reqs, spec_num, _vocab = draft_logits.shape
     device = draft_logits.device
     # Cast to proposal dtype (FP32); NPU IndexPut rejects BF16 selfRef.
@@ -37,7 +40,13 @@ def fill_shared_depth_proposal_logits(
     proposal_logits[:, 0] = draft_f[:, 0]
     if num_nodes <= 0:
         return
-    req_idx = torch.arange(num_reqs, device=device)
+    if (
+        _shared_req_arange is None
+        or _shared_req_arange.numel() < num_reqs
+        or _shared_req_arange.device != device
+    ):
+        _shared_req_arange = torch.arange(num_reqs, device=device, dtype=torch.long)
+    req_idx = _shared_req_arange[:num_reqs]
     for slot in range(num_nodes):
         depth = depths[:, slot].to(torch.long)
         parent = parents[:, slot].to(torch.long)

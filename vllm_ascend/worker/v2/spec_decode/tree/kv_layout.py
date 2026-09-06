@@ -1,5 +1,36 @@
 import torch
 
+# Cached arange / column buffers keyed by device (grow on demand).
+_depth_arange: dict[torch.device, torch.Tensor] = {}
+_dst_off_arange: dict[torch.device, torch.Tensor] = {}
+_root_col: dict[torch.device, torch.Tensor] = {}
+_valid_root_col: dict[torch.device, torch.Tensor] = {}
+_token_arange: dict[torch.device, torch.Tensor] = {}
+
+
+def _cached_arange(cache: dict, n: int, device: torch.device, dtype=torch.long) -> torch.Tensor:
+    buf = cache.get(device)
+    if buf is None or buf.numel() < n or buf.dtype != dtype:
+        buf = torch.arange(n, device=device, dtype=dtype)
+        cache[device] = buf
+    return buf[:n]
+
+
+def _cached_col(
+    cache: dict,
+    num_reqs: int,
+    device: torch.device,
+    dtype,
+    fill_value,
+) -> torch.Tensor:
+    buf = cache.get(device)
+    if buf is None or buf.shape[0] < num_reqs or buf.dtype != dtype:
+        buf = torch.empty((num_reqs, 1), dtype=dtype, device=device)
+        cache[device] = buf
+    out = buf[:num_reqs]
+    out.fill_(fill_value)
+    return out
+
 
 def compact_tree_kv_along_path(
     caches: list[torch.Tensor],
@@ -25,7 +56,7 @@ def compact_tree_kv_along_path(
     safe_idx = req_idx.clamp(min=0)
     prefix = num_computed[safe_idx]
     spec_len = node.shape[1]
-    depth = torch.arange(spec_len, device=node.device, dtype=prefix.dtype) + 1
+    depth = _cached_arange(_depth_arange, spec_len, node.device, dtype=prefix.dtype) + 1
     dst_pos = prefix.unsqueeze(1) + depth
     src_pos = prefix.unsqueeze(1) + node.clamp(min=0)
     valid = (node >= 0) & (req_idx >= 0).unsqueeze(1)
@@ -66,18 +97,17 @@ def compact_tree_query_along_path(
     num_reqs, spec_len = path_node_ids.shape
     node = path_node_ids.to(dtype=torch.long)
     qsl = query_start_loc[:num_reqs].to(dtype=torch.long)
-    root = torch.zeros((num_reqs, 1), dtype=torch.long, device=node.device)
+    root = _cached_col(_root_col, num_reqs, node.device, torch.long, 0)
     src_off = torch.cat([root, node.clamp(min=0)], dim=1)
-    dst_off = torch.arange(
-        spec_len + 1, device=node.device, dtype=torch.long
-    ).expand(num_reqs, -1)
-    valid = torch.cat(
-        [
-            torch.ones((num_reqs, 1), dtype=torch.bool, device=node.device),
-            node >= 0,
-        ],
-        dim=1,
+    dst_off = (
+        _cached_arange(_dst_off_arange, spec_len + 1, node.device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(num_reqs, -1)
     )
+    valid_root = _cached_col(
+        _valid_root_col, num_reqs, node.device, torch.bool, True
+    )
+    valid = torch.cat([valid_root, node >= 0], dim=1)
     src_off = torch.where(valid, src_off, dst_off)
     src_idx = qsl.unsqueeze(1) + src_off
     dst_idx = qsl.unsqueeze(1) + dst_off
@@ -107,10 +137,9 @@ def mask_rejected_dflash_context_slots(
     starts = query_start_loc[:num_reqs].to(dtype=torch.long)
     ends = query_start_loc[1 : num_reqs + 1].to(dtype=torch.long)
     valid_ends = ends - num_rejected.to(dtype=torch.long)
-    idx = torch.arange(
-        context_slot_mapping.shape[0],
-        device=context_slot_mapping.device,
-        dtype=torch.long,
+    n = context_slot_mapping.shape[0]
+    idx = _cached_arange(
+        _token_arange, n, context_slot_mapping.device, dtype=torch.long
     )
     req = torch.searchsorted(ends, idx, right=True).clamp(max=num_reqs - 1)
     in_req = (idx >= starts[req]) & (idx < ends[req])

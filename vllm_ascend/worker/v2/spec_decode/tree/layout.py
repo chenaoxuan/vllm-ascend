@@ -38,6 +38,10 @@ class TreeLayout:
     next_sibling: torch.Tensor
 
 
+# Reused scatter source for finalize_tree_layout ([max_reqs, 1]).
+_scatter_node_id_buf: torch.Tensor | None = None
+
+
 def empty_tree_layout(
     num_reqs: int,
     budget: int,
@@ -77,6 +81,7 @@ def finalize_tree_layout(
         parent_ids: [R, num_nodes] parent node ids (0 = root).
         num_nodes: number of non-root nodes (same for every request in the batch).
     """
+    global _scatter_node_id_buf
     num_reqs = tokens.shape[0]
     device = tokens.device
 
@@ -92,6 +97,16 @@ def finalize_tree_layout(
     out.parents[:, :num_nodes] = parent_ids.to(out.parents.dtype)
     out.num_nodes[:] = num_nodes
 
+    if (
+        _scatter_node_id_buf is None
+        or _scatter_node_id_buf.shape[0] < num_reqs
+        or _scatter_node_id_buf.device != device
+    ):
+        _scatter_node_id_buf = torch.empty(
+            (num_reqs, 1), dtype=torch.int32, device=device
+        )
+    node_id_buf = _scatter_node_id_buf[:num_reqs]
+
     for slot in range(num_nodes):
         node_id = slot + 1
         parent_id = parent_ids[:, slot]
@@ -99,11 +114,8 @@ def finalize_tree_layout(
             out.first_child[:, : num_nodes + 1], 1, parent_id.unsqueeze(1)
         ).squeeze(1)
         out.next_sibling[:, node_id] = cur_first
-        out.first_child.scatter_(
-            1,
-            parent_id.unsqueeze(1),
-            torch.full((num_reqs, 1), node_id, dtype=torch.int32, device=device),
-        )
+        node_id_buf.fill_(node_id)
+        out.first_child.scatter_(1, parent_id.unsqueeze(1), node_id_buf)
 
     for slot in range(num_nodes):
         parent_id = parent_ids[:, slot]

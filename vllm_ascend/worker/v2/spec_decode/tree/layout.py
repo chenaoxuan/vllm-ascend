@@ -82,9 +82,57 @@ def finalize_tree_layout(
         num_nodes: number of non-root nodes (same for every request in the batch).
     """
     from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+    from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
     with tree_time("finalize"):
-        return _finalize_tree_layout_impl(out, tokens, depths, parent_ids, num_nodes)
+        if use_tree_triton(tokens.device):
+            return _finalize_tree_layout_triton(
+                out, tokens, depths, parent_ids, num_nodes
+            )
+        return finalize_tree_layout_torch(
+            out, tokens, depths, parent_ids, num_nodes
+        )
+
+
+def _finalize_tree_layout_triton(
+    out: TreeLayout,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parent_ids: torch.Tensor,
+    num_nodes: int,
+) -> TreeLayout:
+    from vllm_ascend.ops.triton.spec_decode.tree.finalize_layout import (
+        finalize_tree_layout_triton,
+    )
+
+    out.tokens.fill_(-1)
+    out.depths.zero_()
+    out.parents.fill_(-1)
+    out.visibility.zero_()
+    out.first_child.fill_(-1)
+    out.next_sibling.fill_(-1)
+    out.tokens[:, :num_nodes] = tokens.to(out.tokens.dtype)
+    out.depths[:, :num_nodes] = depths.to(out.depths.dtype)
+    out.parents[:, :num_nodes] = parent_ids.to(out.parents.dtype)
+    out.num_nodes[:] = num_nodes
+    finalize_tree_layout_triton(
+        parent_ids[:, :num_nodes].to(torch.long),
+        out.first_child,
+        out.next_sibling,
+        out.visibility,
+        num_nodes,
+    )
+    return out
+
+
+def finalize_tree_layout_torch(
+    out: TreeLayout,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parent_ids: torch.Tensor,
+    num_nodes: int,
+) -> TreeLayout:
+    return _finalize_tree_layout_impl(out, tokens, depths, parent_ids, num_nodes)
 
 
 def _finalize_tree_layout_impl(

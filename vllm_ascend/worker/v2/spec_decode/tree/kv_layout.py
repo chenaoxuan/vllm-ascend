@@ -51,6 +51,58 @@ def compact_tree_kv_along_path(
     Reads are gathered into a temporary before scatter so overlapping src/dst
     slots (including swaps) stay correct.
     """
+    from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
+
+    if use_tree_triton(path_node_ids.device):
+        _compact_tree_kv_along_path_triton(
+            caches, block_table, block_size, idx_mapping, num_computed, path_node_ids
+        )
+        return
+    compact_tree_kv_along_path_torch(
+        caches, block_table, block_size, idx_mapping, num_computed, path_node_ids
+    )
+
+
+def _compact_tree_kv_along_path_triton(
+    caches: list[torch.Tensor],
+    block_table: torch.Tensor,
+    block_size: int,
+    idx_mapping: torch.Tensor,
+    num_computed: torch.Tensor,
+    path_node_ids: torch.Tensor,
+) -> None:
+    from vllm_ascend.ops.triton.spec_decode.tree.kv_compact import (
+        compact_tree_kv_slots_triton,
+    )
+
+    node = path_node_ids.to(dtype=torch.long)
+    num_reqs, spec_len = node.shape
+    src_slots = torch.empty((num_reqs, spec_len), dtype=torch.long, device=node.device)
+    dst_slots = torch.empty_like(src_slots)
+    compact_tree_kv_slots_triton(
+        block_table,
+        num_computed,
+        idx_mapping,
+        node,
+        src_slots,
+        dst_slots,
+        block_size,
+    )
+    for cache in caches:
+        tail = cache.shape[2:]
+        flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
+        gathered = flat[src_slots].clone()
+        flat[dst_slots] = gathered
+
+
+def compact_tree_kv_along_path_torch(
+    caches: list[torch.Tensor],
+    block_table: torch.Tensor,
+    block_size: int,
+    idx_mapping: torch.Tensor,
+    num_computed: torch.Tensor,
+    path_node_ids: torch.Tensor,
+) -> None:
     node = path_node_ids.to(dtype=torch.long)
     req_idx = idx_mapping[: node.shape[0]]
     safe_idx = req_idx.clamp(min=0)

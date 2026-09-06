@@ -169,6 +169,19 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self._domino_shift_label,
             self.tree_proposal_logits is not None,
         )
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
+
+        configure_tree_timer(
+            enabled=bool(tree_cfg.enable_timer),
+            backend="torch",
+            meta={
+                "method": self.method,
+                "budget": self.budget,
+                "topk": self.topk,
+                "depth": self.num_speculative_steps,
+                "rejection_sampler": tree_cfg.rejection_sampler,
+            },
+        )
 
     def load_draft_model(
         self,
@@ -255,15 +268,18 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     ) -> torch.Tensor:
         path_node_ids = getattr(input_batch, "path_node_ids", None)
         if path_node_ids is not None and not dummy_run:
+            from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
             tensors = [last_hidden_states]
             if aux_hidden_states:
                 tensors.extend(aux_hidden_states)
-            compact_tree_query_along_path(
-                tensors,
-                input_batch.query_start_loc,
-                path_node_ids,
-                linearize_positions=input_batch.positions,
-            )
+            with tree_time("kv_query_compact"):
+                compact_tree_query_along_path(
+                    tensors,
+                    input_batch.query_start_loc,
+                    path_node_ids,
+                    linearize_positions=input_batch.positions,
+                )
         return super().propose(
             input_batch,
             attn_metadata,
@@ -292,13 +308,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        last_hidden_states = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        with tree_time("draft_forward"):
+            last_hidden_states = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         if self.method == "beam":

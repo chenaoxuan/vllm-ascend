@@ -55,6 +55,25 @@ def greedy_tree_reject(
     Optional ``sampled_token_ids`` reuses a preallocated ``[R, spec_len+1]``
     buffer (filled with PAD).
     """
+    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+    with tree_time("greedy_tree_reject"):
+        return _greedy_tree_reject_impl(
+            tree,
+            target_logits,
+            num_speculative_tokens,
+            path_node_ids=path_node_ids,
+            sampled_token_ids=sampled_token_ids,
+        )
+
+
+def _greedy_tree_reject_impl(
+    tree: TreeLayout,
+    target_logits: torch.Tensor,
+    num_speculative_tokens: int,
+    path_node_ids: torch.Tensor | None = None,
+    sampled_token_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
     tokens = tree.tokens
     first_child = tree.first_child
     next_sibling = tree.next_sibling

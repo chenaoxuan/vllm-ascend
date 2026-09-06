@@ -81,6 +81,19 @@ def finalize_tree_layout(
         parent_ids: [R, num_nodes] parent node ids (0 = root).
         num_nodes: number of non-root nodes (same for every request in the batch).
     """
+    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+    with tree_time("finalize"):
+        return _finalize_tree_layout_impl(out, tokens, depths, parent_ids, num_nodes)
+
+
+def _finalize_tree_layout_impl(
+    out: TreeLayout,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parent_ids: torch.Tensor,
+    num_nodes: int,
+) -> TreeLayout:
     global _scatter_node_id_buf
     num_reqs = tokens.shape[0]
     device = tokens.device

@@ -85,6 +85,20 @@ class AttentionMaskBuilder:
     def get_tree_attention_mask(self, tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
                                 num_decode):
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import (
+            tree_time,
+            tree_timer_begin_step,
+        )
+
+        tree_timer_begin_step()
+        with tree_time("mask"):
+            return self._get_tree_attention_mask_impl(
+                tree_visibility, seq_lens, num_decode
+            )
+
+    def _get_tree_attention_mask_impl(self, tree_visibility: torch.Tensor,
+                                     seq_lens: torch.Tensor,
+                                     num_decode):
         max_nodes = tree_visibility.shape[-1]
         query_len = 1 + max_nodes
         num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])

@@ -928,6 +928,8 @@ class TreeSpecConfig:
     topk: int | None = None
     rejection_sampler: str = "greedy"
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # When true (or VLLM_ASCEND_TREE_SPEC_TIMER=1), print segment timings at exit.
+    enable_timer: bool = False
 
     @field_validator("params", mode="before")
     @classmethod

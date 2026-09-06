@@ -289,6 +289,27 @@ class PrefixTreeBuilder(TreeBuilder):
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        with tree_time("prefix_tree_builder"):
+            tokens, depths, parent_ids, num_nodes = self._build_impl(
+                draft_logits,
+                out,
+                root_token_ids=root_token_ids,
+                draft_hidden=draft_hidden,
+                proposal_logits=proposal_logits,
+            )
+        return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+
+    def _build_impl(
+        self,
+        draft_logits: torch.Tensor,
+        out: TreeLayout,
+        *,
+        root_token_ids: torch.Tensor | None = None,
+        draft_hidden: torch.Tensor | None = None,
+        proposal_logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         budget = self.budget
         topk = self.topk
         depth_bonus = self.depth_bonus
@@ -506,4 +527,4 @@ class PrefixTreeBuilder(TreeBuilder):
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, : num_nodes + 1] = prop_temp[:, : num_nodes + 1]
 
-        return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+        return tokens, depths, parent_ids, num_nodes

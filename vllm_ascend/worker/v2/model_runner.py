@@ -905,7 +905,10 @@ class NPUModelRunner(GPUModelRunner):
         sampler = getattr(self, "rejection_sampler", None)
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
         if path_node_ids is not None:
-            self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
+            from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+            with tree_time("kv_query_compact"):
+                self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
             sampler.path_node_ids = None
 
         super().postprocess_sampled(

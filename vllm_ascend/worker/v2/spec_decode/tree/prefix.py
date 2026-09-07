@@ -166,15 +166,144 @@ def _scatter_parent_proposal(
         )
 
 
+def expand_prefix_layer(
+    top_scores: torch.Tensor,
+    cand_ids: torch.Tensor,
+    path_scores: torch.Tensor,
+    frontier: torch.Tensor,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parents: torch.Tensor,
+    parent_pos: torch.Tensor,
+    *,
+    live: int,
+    num_nodes: int,
+    child_depth: int,
+) -> torch.Tensor:
+    """Select ``width`` children for one expand layer and write node slices.
+
+    ``live`` / ``num_nodes`` / ``child_depth`` are host ints (from depth).
+    ``parent_pos`` is a device ``[R, width]`` output (GRU gather index).
+    """
+    from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
+        use_tree_triton,
+    )
+
+    if use_tree_triton():
+        return _expand_prefix_layer_triton(
+            top_scores,
+            cand_ids,
+            path_scores,
+            frontier,
+            tokens,
+            depths,
+            parents,
+            parent_pos,
+            live=live,
+            num_nodes=num_nodes,
+            child_depth=child_depth,
+        )
+    return _expand_prefix_layer_torch(
+        top_scores,
+        cand_ids,
+        path_scores,
+        frontier,
+        tokens,
+        depths,
+        parents,
+        parent_pos,
+        live=live,
+        num_nodes=num_nodes,
+        child_depth=child_depth,
+    )
+
+
+def _expand_prefix_layer_triton(
+    top_scores: torch.Tensor,
+    cand_ids: torch.Tensor,
+    path_scores: torch.Tensor,
+    frontier: torch.Tensor,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parents: torch.Tensor,
+    parent_pos: torch.Tensor,
+    *,
+    live: int,
+    num_nodes: int,
+    child_depth: int,
+) -> torch.Tensor:
+    from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
+        expand_prefix_layer_triton,
+    )
+    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
+
+    with tree_time_accum("build_expand_select"):
+        expand_prefix_layer_triton(
+            top_scores,
+            cand_ids,
+            path_scores,
+            frontier,
+            tokens,
+            depths,
+            parents,
+            parent_pos,
+            live,
+            num_nodes,
+            child_depth,
+        )
+    return parent_pos
+
+
+def _expand_prefix_layer_torch(
+    top_scores: torch.Tensor,
+    cand_ids: torch.Tensor,
+    path_scores: torch.Tensor,
+    frontier: torch.Tensor,
+    tokens: torch.Tensor,
+    depths: torch.Tensor,
+    parents: torch.Tensor,
+    parent_pos: torch.Tensor,
+    *,
+    live: int,
+    num_nodes: int,
+    child_depth: int,
+) -> torch.Tensor:
+    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
+
+    with tree_time_accum("build_expand_select"):
+        num_reqs, width, _ = top_scores.shape
+        if live < width:
+            valid_parent = torch.arange(width, device=top_scores.device) < live
+            top_scores = torch.where(
+                valid_parent[None, :, None],
+                top_scores,
+                torch.full_like(top_scores, float("-inf")),
+            )
+        parent_scores = torch.gather(path_scores, 1, frontier)
+        cand_scores = parent_scores.unsqueeze(-1) + top_scores
+        flat = cand_scores.reshape(num_reqs, -1)
+        vals, sel = torch.topk(flat, k=width, dim=-1)
+        pos = sel // width
+        parent_pos.copy_(pos)
+        sel_tokens = torch.gather(cand_ids.reshape(num_reqs, -1), 1, sel)
+        sel_parents = torch.gather(frontier, 1, pos)
+        start = num_nodes + 1
+        tokens[:, num_nodes : num_nodes + width] = sel_tokens
+        depths[:, num_nodes : num_nodes + width] = child_depth
+        parents[:, start : start + width] = sel_parents
+        path_scores[:, start : start + width] = vals
+    return parent_pos
+
+
 class PrefixTreeBuilder(TreeBuilder):
     """DARTree-style uniform-width supertree + prefix-closed Top-B prune.
 
-    Expansion **k** and beam **width** both come from ``topk``
-    (``k = min(topk, vocab, budget)``). Domino shortlist **C** is
-    ``params["candidate_size"]`` (missing/None → ``C = k``; else clamp
-    ``C = max(k, min(int(C), vocab))``). If the expanded supertree
-    exceeds ``budget``, ``_select_topb_nodes`` prunes it (hard-coded
-    ``depth_bonus=-0.2``).
+    Beam **width** is ``min(topk, vocab, budget)``; each of ``spec_num``
+    layers expands exactly ``width`` nodes (rectangular supertree), then
+    ``_select_topb_nodes`` prunes to ``budget`` when needed (hard-coded
+    ``depth_bonus=-0.2``). Domino shortlist **C** is
+    ``params["candidate_size"]`` (missing/None → ``C = width``; else clamp
+    ``C = max(width, min(int(C), vocab))``).
     """
 
     required_backend = "dflash"
@@ -205,6 +334,7 @@ class PrefixTreeBuilder(TreeBuilder):
         self._parents_buf: torch.Tensor | None = None
         self._path_scores_buf: torch.Tensor | None = None
         self._frontier_buf: torch.Tensor | None = None
+        self._parent_pos_buf: torch.Tensor | None = None
         self._prop_temp_buf: torch.Tensor | None = None
         self._prop_layer_buf: torch.Tensor | None = None
         self._hidden_buf: torch.Tensor | None = None
@@ -213,7 +343,6 @@ class PrefixTreeBuilder(TreeBuilder):
         self._width_arange: torch.Tensor | None = None
         self._node_arange: torch.Tensor | None = None
         self._budget_ids: torch.Tensor | None = None
-        self._frontier_pad: torch.Tensor | None = None
 
     def _ensure_scratch(
         self,
@@ -226,10 +355,6 @@ class PrefixTreeBuilder(TreeBuilder):
         gru_hidden_dim: int = 0,
         dtype: torch.dtype = torch.float32,
     ) -> None:
-        k = min(self.topk, vocab, self.budget)
-        width = k
-        supertree_budget = width * spec_num
-        max_nodes = supertree_budget + 1
         grow = (
             self._tokens_buf is None
             or num_reqs > self._scratch_reqs
@@ -256,7 +381,7 @@ class PrefixTreeBuilder(TreeBuilder):
                 (r, mn), dtype=torch.float32, device=device
             )
             self._frontier_buf = torch.empty((r, w), dtype=torch.long, device=device)
-            self._frontier_pad = torch.zeros((r, w), dtype=torch.long, device=device)
+            self._parent_pos_buf = torch.empty((r, w), dtype=torch.long, device=device)
             self._old_to_new_buf = torch.empty((r, mn), dtype=torch.long, device=device)
             self._req_arange = torch.arange(r, device=device, dtype=torch.long)
             self._width_arange = torch.arange(w, device=device, dtype=torch.long)
@@ -276,19 +401,18 @@ class PrefixTreeBuilder(TreeBuilder):
                 self._hidden_buf = torch.empty(
                     (r, mn, self._scratch_gru), dtype=dtype, device=device
                 )
-        else:
-            if need_proposal and self._prop_temp_buf is None:
-                r = self._scratch_reqs
-                v = self._scratch_vocab
-                w = min(self.topk, v, self.budget)
-                sb = w * self._scratch_spec
-                mn = sb + 1
-                self._prop_temp_buf = torch.empty(
-                    (r, mn, v), dtype=torch.float32, device=device
-                )
-                self._prop_layer_buf = torch.empty(
-                    (r, w, v), dtype=torch.float32, device=device
-                )
+        elif need_proposal and self._prop_temp_buf is None:
+            r = self._scratch_reqs
+            v = self._scratch_vocab
+            w = min(self.topk, v, self.budget)
+            sb = w * self._scratch_spec
+            mn = sb + 1
+            self._prop_temp_buf = torch.empty(
+                (r, mn, v), dtype=torch.float32, device=device
+            )
+            self._prop_layer_buf = torch.empty(
+                (r, w, v), dtype=torch.float32, device=device
+            )
 
     def build(
         self,
@@ -358,7 +482,7 @@ class PrefixTreeBuilder(TreeBuilder):
             new_ids = self._budget_ids.unsqueeze(0)
             old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, budget))
             parent_ids = torch.gather(old_to_new, 1, old_parents)
-            if need_proposal and prop_temp is not None:
+            if need_proposal:
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, 0] = prop_temp[:, 0]
                 gathered = torch.gather(
@@ -372,7 +496,7 @@ class PrefixTreeBuilder(TreeBuilder):
             tokens = tokens[:, :num_nodes]
             depths = depths[:, :num_nodes]
             parent_ids = parents[:, 1 : num_nodes + 1]
-            if need_proposal and prop_temp is not None:
+            if need_proposal:
                 proposal_logits.fill_(float("-inf"))
                 proposal_logits[:, : num_nodes + 1] = prop_temp[:, : num_nodes + 1]
         return tokens, depths, parent_ids, num_nodes
@@ -398,8 +522,9 @@ class PrefixTreeBuilder(TreeBuilder):
         correction_scorer = self.correction_scorer
         num_reqs, spec_num, vocab = draft_logits.shape
         device = draft_logits.device
-        k = min(topk, vocab, budget)
-        width = k
+        # Uniform-width expand: each of ``spec_num`` layers adds exactly
+        # ``width`` nodes, filling ``width * spec_num`` then Top-B prune.
+        width = min(topk, vocab, budget)
         supertree_budget = width * spec_num
         need_proposal = proposal_logits is not None
 
@@ -422,9 +547,9 @@ class PrefixTreeBuilder(TreeBuilder):
             if with_correction:
                 raw_c = self.candidate_size
                 if raw_c is None:
-                    candidate_count = k
+                    candidate_count = width
                 else:
-                    candidate_count = max(k, min(int(raw_c), vocab))
+                    candidate_count = max(width, min(int(raw_c), vocab))
                 base_float = draft_logits.float()
                 candidate_vals, candidate_ids = torch.topk(
                     base_float, k=candidate_count, dim=-1
@@ -468,19 +593,17 @@ class PrefixTreeBuilder(TreeBuilder):
 
             frontier = self._frontier_buf[:num_reqs, :width]
             frontier.zero_()
-            frontier_len = 1
             num_nodes = 0
             width_arange = self._width_arange[:width]
             req_idx = self._req_arange[:num_reqs]
+            parent_pos = self._parent_pos_buf[:num_reqs, :width]
 
         for child_depth in range(1, spec_num + 1):
-            if num_nodes >= supertree_budget:
-                break
-            take = min(width, frontier_len * k, supertree_budget - num_nodes)
-            if take <= 0:
-                break
             depth_slot = child_depth - 1
-            valid_parent = width_arange[None, :] < frontier_len
+            # Layer 1: only the root slot is live; later layers use the full beam.
+            live = 1 if child_depth == 1 else width
+            valid_parent = width_arange[None, :] < live
+            start = num_nodes + 1
 
             with tree_time_accum("build_expand_score"):
                 if with_correction:
@@ -494,13 +617,13 @@ class PrefixTreeBuilder(TreeBuilder):
                             ),
                         )
                         logits = draft_logits[:, depth_slot].float()
-                        top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
+                        top_vals, top_ids = torch.topk(logits, k=width, dim=-1)
                         log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
                         top_scores = (top_vals - log_z).unsqueeze(1).expand(
                             -1, width, -1
                         )
                         cand_ids = top_ids.unsqueeze(1).expand(-1, width, -1)
-                        if prop_temp is not None:
+                        if need_proposal:
                             full = logits.unsqueeze(1).expand(-1, width, -1)
                             _scatter_parent_proposal(
                                 prop_temp,
@@ -529,10 +652,10 @@ class PrefixTreeBuilder(TreeBuilder):
                                 candidate_bias[:, depth_slot]
                                 if candidate_bias is not None
                                 else None,
-                                k,
+                                width,
                             )
                         )
-                        if prop_temp is not None:
+                        if need_proposal:
                             full = self._prop_layer_buf[:num_reqs, :width, :vocab]
                             full.fill_(float("-inf"))
                             ids = candidate_ids[:, depth_slot].unsqueeze(1).expand(
@@ -548,11 +671,11 @@ class PrefixTreeBuilder(TreeBuilder):
                             )
                 else:
                     top_vals, top_ids = torch.topk(
-                        log_probs[:, depth_slot, :], k=k, dim=-1
+                        log_probs[:, depth_slot, :], k=width, dim=-1
                     )
                     top_scores = top_vals.unsqueeze(1).expand(-1, width, -1)
                     cand_ids = top_ids.unsqueeze(1).expand(-1, width, -1)
-                    if prop_temp is not None:
+                    if need_proposal:
                         full = (
                             draft_logits[:, depth_slot]
                             .float()
@@ -567,37 +690,24 @@ class PrefixTreeBuilder(TreeBuilder):
                             req_idx=req_idx,
                         )
 
-                top_scores = torch.where(
-                    valid_parent[:, :, None],
-                    top_scores,
-                    torch.full_like(top_scores, float("-inf")),
-                )
-
-            with tree_time_accum("build_expand_select"):
-                parent_scores = torch.gather(path_scores, 1, frontier)
-                cand_scores = parent_scores.unsqueeze(-1) + top_scores
-                flat = cand_scores.reshape(num_reqs, -1)
-                vals, sel = torch.topk(flat, k=take, dim=-1)
-                parent_pos = sel // k
-                sel_tokens = torch.gather(cand_ids.reshape(num_reqs, -1), 1, sel)
-                sel_parents = torch.gather(frontier, 1, parent_pos)
-
-                start = num_nodes + 1
-                tokens[:, num_nodes : num_nodes + take] = sel_tokens
-                depths[:, num_nodes : num_nodes + take] = child_depth
-                parents[:, start : start + take] = sel_parents
-                path_scores[:, start : start + take] = vals
-
-                new_ids = (
-                    self._node_arange[start : start + take]
-                    .unsqueeze(0)
-                    .expand(num_reqs, -1)
-                )
-                if take < width:
-                    pad = self._frontier_pad[:num_reqs, : width - take]
-                    pad.zero_()
-                    new_ids = torch.cat([new_ids, pad], dim=-1)
-                frontier = new_ids
+            expand_prefix_layer(
+                top_scores,
+                cand_ids,
+                path_scores,
+                frontier,
+                tokens,
+                depths,
+                parents,
+                parent_pos,
+                live=live,
+                num_nodes=num_nodes,
+                child_depth=child_depth,
+            )
+            frontier = (
+                self._node_arange[start : start + width]
+                .unsqueeze(0)
+                .expand(num_reqs, -1)
+            )
 
             if with_correction:
                 with tree_time_accum("build_expand_gru"):
@@ -606,13 +716,12 @@ class PrefixTreeBuilder(TreeBuilder):
                         parent_pos.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
                     )
                     child_hidden = correction_scorer.update_hidden(
-                        sel_tokens.reshape(-1),
+                        tokens[:, num_nodes : num_nodes + width].reshape(-1),
                         parent_hidden_sel.reshape(-1, gru_hidden_dim),
-                    ).reshape(num_reqs, take, gru_hidden_dim)
-                    hidden_states[:, start : start + take] = child_hidden
+                    ).reshape(num_reqs, width, gru_hidden_dim)
+                    hidden_states[:, start : start + width] = child_hidden
 
-            frontier_len = take
-            num_nodes += take
+            num_nodes += width
 
         tree_time_accum_flush()
         with tree_time("build_prune"):

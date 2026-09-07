@@ -184,3 +184,92 @@ def prefix_expand_depth_triton(
         WIDTH=width,
         K=k,
     )
+
+
+def prefix_domino_score_torch(
+    s_proj,
+    z,
+    cand_vals,
+    cand_ids,
+    cand_w,
+    cand_bias,
+    valid_parent,
+    k: int,
+    use_silu: bool,
+):
+    """Cube Domino score after ``F.linear(w_s)`` (SiLU + einsum + topk/lse/mask).
+
+    Ascend Triton scalar rematerialization of mid·w_c is slower than Cube torch
+    at typical ``M=256,C=64``; keep this as the production path.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    mid_in = z.unsqueeze(1) + s_proj
+    mid = F.silu(mid_in) if use_silu else mid_in
+    bias = torch.einsum("rwm,rcm->rwc", mid, cand_w)
+    if cand_bias is not None:
+        bias = bias + cand_bias.unsqueeze(1)
+    logits = cand_vals.unsqueeze(1).to(bias.dtype) + bias
+    logits = logits.float()
+    top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
+    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+    top_scores = top_vals - log_z
+    width = s_proj.size(1)
+    expanded = cand_ids.unsqueeze(1).expand(-1, width, -1)
+    sel_ids = torch.gather(expanded, 2, top_ids)
+    top_scores = torch.where(
+        valid_parent[:, :, None],
+        top_scores,
+        torch.full_like(top_scores, float("-inf")),
+    )
+    return top_scores, sel_ids
+
+
+def prefix_domino_score_triton(
+    s_proj,
+    z,
+    cand_vals,
+    cand_ids,
+    cand_w,
+    cand_bias,
+    valid_parent,
+    top_scores_out,
+    cand_ids_out,
+    k: int,
+    use_silu: bool,
+) -> None:
+    """Dispatch to Cube torch (see ``prefix_domino_score_torch``)."""
+    top_scores, sel_ids = prefix_domino_score_torch(
+        s_proj,
+        z,
+        cand_vals,
+        cand_ids,
+        cand_w,
+        cand_bias,
+        valid_parent,
+        k,
+        use_silu,
+    )
+    top_scores_out.copy_(top_scores)
+    cand_ids_out.copy_(sel_ids)
+
+
+def prefix_gru_mix_torch(tokens, parent_h, gh, gru_table, out_h) -> None:
+    """Torch GRU gate mix after Cube ``F.linear(W_hh)`` (same as update_hidden)."""
+    import torch
+
+    num_reqs, take, gru_h = parent_h.shape
+    flat_tok = tokens.reshape(-1)
+    gi = gru_table.index_select(0, flat_tok).view(num_reqs, take, 3 * gru_h)
+    i_r, i_z, i_n = gi.split(gru_h, dim=-1)
+    h_r, h_z, h_n = gh.split(gru_h, dim=-1)
+    r = torch.sigmoid(i_r + h_r)
+    z = torch.sigmoid(i_z + h_z)
+    n = torch.tanh(i_n + r * h_n)
+    out_h.copy_((1.0 - z) * n + z * parent_h)
+
+
+def prefix_gru_mix_triton(tokens, parent_h, gh, gru_table, out_h) -> None:
+    """Dispatch to torch; Ascend scalar Triton over H≈1024 is slower than Cube."""
+    prefix_gru_mix_torch(tokens, parent_h, gh, gru_table, out_h)

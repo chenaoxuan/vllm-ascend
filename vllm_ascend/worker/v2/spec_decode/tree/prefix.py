@@ -353,7 +353,7 @@ class PrefixTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor,
         draft_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Greedy Domino expand: Cube scoring via torch, select/write via Triton."""
+        """Greedy Domino expand: Cube score/GRU via torch, select/write via Triton."""
         from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
             prefix_expand_depth_triton,
         )
@@ -441,6 +441,7 @@ class PrefixTreeBuilder(TreeBuilder):
                     1,
                     frontier.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
                 )
+                valid_parent = width_arange[None, :] < frontier_len
                 if depth_slot < prefix_len:
                     logits = draft_logits[:, depth_slot].float()
                     top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
@@ -462,7 +463,6 @@ class PrefixTreeBuilder(TreeBuilder):
                         else None,
                         k,
                     )
-                valid_parent = width_arange[None, :] < frontier_len
                 top_scores = torch.where(
                     valid_parent[:, :, None],
                     top_scores,
@@ -494,11 +494,12 @@ class PrefixTreeBuilder(TreeBuilder):
                     1,
                     sel_parents.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
                 )
-                child_hidden = correction_scorer.update_hidden(
-                    sel_tokens.reshape(-1),
-                    parent_hidden_sel.reshape(-1, gru_hidden_dim),
-                ).reshape(num_reqs, take, gru_hidden_dim)
-                hidden_states[:, start : start + take] = child_hidden
+                hidden_states[:, start : start + take] = (
+                    correction_scorer.update_hidden(
+                        sel_tokens.reshape(-1),
+                        parent_hidden_sel.reshape(-1, gru_hidden_dim),
+                    ).view(num_reqs, take, gru_hidden_dim)
+                )
             frontier_len = take
             num_nodes += take
 

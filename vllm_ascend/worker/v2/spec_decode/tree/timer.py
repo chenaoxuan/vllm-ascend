@@ -7,7 +7,13 @@ from typing import Iterator
 import torch
 
 TREE_TIMER_SEGMENTS: tuple[str, ...] = (
-    "build_draft_tree",
+    "build_precompute",
+    "build_expand_score",
+    "build_expand_select",
+    "build_expand_gru",
+    "build_prune",
+    "build_finalize_layout",
+    "build_draft_tree",  # non-prefix builders (beam / priority)
     "build_attn_mask",
     "target_fia_forward",
     "rejection_sample",
@@ -22,6 +28,7 @@ _WARMUP_STEPS = 2
 _STEP = 0
 _RECORDING = False
 _SAMPLES: dict[str, list[float]] = defaultdict(list)
+_ACCUM: dict[str, float] = defaultdict(float)
 _META: dict[str, object] = {}
 _REGISTERED = False
 
@@ -61,6 +68,7 @@ def tree_timer_begin_step() -> None:
         return
     _STEP += 1
     _RECORDING = _STEP > _WARMUP_STEPS
+    _ACCUM.clear()
 
 
 def _sync() -> None:
@@ -88,6 +96,32 @@ def tree_time(segment: str) -> Iterator[None]:
         _sync()
         if _RECORDING:
             _SAMPLES[segment].append((time.perf_counter() - t0) * 1000.0)
+
+
+@contextmanager
+def tree_time_accum(segment: str) -> Iterator[None]:
+    """Accumulate timed spans into one per-step sample (for expand depth loops)."""
+    if not tree_timer_enabled():
+        yield
+        return
+    _sync()
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        _sync()
+        if _RECORDING:
+            _ACCUM[segment] += (time.perf_counter() - t0) * 1000.0
+
+
+def tree_time_accum_flush() -> None:
+    """Flush accumulated expand sub-segments as one sample each."""
+    if not tree_timer_enabled() or not _RECORDING:
+        _ACCUM.clear()
+        return
+    for name, ms in _ACCUM.items():
+        _SAMPLES[name].append(ms)
+    _ACCUM.clear()
 
 
 def print_tree_timer_report() -> None:

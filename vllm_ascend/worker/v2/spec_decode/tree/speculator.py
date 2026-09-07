@@ -336,16 +336,19 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
-        with tree_time("build_draft_tree"):
-            self.tree = self.tree_builder.build(
-                logits,
-                layout,
-                root_token_ids=root_token_ids,
-                draft_hidden=sample_hidden_states.view(
-                    num_reqs, self.num_speculative_steps, -1
-                ),
-                proposal_logits=proposal,
-            )
+        build_kwargs = dict(
+            root_token_ids=root_token_ids,
+            draft_hidden=sample_hidden_states.view(
+                num_reqs, self.num_speculative_steps, -1
+            ),
+            proposal_logits=proposal,
+        )
+        if self.method == "prefix":
+            # Fine-grained timers live inside PrefixTreeBuilder.build.
+            self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
+        else:
+            with tree_time("build_draft_tree"):
+                self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

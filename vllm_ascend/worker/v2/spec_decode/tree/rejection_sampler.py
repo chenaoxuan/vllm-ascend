@@ -155,10 +155,16 @@ class TreeRejectionSampler(RejectionSampler):
         )
         method = get_ascend_config().tree_spec_config.rejection_sampler
         if method == "magicmtp":
+            # Prefer node-indexed proposal logits from the tree builder
+            # (Domino / Markov corrected). Fall back to the caller's tensor
+            # (depth-indexed or already node-indexed).
+            proposal = getattr(input_batch, "tree_proposal_logits", None)
+            if proposal is None:
+                proposal = draft_logits
             sampled = block_tree_reject(
                 tree,
                 target_logits,
-                draft_logits,
+                proposal,
                 self.num_speculative_steps,
                 path_node_ids=path_node_ids,
             )
@@ -358,8 +364,15 @@ def block_tree_reject(
     这是 MagicMTP 在树上的扩展。
 
     ``target_logits`` is ``[num_reqs, budget + 1, vocab]``, node 0 = root.
-    ``draft_logits`` is ``[num_reqs, spec_num, vocab]`` (DFlash depth rows) or
-    ``None`` (q=1, one-hot residual). No temperature / top-k / top-p.
+    ``draft_logits`` is the draft proposal used as ``M_s``:
+
+    - ``[num_reqs, budget + 1, vocab]``: **node-indexed** (preferred). Column
+      ``j`` is the (possibly Domino / Markov corrected) logits at tree node
+      ``j``. Built by the tree builders to match the expansion distribution.
+    - ``[num_reqs, spec_num, vocab]``: depth-indexed DFlash rows (legacy).
+    - ``None``: q=1 one-hot residual.
+
+    No temperature / top-k / top-p.
 
     Accepts the whole root→leaf block, or rejects the leaf and updates residual
     ``M_b`` / ``M_s`` / ``p`` at the parent. Recovers a single token ``Y`` from
@@ -378,8 +391,22 @@ def block_tree_reject(
     vocab = target_logits.shape[-1]
     target_probs = torch.softmax(target_logits.float(), dim=-1)
     has_draft = draft_logits is not None
-    draft_probs = torch.softmax(draft_logits.float(), dim=-1) if has_draft else None
-    spec_num = draft_probs.shape[1] if draft_probs is not None else 0
+    node_indexed = (
+        has_draft and draft_logits is not None and draft_logits.shape[1] == budget + 1
+    )
+    if has_draft and draft_logits is not None:
+        logits_f = draft_logits.float()
+        if node_indexed:
+            # Unused node rows stay -inf from builders; avoid NaN softmax.
+            row_ok = torch.isfinite(logits_f).any(dim=-1, keepdim=True)
+            safe = torch.where(row_ok, logits_f, torch.zeros_like(logits_f))
+            draft_probs = torch.softmax(safe, dim=-1)
+            draft_probs = torch.where(row_ok, draft_probs, torch.zeros_like(draft_probs))
+        else:
+            draft_probs = torch.softmax(logits_f, dim=-1)
+    else:
+        draft_probs = None
+    spec_num = 0 if node_indexed or draft_probs is None else draft_probs.shape[1]
     if etas is None:
         etas = torch.rand(num_reqs, budget, device=device)
     if recover_u is None:
@@ -405,14 +432,17 @@ def block_tree_reject(
         ns = tree.next_sibling[req_idx].clone().to(torch.long)
         mb = target_probs[req_idx].clone()
         ms = target_probs.new_zeros(budget + 1, vocab)
-        if has_draft:
-            ms[0] = draft_probs[req_idx, 0]
-            if spec_num > 0:
-                depth = tree.depths[req_idx].to(torch.long)
-                step = depth.clamp(min=0, max=spec_num - 1)
-                gathered = draft_probs[req_idx].index_select(0, step)
-                valid_ms = (depth > 0) & (depth < spec_num) & (tok >= 0)
-                ms[1:] = torch.where(valid_ms.unsqueeze(-1), gathered, ms[1:])
+        if has_draft and draft_probs is not None:
+            if node_indexed:
+                ms = draft_probs[req_idx].clone()
+            else:
+                ms[0] = draft_probs[req_idx, 0]
+                if spec_num > 0:
+                    depth = tree.depths[req_idx].to(torch.long)
+                    step = depth.clamp(min=0, max=spec_num - 1)
+                    gathered = draft_probs[req_idx].index_select(0, step)
+                    valid_ms = (depth > 0) & (depth < spec_num) & (tok >= 0)
+                    ms[1:] = torch.where(valid_ms.unsqueeze(-1), gathered, ms[1:])
         p = target_probs.new_zeros(budget + 1)
         p[0] = 1
         true = torch.ones((), dtype=torch.bool, device=device)

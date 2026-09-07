@@ -140,10 +140,24 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             device=device,
         )
         self.tree = self._load_layout_from_buffers(self.max_num_reqs)
+        self.tree_proposal_logits: torch.Tensor | None = None
+        if tree_cfg.rejection_sampler == "magicmtp":
+            # Node-indexed proposal for MagicMTP: column j = M_s at node j.
+            # Must carry Domino / Markov corrections from the builders.
+            self.tree_proposal_logits = torch.full(
+                (
+                    self.max_num_reqs,
+                    self.budget + 1,
+                    self.vocab_size,
+                ),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
         logger.info(
             "Tree speculator enabled: method=%s budget=%s topk=%s "
             "depth=%s sample_from_anchor=%s num_query_per_req=%s "
-            "draft_backend=%s domino_shift_label=%s",
+            "draft_backend=%s domino_shift_label=%s magicmtp=%s",
             self.method,
             self.budget,
             self.topk,
@@ -152,6 +166,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self.num_query_per_req,
             self.draft_backend,
             self._domino_shift_label,
+            self.tree_proposal_logits is not None,
         )
 
     def load_draft_model(
@@ -294,6 +309,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
             num_reqs, nqp
         )[:, 0]
+        proposal = None
+        if self.tree_proposal_logits is not None:
+            proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
         self.tree = self.tree_builder.build(
             logits,
             layout,
@@ -301,6 +319,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             draft_hidden=sample_hidden_states.view(
                 num_reqs, self.num_speculative_steps, -1
             ),
+            proposal_logits=proposal,
         )
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:

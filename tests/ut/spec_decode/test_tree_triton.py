@@ -1,5 +1,7 @@
 """CPU UT: tree Triton wrappers fall back to Torch golden and stay consistent."""
 
+from unittest.mock import patch
+
 import torch
 
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder, align_up
@@ -11,6 +13,7 @@ from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
     greedy_tree_reject,
     greedy_tree_reject_torch,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
 
 def _chain_tree(num_reqs: int, budget: int, depth: int, device="cpu"):
@@ -79,3 +82,54 @@ def test_tree_attention_mask_torch_builder():
     assert mask.shape == (1, 1, 3, align_up(10))
     prev = 10 - 3
     assert not bool(mask[0, 0, 1, prev + 1])
+
+
+def test_use_tree_triton_whitelist():
+    npu = torch.device("npu:0")
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch.HAS_TRITON",
+            True,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._env_triton_disabled",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._configured_triton_ops",
+            return_value=None,
+        ),
+    ):
+        assert use_tree_triton("attention_mask", npu)
+        assert use_tree_triton("greedy_reject", npu)
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch.HAS_TRITON",
+            True,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._env_triton_disabled",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._configured_triton_ops",
+            return_value=[],
+        ),
+    ):
+        assert not use_tree_triton("attention_mask", npu)
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch.HAS_TRITON",
+            True,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._env_triton_disabled",
+            return_value=False,
+        ),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch._configured_triton_ops",
+            return_value=["greedy_reject"],
+        ),
+    ):
+        assert use_tree_triton("greedy_reject", npu)
+        assert not use_tree_triton("attention_mask", npu)

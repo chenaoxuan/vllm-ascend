@@ -85,7 +85,7 @@ def finalize_tree_layout(
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
     with tree_time("finalize"):
-        if use_tree_triton(tokens.device):
+        if use_tree_triton("finalize_layout", tokens.device):
             return _finalize_tree_layout_triton(
                 out, tokens, depths, parent_ids, num_nodes
             )

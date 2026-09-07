@@ -195,6 +195,7 @@ class TestAscendConfig(TestBase):
         self.assertIsNone(ascend_config.tree_spec_config.topk)
         self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
         self.assertEqual(ascend_config.tree_spec_config.params, {})
+        self.assertIsNone(ascend_config.tree_spec_config.triton_ops)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -292,6 +293,26 @@ class TestAscendConfig(TestBase):
     def test_tree_spec_config_rejects_unknown_rejection_sampler(self):
         with self.assertRaisesRegex(ValueError, "tree_spec_config.rejection_sampler must be one of"):
             TreeSpecConfig(enabled=True, method="priority", budget=8, topk=4, rejection_sampler="block")
+
+    def test_tree_spec_config_triton_ops_whitelist(self):
+        cfg = TreeSpecConfig(
+            enabled=True,
+            method="priority",
+            budget=8,
+            topk=4,
+            triton_ops=["greedy_reject", "kv_compact"],
+        )
+        self.assertEqual(cfg.triton_ops, ["greedy_reject", "kv_compact"])
+        empty = TreeSpecConfig(enabled=True, method="priority", budget=8, topk=4, triton_ops=[])
+        self.assertEqual(empty.triton_ops, [])
+        with self.assertRaisesRegex(ValueError, "tree_spec_config.triton_ops has unknown names"):
+            TreeSpecConfig(
+                enabled=True,
+                method="priority",
+                budget=8,
+                topk=4,
+                triton_ops=["not_a_real_op"],
+            )
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

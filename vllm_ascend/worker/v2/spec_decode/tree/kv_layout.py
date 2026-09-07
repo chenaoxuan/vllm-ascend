@@ -53,7 +53,7 @@ def compact_tree_kv_along_path(
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
-    if use_tree_triton(path_node_ids.device):
+    if use_tree_triton("kv_compact", path_node_ids.device):
         _compact_tree_kv_along_path_triton(
             caches, block_table, block_size, idx_mapping, num_computed, path_node_ids
         )

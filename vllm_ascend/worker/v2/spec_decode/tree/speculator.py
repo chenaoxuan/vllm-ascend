@@ -171,18 +171,29 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
-            use_tree_triton,
+            tree_triton_base_enabled,
         )
 
+        ops = tree_cfg.triton_ops
+        if ops is None:
+            timer_backend = "triton" if tree_triton_base_enabled(device) else "torch"
+            ops_meta = "all"
+        elif ops:
+            timer_backend = "triton" if tree_triton_base_enabled(device) else "torch"
+            ops_meta = ",".join(ops)
+        else:
+            timer_backend = "torch"
+            ops_meta = "none"
         configure_tree_timer(
             enabled=bool(tree_cfg.enable_timer),
-            backend="triton" if use_tree_triton(device) else "torch",
+            backend=timer_backend,
             meta={
                 "method": self.method,
                 "budget": self.budget,
                 "topk": self.topk,
                 "depth": self.num_speculative_steps,
                 "rejection_sampler": tree_cfg.rejection_sampler,
+                "triton_ops": ops_meta,
             },
         )
 

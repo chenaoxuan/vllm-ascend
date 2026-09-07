@@ -59,7 +59,7 @@ def greedy_tree_reject(
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
     with tree_time("greedy_tree_reject"):
-        if use_tree_triton(target_logits.device):
+        if use_tree_triton("greedy_reject", target_logits.device):
             return _greedy_tree_reject_triton(
                 tree,
                 target_logits,

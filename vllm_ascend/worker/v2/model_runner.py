@@ -907,7 +907,7 @@ class NPUModelRunner(GPUModelRunner):
         if path_node_ids is not None:
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-            with tree_time("kv_query_compact"):
+            with tree_time("compact_kv_path"):
                 self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
             sampler.path_node_ids = None
 

@@ -1,5 +1,4 @@
 import atexit
-import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -8,13 +7,13 @@ from typing import Iterator
 import torch
 
 TREE_TIMER_SEGMENTS: tuple[str, ...] = (
-    "mask",
-    "target_fia",
-    "greedy_tree_reject",
-    "kv_query_compact",
-    "draft_forward",
-    "prefix_tree_builder",
-    "finalize",
+    "build_draft_tree",
+    "build_attn_mask",
+    "target_fia_forward",
+    "rejection_sample",
+    "compact_kv_path",
+    "compact_query_path",
+    "draft_model_forward",
 )
 
 _ENABLED = False
@@ -27,32 +26,19 @@ _META: dict[str, object] = {}
 _REGISTERED = False
 
 
-def _env_enabled() -> bool:
-    return os.getenv("VLLM_ASCEND_TREE_SPEC_TIMER", "0").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def configure_tree_timer(
     *,
-    enabled: bool | None = None,
+    enabled: bool = False,
     backend: str = "torch",
     warmup_steps: int = 2,
     meta: dict[str, object] | None = None,
 ) -> None:
     """Enable/disable the tree-spec segment timer.
 
-    ``enabled=None`` keeps current state or turns on via
-    ``VLLM_ASCEND_TREE_SPEC_TIMER``. ``backend`` is printed as ``torch`` or
-    ``triton``; triton skips ``torch.npu.synchronize`` (Ascend segfault).
+    ``backend`` is printed as ``torch`` or ``triton``; triton skips
+    ``torch.npu.synchronize`` (Ascend segfault).
     """
     global _ENABLED, _BACKEND, _WARMUP_STEPS, _REGISTERED
-    if enabled is None:
-        enabled = _ENABLED or _env_enabled()
-    else:
-        enabled = bool(enabled) or _env_enabled()
     _ENABLED = bool(enabled)
     _BACKEND = backend
     _WARMUP_STEPS = max(0, int(warmup_steps))
@@ -63,14 +49,8 @@ def configure_tree_timer(
         _REGISTERED = True
 
 
-def set_tree_timer_backend(backend: str) -> None:
-    """Update printed backend label (``torch`` / ``triton``)."""
-    global _BACKEND
-    _BACKEND = backend
-
-
 def tree_timer_enabled() -> bool:
-    return _ENABLED or _env_enabled()
+    return _ENABLED
 
 
 def tree_timer_begin_step() -> None:
@@ -121,7 +101,7 @@ def tree_time(segment: str) -> Iterator[None]:
 
 def print_tree_timer_report() -> None:
     """Print aggregated segment timings to stdout (no file)."""
-    if not (_ENABLED or _env_enabled()):
+    if not _ENABLED:
         return
     sync_mode = "device" if _device_sync_safe() else "host_only"
     lines = [

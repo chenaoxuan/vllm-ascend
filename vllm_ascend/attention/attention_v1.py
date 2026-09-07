@@ -1544,7 +1544,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-        with tree_time("target_fia"):
+        with tree_time("target_fia_forward"):
             return self._forward_tree_decode_fia_impl(
                 query,
                 key,

@@ -13,7 +13,6 @@ from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.builder import (
     create_tree_builder,
-    validate_tree_method_backend,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
@@ -79,7 +78,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
         )
-        validate_tree_method_backend(self.method, self.draft_backend)
 
         self.tree_builder = None
         self._domino_scorer = None
@@ -171,19 +169,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
         from vllm_ascend.worker.v2.spec_decode.tree.timer import configure_tree_timer
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
-            tree_triton_base_enabled,
+            use_tree_triton,
         )
 
-        ops = tree_cfg.triton_ops
-        if ops is None:
-            timer_backend = "triton" if tree_triton_base_enabled(device) else "torch"
-            ops_meta = "all"
-        elif ops:
-            timer_backend = "triton" if tree_triton_base_enabled(device) else "torch"
-            ops_meta = ",".join(ops)
-        else:
-            timer_backend = "torch"
-            ops_meta = "none"
+        timer_backend = "triton" if use_tree_triton() else "torch"
         configure_tree_timer(
             enabled=bool(tree_cfg.enable_timer),
             backend=timer_backend,
@@ -193,7 +182,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 "topk": self.topk,
                 "depth": self.num_speculative_steps,
                 "rejection_sampler": tree_cfg.rejection_sampler,
-                "triton_ops": ops_meta,
+                "enable_triton": bool(tree_cfg.enable_triton),
             },
         )
 
@@ -287,7 +276,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             tensors = [last_hidden_states]
             if aux_hidden_states:
                 tensors.extend(aux_hidden_states)
-            with tree_time("kv_query_compact"):
+            with tree_time("compact_query_path"):
                 compact_tree_query_along_path(
                     tensors,
                     input_batch.query_start_loc,
@@ -324,7 +313,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     ) -> None:
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-        with tree_time("draft_forward"):
+        with tree_time("draft_model_forward"):
             last_hidden_states = self._run_model(
                 num_tokens_padded,
                 attn_metadata,
@@ -347,15 +336,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
-        self.tree = self.tree_builder.build(
-            logits,
-            layout,
-            root_token_ids=root_token_ids,
-            draft_hidden=sample_hidden_states.view(
-                num_reqs, self.num_speculative_steps, -1
-            ),
-            proposal_logits=proposal,
-        )
+        with tree_time("build_draft_tree"):
+            self.tree = self.tree_builder.build(
+                logits,
+                layout,
+                root_token_ids=root_token_ids,
+                draft_hidden=sample_hidden_states.view(
+                    num_reqs, self.num_speculative_steps, -1
+                ),
+                proposal_logits=proposal,
+            )
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

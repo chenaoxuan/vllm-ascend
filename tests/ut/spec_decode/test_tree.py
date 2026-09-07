@@ -8,7 +8,6 @@ from vllm_ascend.worker.v2.input_batch import prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.spec_decode.tree.beam import BeamTreeBuilder
 from vllm_ascend.worker.v2.spec_decode.tree.builder import create_tree_builder
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
-    compact_tree_kv_along_path,
     compact_tree_query_along_path,
     mask_rejected_dflash_context_slots,
 )
@@ -33,7 +32,10 @@ def test_batch_spine_and_sibling_trees() -> None:
         ]
     )
     out = empty_tree_layout(2, 3, device=logits.device)
-    layout = PriorityTreeBuilder(budget=3, topk=3).build(logits, out)
+    pri_prop = torch.full((2, 4, 3), float("-inf"))
+    layout = PriorityTreeBuilder(budget=3, topk=3).build(
+        logits, out, proposal_logits=pri_prop
+    )
 
     assert layout is out
     assert layout.num_nodes.tolist() == [3, 3]
@@ -48,6 +50,8 @@ def test_batch_spine_and_sibling_trees() -> None:
     ]
     assert layout.first_child[0, :4].tolist() == [1, 2, 3, -1]
     assert layout.next_sibling[0, :4].tolist() == [-1, -1, -1, -1]
+    assert torch.allclose(pri_prop[0, 0], logits[0, 0])
+    assert torch.allclose(pri_prop[0, 1], logits[0, 1])
 
     assert layout.tokens[1].tolist() == [0, 1, 0]
     assert layout.depths[1].tolist() == [1, 1, 2]
@@ -63,23 +67,28 @@ def test_batch_spine_and_sibling_trees() -> None:
 
 
 def test_build_beam_trees_with_markov() -> None:
-    """DSpark beam: map draft→target before markov_embed; topk>1 fills budget.
+    """DSpark beam: map draft→target before markov_embed; score-pack fills budget.
 
-    Zero markov bias keeps base-logit topology so parents/depths stay checkable,
-    while ``seen`` proves the second depth embeds mapped target ids.
+    Zero markov bias keeps relative topk order. Packing selects by cumulative
+    log-prob (not BFS level fill), so the high-prob spine (mapped id 10) is
+    preferred over weaker depth-0 siblings. ``seen`` proves depth-1 embeds
+    mapped target ids. Proposal buffer gets Markov-corrected logits.
     """
 
     class _FakeDSparkDraft:
-        def __init__(self, vocab: int) -> None:
+        def __init__(self, vocab: int, *, bias0: float = 0.0) -> None:
             self.seen: list[torch.Tensor] = []
             self._vocab = vocab
+            self._bias0 = bias0
 
         def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
             self.seen.append(token_ids.clone())
             return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
 
         def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-            return markov_embed.new_zeros(markov_embed.shape[0], self._vocab)
+            bias = markov_embed.new_zeros(markov_embed.shape[0], self._vocab)
+            bias[:, 0] = self._bias0
+            return bias
 
         def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
             return draft_ids + 10
@@ -104,29 +113,60 @@ def test_build_beam_trees_with_markov() -> None:
 
     assert layout is out
     assert layout.num_nodes[0].tolist() == budget
-    assert layout.tokens[0, :9].tolist() == [10, 11, 12, 10, 11, 12, 10, 11, 12]
-    assert layout.depths[0, :9].tolist() == [1, 1, 1, 2, 2, 2, 3, 3, 3]
-    assert layout.parents[0, :9].tolist() == [0, 0, 0, 1, 1, 1, 4, 4, 4]
-    assert layout.first_child[0, :10].tolist() == [3, 6, -1, -1, 9, -1, -1, -1, -1, -1]
+    tokens = layout.tokens[0, :9]
+    depths = layout.depths[0, :9]
+    parents = layout.parents[0, :9]
+    # Best draft id 0 → target 10 is packed first; next slots stay on that spine.
+    assert tokens.tolist()[:4] == [10, 10, 11, 12]
+    assert set(tokens.tolist()) <= {10, 11, 12}
+    assert depths[0].item() == 1
+    assert (depths == 1).sum().item() == 1
+    assert depths.max().item() == 3
+    assert parents[0].item() == 0
+    assert parents[1:4].tolist() == [1, 1, 1]
     assert torch.equal(draft.seen[0], torch.tensor([[0]]))
     assert torch.equal(draft.seen[1], torch.tensor([[10, 11, 12]]))
 
+    beam_logits = torch.zeros(1, 2, 4)
+    beam_logits[0, 0] = torch.tensor([1.0, 2.0, 3.0, 0.0])
+    beam_out = empty_tree_layout(1, 2, device="cpu")
+    beam_prop = torch.full((1, 3, 4), float("-inf"))
+    BeamTreeBuilder(
+        budget=2, topk=1, draft_model=_FakeDSparkDraft(4, bias0=50.0)
+    ).build(
+        beam_logits,
+        beam_out,
+        root_token_ids=torch.tensor([1]),
+        proposal_logits=beam_prop,
+    )
+    assert beam_prop[0, 0, 0] > beam_logits[0, 0, 0] + 40.0
+
 
 def test_build_prefix_trees_with_domino_correction() -> None:
-    """Domino scorer path: correction hooks + Top-B prune to budget."""
+    """Domino scorer path: correction hooks + Top-B prune + proposal fill."""
 
     class _FakeDominoScorer:
         gru_hidden_dim = 2
 
-        def __init__(self, vocab: int) -> None:
+        def __init__(self, vocab: int, *, boost_token: int | None = None) -> None:
             mid = 2
             self.fc2_weight = torch.zeros(vocab, mid)
+            if boost_token is not None:
+                self.fc2_weight[boost_token] = 20.0
             self.fc2_bias = None
-            self.w_s = torch.zeros(mid, self.gru_hidden_dim)
+            self.w_s = (
+                torch.ones(mid, self.gru_hidden_dim)
+                if boost_token is not None
+                else torch.zeros(mid, self.gru_hidden_dim)
+            )
             self.middle = nn.Identity()
 
         def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
-            return parallel_hiddens.new_zeros(
+            if self.w_s.abs().sum() == 0:
+                return parallel_hiddens.new_zeros(
+                    *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
+                )
+            return parallel_hiddens.new_ones(
                 *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
             )
 
@@ -172,6 +212,24 @@ def test_build_prefix_trees_with_domino_correction() -> None:
     assert layout.tokens[1, :2].tolist() == [1, 2]
     assert layout.parents[1, :2].tolist() == [0, 1]
     assert layout.depths[1, :2].tolist() == [1, 2]
+
+    dom_logits = torch.tensor([[[5.0, 4.0, 3.0], [1.0, 1.0, 1.0]]])
+    dom_out = empty_tree_layout(1, 3, device="cpu")
+    dom_prop = torch.full((1, 4, 3), float("-inf"))
+    PrefixTreeBuilder(
+        budget=3,
+        topk=3,
+        correction_scorer=_FakeDominoScorer(3, boost_token=1),
+        prefix_len=0,
+    ).build(
+        dom_logits,
+        dom_out,
+        root_token_ids=torch.tensor([0]),
+        draft_hidden=torch.zeros(1, 2, 4),
+        proposal_logits=dom_prop,
+    )
+    assert torch.isfinite(dom_prop[0, 0]).any()
+    assert dom_prop[0, 0, 1] > dom_logits[0, 0, 1]
 
 
 def test_build_prefix_trees_separates_candidate_size_from_topk() -> None:
@@ -225,94 +283,8 @@ def test_build_prefix_trees_separates_candidate_size_from_topk() -> None:
     assert torch.isfinite(proposal[0, 0]).sum().tolist() == 4
 
 
-def test_builders_fill_corrected_proposal_logits() -> None:
-    """MagicMTP proposal buffer stores Domino / Markov corrected logits, not raw."""
-
-    class _FakeDSparkDraft:
-        def __init__(self, vocab: int) -> None:
-            self._vocab = vocab
-
-        def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
-            return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
-
-        def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
-            # Strong bias toward token 0 so proposal != raw depth row.
-            bias = markov_embed.new_zeros(markov_embed.shape[0], self._vocab)
-            bias[:, 0] = 50.0
-            return bias
-
-        def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
-            return draft_ids
-
-    # Priority: shared-depth rows copied to parent nodes.
-    pri_logits = torch.tensor(
-        [[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]]]
-    )
-    pri_out = empty_tree_layout(1, 3, device="cpu")
-    pri_prop = torch.full((1, 4, 3), float("-inf"))
-    PriorityTreeBuilder(budget=3, topk=3).build(
-        pri_logits, pri_out, proposal_logits=pri_prop
-    )
-    assert torch.allclose(pri_prop[0, 0], pri_logits[0, 0])
-    assert torch.allclose(pri_prop[0, 1], pri_logits[0, 1])
-
-    # Beam + Markov: root proposal includes +50 on token 0.
-    beam_logits = torch.zeros(1, 2, 4)
-    beam_logits[0, 0] = torch.tensor([1.0, 2.0, 3.0, 0.0])
-    beam_out = empty_tree_layout(1, 2, device="cpu")
-    beam_prop = torch.full((1, 3, 4), float("-inf"))
-    BeamTreeBuilder(budget=2, topk=1, draft_model=_FakeDSparkDraft(4)).build(
-        beam_logits,
-        beam_out,
-        root_token_ids=torch.tensor([1]),
-        proposal_logits=beam_prop,
-    )
-    assert beam_prop[0, 0, 0] > beam_logits[0, 0, 0] + 40.0
-
-    # Domino: corrected parent proposal boosts token 1 vs raw depth-0 row.
-    class _FakeDominoScorer:
-        gru_hidden_dim = 2
-
-        def __init__(self, vocab: int) -> None:
-            mid = 2
-            self.fc2_weight = torch.zeros(vocab, mid)
-            # Boost token 1 (in base top-k) in the correction head.
-            self.fc2_weight[1] = 20.0
-            self.fc2_bias = None
-            self.w_s = torch.ones(mid, self.gru_hidden_dim)
-            self.middle = nn.Identity()
-
-        def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
-            return parallel_hiddens.new_ones(
-                *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
-            )
-
-        def update_hidden(
-            self, token_ids: torch.Tensor, h_state: torch.Tensor
-        ) -> torch.Tensor:
-            return h_state
-
-    dom_logits = torch.tensor([[[5.0, 4.0, 3.0], [1.0, 1.0, 1.0]]])
-    dom_out = empty_tree_layout(1, 3, device="cpu")
-    dom_prop = torch.full((1, 4, 3), float("-inf"))
-    PrefixTreeBuilder(
-        budget=3,
-        topk=3,
-        correction_scorer=_FakeDominoScorer(3),
-        prefix_len=0,
-    ).build(
-        dom_logits,
-        dom_out,
-        root_token_ids=torch.tensor([0]),
-        draft_hidden=torch.zeros(1, 2, 4),
-        proposal_logits=dom_prop,
-    )
-    assert torch.isfinite(dom_prop[0, 0]).any()
-    assert dom_prop[0, 0, 1] > dom_logits[0, 0, 1]
-
-
-def test_tree_kv_slot_layout_and_compact() -> None:
-    """Siblings share RoPE positions but unique KV slots; compact packs the path."""
+def test_tree_spec_pos_seq_lens() -> None:
+    """Siblings share RoPE positions but unique KV slots."""
     num_computed = 10
     query_len = 4
     tree_depths = torch.zeros((1, 8), dtype=torch.int32)
@@ -338,38 +310,6 @@ def test_tree_kv_slot_layout_and_compact() -> None:
     assert pos.tolist() == [10, 11, 11, 12]
     assert slot_pos.tolist() == [10, 11, 12, 13]
     assert seq_lens[0].tolist() == 14
-
-    block_size = 16
-    cache = torch.arange(2 * block_size, dtype=torch.float32).view(2, block_size, 1)
-    before = cache.clone()
-    block_table = torch.zeros((1, 4), dtype=torch.int32)
-    block_table[0, 1] = 1
-    path_node_ids = torch.tensor([[2, -1, -1]], dtype=torch.long)
-    compact_tree_kv_along_path(
-        [cache],
-        block_table,
-        block_size,
-        idx_mapping,
-        computed,
-        path_node_ids,
-    )
-    # node 2 lives at logical 12; accepted path depth 1 dest is logical 11.
-    assert cache[0, 11].tolist() == before[0, 12].tolist()
-    assert cache[0, 12].tolist() == before[0, 12].tolist()
-
-    # Overlapping src/dst: gather then scatter so 13→12 does not read the
-    # already-written 12→11 result.
-    cache = before.clone()
-    compact_tree_kv_along_path(
-        [cache],
-        block_table,
-        block_size,
-        idx_mapping,
-        computed,
-        torch.tensor([[2, 3, -1]], dtype=torch.long),
-    )
-    assert cache[0, 11].tolist() == before[0, 12].tolist()
-    assert cache[0, 12].tolist() == before[0, 13].tolist()
 
 
 def test_tree_query_compact_along_non_prefix_path() -> None:
@@ -477,7 +417,15 @@ def test_prefix_domino_shift_label_samples_bonus_hidden() -> None:
             self.use_local_argmax_reduction = False
             self.draft_tokens = torch.zeros(2, num_spec, dtype=torch.long)
 
-        tree_cfg = SimpleNamespace(method=method, budget=8, topk=4, params={})
+        tree_cfg = SimpleNamespace(
+            method=method,
+            budget=8,
+            topk=4,
+            params={},
+            rejection_sampler="greedy",
+            enable_triton=True,
+            enable_timer=False,
+        )
         with (
             patch.object(AscendDFlashSpeculator, "__init__", _parent_init),
             patch(

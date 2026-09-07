@@ -91,7 +91,7 @@ class AttentionMaskBuilder:
         )
 
         tree_timer_begin_step()
-        with tree_time("mask"):
+        with tree_time("build_attn_mask"):
             return self._get_tree_attention_mask_impl(
                 tree_visibility, seq_lens, num_decode
             )
@@ -126,7 +126,7 @@ class AttentionMaskBuilder:
         # Triton needs a contiguous bool→int8 view; sliced caps (kv_len < cap)
         # are non-contiguous and must stay on the torch path.
         mask_slice = attn_mask[:num_mask]
-        if use_tree_triton("attention_mask", self.device) and mask_slice.is_contiguous():
+        if use_tree_triton() and mask_slice.is_contiguous():
             from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
                 fill_tree_attention_mask_triton,
             )

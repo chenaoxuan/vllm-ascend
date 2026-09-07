@@ -6,6 +6,9 @@ _dst_off_arange: dict[torch.device, torch.Tensor] = {}
 _root_col: dict[torch.device, torch.Tensor] = {}
 _valid_root_col: dict[torch.device, torch.Tensor] = {}
 _token_arange: dict[torch.device, torch.Tensor] = {}
+# Growable src/dst slot buffers for the triton path, keyed by device.
+_kv_src_slots: dict[torch.device, torch.Tensor] = {}
+_kv_dst_slots: dict[torch.device, torch.Tensor] = {}
 
 
 def _cached_arange(cache: dict, n: int, device: torch.device, dtype=torch.long) -> torch.Tensor:
@@ -75,10 +78,29 @@ def _compact_tree_kv_along_path_triton(
         compact_tree_kv_slots_triton,
     )
 
-    node = path_node_ids.to(dtype=torch.long)
+    # Skip the copy when already int64+contiguous; only convert otherwise.
+    if path_node_ids.dtype == torch.long and path_node_ids.is_contiguous():
+        node = path_node_ids
+    else:
+        node = path_node_ids.to(dtype=torch.long).contiguous()
     num_reqs, spec_len = node.shape
-    src_slots = torch.empty((num_reqs, spec_len), dtype=torch.long, device=node.device)
-    dst_slots = torch.empty_like(src_slots)
+    device = node.device
+    # Reuse growable slot buffers (keyed by device) instead of malloc per call.
+    src_full = _kv_src_slots.get(device)
+    dst_full = _kv_dst_slots.get(device)
+    if (
+        src_full is None
+        or src_full.shape[0] < num_reqs
+        or src_full.shape[1] < spec_len
+    ):
+        r = max(num_reqs, src_full.shape[0] if src_full is not None else 0)
+        s = max(spec_len, src_full.shape[1] if src_full is not None else 0)
+        src_full = torch.empty((r, s), dtype=torch.long, device=device)
+        dst_full = torch.empty_like(src_full)
+        _kv_src_slots[device] = src_full
+        _kv_dst_slots[device] = dst_full
+    src_slots = src_full[:num_reqs, :spec_len]
+    dst_slots = dst_full[:num_reqs, :spec_len]
     compact_tree_kv_slots_triton(
         block_table,
         num_computed,
@@ -88,11 +110,18 @@ def _compact_tree_kv_along_path_triton(
         dst_slots,
         block_size,
     )
+    src_flat = src_slots.reshape(-1)
+    dst_flat = dst_slots.reshape(-1)
     for cache in caches:
         tail = cache.shape[2:]
         flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
-        gathered = flat[src_slots].clone()
-        flat[dst_slots] = gathered
+        # index_select returns a fresh copy (gather), so no .clone() is needed
+        # before the in-place scatter. Overlapping src/dst slots stay correct
+        # because `gathered` is an independent snapshot of the pre-scatter state.
+        gathered = torch.index_select(flat, 0, src_flat).view(
+            num_reqs, spec_len, *tail
+        )
+        flat.index_copy_(0, dst_flat, gathered.reshape(-1, *tail))
 
 
 def compact_tree_kv_along_path_torch(

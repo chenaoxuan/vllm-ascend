@@ -1,7 +1,5 @@
 from vllm.triton_utils import tl, triton
 
-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-
 
 @triton.jit(do_not_specialize=["num_reqs", "spec_len", "block_size"])
 def compact_tree_kv_slots_kernel(
@@ -18,35 +16,30 @@ def compact_tree_kv_slots_kernel(
     stride_path_r,
     stride_out_r,
 ):
-    pid = tl.program_id(0)
-    nprog = tl.num_programs(0)
-    req = pid
-    while req < num_reqs:
-        req_state = tl.load(idx_mapping_ptr + req)
-        safe = tl.where(req_state >= 0, req_state, 0)
-        prefix = tl.load(num_computed_ptr + safe)
-        # Dynamic extent must use tl.range on Ascend (plain range(spec_len) is unsafe).
-        for d in tl.range(0, spec_len):
-            node = tl.load(path_ptr + req * stride_path_r + d)
-            valid = (node >= 0) & (req_state >= 0)
-            depth = d + 1
-            dst_pos = prefix + depth
-            src_pos = tl.where(valid, prefix + node, dst_pos)
-            src_block = tl.load(
-                block_table_ptr
-                + safe * stride_bt_r
-                + (src_pos // block_size)
-            )
-            dst_block = tl.load(
-                block_table_ptr
-                + safe * stride_bt_r
-                + (dst_pos // block_size)
-            )
-            src_slot = src_block * block_size + (src_pos % block_size)
-            dst_slot = dst_block * block_size + (dst_pos % block_size)
-            tl.store(src_slots_ptr + req * stride_out_r + d, src_slot)
-            tl.store(dst_slots_ptr + req * stride_out_r + d, dst_slot)
-        req += nprog
+    # 2D grid: one program per (req, depth). Fully parallel; no host-side
+    # vectorcore tuning and no scalar loop over spec_len.
+    req = tl.program_id(0)
+    d = tl.program_id(1)
+    if req >= num_reqs or d >= spec_len:
+        return
+    req_state = tl.load(idx_mapping_ptr + req)
+    safe = tl.where(req_state >= 0, req_state, 0)
+    prefix = tl.load(num_computed_ptr + safe)
+    node = tl.load(path_ptr + req * stride_path_r + d)
+    valid = (node >= 0) & (req_state >= 0)
+    depth = d + 1
+    dst_pos = prefix + depth
+    src_pos = tl.where(valid, prefix + node, dst_pos)
+    src_block = tl.load(
+        block_table_ptr + safe * stride_bt_r + (src_pos // block_size)
+    )
+    dst_block = tl.load(
+        block_table_ptr + safe * stride_bt_r + (dst_pos // block_size)
+    )
+    src_slot = src_block * block_size + (src_pos % block_size)
+    dst_slot = dst_block * block_size + (dst_pos % block_size)
+    tl.store(src_slots_ptr + req * stride_out_r + d, src_slot)
+    tl.store(dst_slots_ptr + req * stride_out_r + d, dst_slot)
 
 
 def compact_tree_kv_slots_triton(
@@ -60,9 +53,7 @@ def compact_tree_kv_slots_triton(
 ) -> None:
     path = path_node_ids.contiguous()
     num_reqs, spec_len = path.shape
-    vec = get_vectorcore_num()
-    grid = min(max(num_reqs, 1), max(vec, 1))
-    compact_tree_kv_slots_kernel[(grid,)](
+    compact_tree_kv_slots_kernel[(num_reqs, spec_len)](
         block_table,
         num_computed,
         idx_mapping,

@@ -82,6 +82,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.tree_builder = None
         self._domino_scorer = None
         self._domino_prefix_len = 0
+        self._tree_finalized = True
         dflash_cfg = _hf_dflash_config(draft_hf)
         self._domino_shift_label = (
             self.method == "prefix"
@@ -92,6 +93,13 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if self._domino_shift_label:
             self.sample_from_anchor = True
             self.num_query_per_req = self.num_speculative_steps
+        # Persistent so FULL replay can update hidden without re-entering Python.
+        self._draft_hidden_buf = torch.empty(
+            self.max_num_reqs * self.num_query_per_req,
+            self.hidden_size,
+            dtype=self.dtype,
+            device=device,
+        )
         if self.budget < self.num_speculative_steps:
             raise ValueError(
                 "tree_spec_config.budget must be >= num_speculative_tokens "
@@ -242,14 +250,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self._domino_shift_label,
         )
 
-    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        if cudagraph_mode != CUDAGraphMode.NONE:
-            logger.warning(
-                "Tree speculator builds the draft tree on CPU; "
-                "disabling full ACL graphs for the draft query."
-            )
-        super().init_cudagraph_manager(CUDAGraphMode.NONE)
-
     def propose(
         self,
         input_batch: InputBatch,
@@ -283,7 +283,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     path_node_ids,
                     linearize_positions=input_batch.positions,
                 )
-        return super().propose(
+        self._tree_finalized = False
+        tokens = super().propose(
             input_batch,
             attn_metadata,
             slot_mappings,
@@ -301,8 +302,28 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             mm_inputs,
             is_profile=is_profile,
         )
+        # FULL replay only runs draft forward; build the tree afterwards.
+        if not dummy_run:
+            self._finalize_tree(input_batch.num_reqs)
+        return tokens
 
-    def _generate_draft(
+    def capture(self) -> None:
+        logger.info("Capturing model for %s speculator...", self._speculator_name)
+        self.sample_indices.zero_()
+        self.sample_pos.zero_()
+        self.sample_idx_mapping.fill_(-1)
+        self.query_cudagraph_manager.capture(
+            self._run_draft_forward,
+            self.input_buffers,
+            self.block_tables,
+            self.attn_groups,
+            self.kv_cache_config,
+            self.max_model_len,
+            causal=self._group_causal,
+            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+        )
+
+    def _run_draft_forward(
         self,
         num_reqs: int,
         num_tokens_padded: int,
@@ -311,18 +332,28 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        """Draft model forward only; tree build stays outside ACLGraph."""
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
         with tree_time("draft_model_forward"):
-            last_hidden_states = self._run_model(
+            hidden = self._run_model(
                 num_tokens_padded,
                 attn_metadata,
                 slot_mappings,
                 num_tokens_across_dp,
                 cudagraph_runtime_mode,
             )
+        self._draft_hidden_buf[:num_tokens_padded].copy_(hidden)
+        self._tree_finalized = False
+
+    def _finalize_tree(self, num_reqs: int) -> None:
+        if self.tree_builder is None or self._tree_finalized:
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
-        sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        sample_hidden_states = hidden[self.sample_indices[:num_sample]]
         if self.method == "beam":
             logits = self.model.compute_draft_logits(sample_hidden_states)
         else:
@@ -344,11 +375,30 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             proposal_logits=proposal,
         )
         if self.method == "prefix":
-            # Fine-grained timers live inside PrefixTreeBuilder.build.
             self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
         else:
             with tree_time("build_draft_tree"):
                 self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
+        self._tree_finalized = True
+
+    def _generate_draft(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        self._run_draft_forward(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        self._finalize_tree(num_reqs)
 
     def _load_layout_from_buffers(self, num_reqs: int) -> TreeLayout:
         """Views into persistent buffers."""

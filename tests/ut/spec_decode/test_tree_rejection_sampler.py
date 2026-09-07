@@ -4,11 +4,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
+from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
 from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
     TreeRejectionSampler,
     block_tree_reject,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
 
 
 def _logits_from_greedy_ids(token_ids: torch.Tensor, vocab_size: int) -> torch.Tensor:
@@ -27,6 +27,27 @@ def _mock_tree_ascend_config(rejection_sampler: str = "greedy"):
     return SimpleNamespace(
         tree_spec_config=SimpleNamespace(rejection_sampler=rejection_sampler),
     )
+
+
+def _paper_magicmtp_tree_and_logits():
+    """Shared MagicMTP paper fixture (depth-indexed draft + node-indexed proposal)."""
+    mb = torch.tensor([0.3, 0.4, 0.3])
+    ms = torch.tensor([0.6, 0.3, 0.1])
+    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+    draft_depth = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 2, 3).contiguous()
+    proposal = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+
+    tree = empty_tree_layout(1, 5, device="cpu")
+    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
+    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
+    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
+    tree.num_nodes[0] = 5
+    tree.first_child[0, 0] = 1
+    tree.next_sibling[0, 1] = 2
+    tree.first_child[0, 1] = 3
+    tree.next_sibling[0, 3] = 4
+    tree.first_child[0, 2] = 5
+    return tree, target, draft_depth, proposal
 
 
 @patch(
@@ -164,39 +185,41 @@ def test_tree_rejection_sampler_ragged_logit_counts_do_not_mix_requests(_mock_cf
     ]
 
 
-def test_block_tree_reject_paper_path() -> None:
-    """Reject X3 then X4 (locks p'≈0.091), then accept X2→X5 and recover Y."""
-    mb = torch.tensor([0.3, 0.4, 0.3])
-    ms = torch.tensor([0.6, 0.3, 0.1])
-    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
-    draft = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 2, 3).contiguous()
+def test_block_tree_reject_paper_path_depth_and_node_indexed() -> None:
+    """Reject X3 then X4, accept X2→X5; depth- and node-indexed proposal agree."""
+    tree, target, draft_depth, proposal = _paper_magicmtp_tree_and_logits()
+    etas = torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]])
+    recover_u = torch.zeros(1)
 
-    tree = empty_tree_layout(1, 5, device="cpu")
-    # X1=a, X2=c, X3=b, X4=c, X5=a
-    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
-    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
-    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
-    tree.num_nodes[0] = 5
-    tree.first_child[0, 0] = 1
-    tree.next_sibling[0, 1] = 2
-    tree.first_child[0, 1] = 3
-    tree.next_sibling[0, 3] = 4
-    tree.first_child[0, 2] = 5
-
-    path_node_ids = torch.full((1, 2), -1, dtype=torch.long)
-    sampled = block_tree_reject(
+    path_depth = torch.full((1, 2), -1, dtype=torch.long)
+    sampled_depth = torch.full((1, 3), -1, dtype=torch.long)
+    out_depth = block_tree_reject(
         tree,
         target,
-        draft,
+        draft_depth,
         2,
-        # 0.7 ∈ (7/11, 1): correct p(X4)≈0.636 rejects; p(X4)=1 (wiped p') would accept.
-        etas=torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]]),
-        recover_u=torch.zeros(1),
-        path_node_ids=path_node_ids,
+        path_node_ids=path_depth,
+        sampled_token_ids=sampled_depth,
+        etas=etas,
+        recover_u=recover_u,
     )
-    # X1 pruned after X4; accept X2=c, X5=a; Y from M_b at X5, u=0 -> a
-    assert sampled.tolist() == [[2, 0, 0]]
-    assert path_node_ids.tolist() == [[2, 5]]
+
+    path_node = torch.full((1, 2), -1, dtype=torch.long)
+    sampled_node = torch.full((1, 3), -1, dtype=torch.long)
+    out_node = block_tree_reject(
+        tree,
+        target,
+        proposal,
+        2,
+        path_node_ids=path_node,
+        sampled_token_ids=sampled_node,
+        etas=etas,
+        recover_u=recover_u,
+    )
+    assert out_depth.tolist() == [[2, 0, 0]]
+    assert path_depth.tolist() == [[2, 5]]
+    assert torch.equal(out_depth, out_node)
+    assert torch.equal(path_depth, path_node)
 
 
 @patch(
@@ -205,23 +228,8 @@ def test_block_tree_reject_paper_path() -> None:
 )
 def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
     """TreeRejectionSampler routes to block_tree_reject when configured."""
-    mb = torch.tensor([0.3, 0.4, 0.3])
-    ms = torch.tensor([0.6, 0.3, 0.1])
-    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
-    # Node-indexed proposal (budget+1=6), same M_s on every node as the paper fixture.
-    proposal = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
+    tree, target, _draft_depth, proposal = _paper_magicmtp_tree_and_logits()
     logits = target.reshape(6, 3)
-
-    tree = empty_tree_layout(1, 5, device="cpu")
-    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
-    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
-    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
-    tree.num_nodes[0] = 5
-    tree.first_child[0, 0] = 1
-    tree.next_sibling[0, 1] = 2
-    tree.first_child[0, 1] = 3
-    tree.next_sibling[0, 3] = 4
-    tree.first_child[0, 2] = 5
 
     spec_config = SimpleNamespace(
         num_speculative_tokens=2,
@@ -262,42 +270,9 @@ def test_tree_rejection_sampler_call_uses_magicmtp(_mock_cfg) -> None:
             return block_tree_reject(*args, **kwargs)
 
         wrapped.side_effect = _fixed_block
-        # draft_logits deliberately None: MagicMTP must use tree_proposal_logits.
         output = rejection_sampler(logits, input_batch, draft_logits=None)
 
     assert wrapped.called
     assert output.sampled_token_ids.tolist() == [[2, 0, 0]]
     assert rejection_sampler.path_node_ids.tolist() == [[2, 5]]
     assert torch.equal(input_batch.path_node_ids, rejection_sampler.path_node_ids)
-
-
-def test_block_tree_reject_node_indexed_proposal() -> None:
-    """Node-indexed proposal logits (budget+1) match the depth-indexed paper path."""
-    mb = torch.tensor([0.3, 0.4, 0.3])
-    ms = torch.tensor([0.6, 0.3, 0.1])
-    target = torch.log(mb.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
-    proposal = torch.log(ms.clamp(min=1e-12)).view(1, 1, 3).expand(1, 6, 3).contiguous()
-
-    tree = empty_tree_layout(1, 5, device="cpu")
-    tree.tokens[0, :5] = torch.tensor([0, 2, 1, 2, 0])
-    tree.parents[0, :5] = torch.tensor([0, 0, 1, 1, 2])
-    tree.depths[0, :5] = torch.tensor([1, 1, 2, 2, 2])
-    tree.num_nodes[0] = 5
-    tree.first_child[0, 0] = 1
-    tree.next_sibling[0, 1] = 2
-    tree.first_child[0, 1] = 3
-    tree.next_sibling[0, 3] = 4
-    tree.first_child[0, 2] = 5
-
-    path_node_ids = torch.full((1, 2), -1, dtype=torch.long)
-    sampled = block_tree_reject(
-        tree,
-        target,
-        proposal,
-        2,
-        etas=torch.tensor([[0.9, 0.7, 0.0, 1.0, 1.0]]),
-        recover_u=torch.zeros(1),
-        path_node_ids=path_node_ids,
-    )
-    assert sampled.tolist() == [[2, 0, 0]]
-    assert path_node_ids.tolist() == [[2, 5]]

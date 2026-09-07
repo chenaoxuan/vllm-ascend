@@ -289,16 +289,13 @@ class PrefixTreeBuilder(TreeBuilder):
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
-
-        with tree_time("prefix_tree_builder"):
-            tokens, depths, parent_ids, num_nodes = self._build_impl(
-                draft_logits,
-                out,
-                root_token_ids=root_token_ids,
-                draft_hidden=draft_hidden,
-                proposal_logits=proposal_logits,
-            )
+        tokens, depths, parent_ids, num_nodes = self._build_impl(
+            draft_logits,
+            out,
+            root_token_ids=root_token_ids,
+            draft_hidden=draft_hidden,
+            proposal_logits=proposal_logits,
+        )
         return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
 
     def _build_impl(

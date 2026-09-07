@@ -17,7 +17,6 @@ _one_bool: dict[torch.device, torch.Tensor] = {}
 _zero_bool: dict[torch.device, torch.Tensor] = {}
 _pad_long: dict[torch.device, torch.Tensor] = {}
 _vocab_arange: dict[torch.device, torch.Tensor] = {}
-_req_arange: dict[torch.device, torch.Tensor] = {}
 
 
 def _scalar(cache: dict, device: torch.device, value, dtype) -> torch.Tensor:
@@ -40,8 +39,8 @@ def greedy_tree_reject(
     tree: TreeLayout,
     target_logits: torch.Tensor,
     num_speculative_tokens: int,
-    path_node_ids: torch.Tensor | None = None,
-    sampled_token_ids: torch.Tensor | None = None,
+    path_node_ids: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
 ) -> torch.Tensor:
     """Greedy-verify a draft tree by token-id comparison on device.
 
@@ -50,65 +49,48 @@ def greedy_tree_reject(
     is the already-accepted root).
 
     Returns ``[num_reqs, spec_len + 1]`` accepted token ids including bonus.
-    Unused slots are ``-1``. When ``path_node_ids`` is set it is filled with
-    accepted draft node ids ``[num_reqs, spec_len]`` (``-1`` unused).
-    Optional ``sampled_token_ids`` reuses a preallocated ``[R, spec_len+1]``
-    buffer (filled with PAD).
+    Unused slots are ``-1``. ``path_node_ids`` is filled with accepted draft
+    node ids ``[num_reqs, spec_len]`` (``-1`` unused). ``sampled_token_ids`` is
+    a preallocated ``[R, spec_len+1]`` buffer (filled with PAD).
     """
-    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
-    with tree_time("greedy_tree_reject"):
-        if use_tree_triton("greedy_reject", target_logits.device):
-            return _greedy_tree_reject_triton(
-                tree,
-                target_logits,
-                num_speculative_tokens,
-                path_node_ids=path_node_ids,
-                sampled_token_ids=sampled_token_ids,
-            )
-        return greedy_tree_reject_torch(
+    if use_tree_triton():
+        return _greedy_tree_reject_triton(
             tree,
             target_logits,
             num_speculative_tokens,
             path_node_ids=path_node_ids,
             sampled_token_ids=sampled_token_ids,
         )
+    return greedy_tree_reject_torch(
+        tree,
+        target_logits,
+        num_speculative_tokens,
+        path_node_ids=path_node_ids,
+        sampled_token_ids=sampled_token_ids,
+    )
 
 
 def _greedy_tree_reject_triton(
     tree: TreeLayout,
     target_logits: torch.Tensor,
     num_speculative_tokens: int,
-    path_node_ids: torch.Tensor | None = None,
-    sampled_token_ids: torch.Tensor | None = None,
+    path_node_ids: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
 ) -> torch.Tensor:
     from vllm_ascend.ops.triton.spec_decode.tree.greedy_reject import (
         greedy_tree_reject_triton,
     )
 
     tokens = tree.tokens
-    device = tokens.device
-    num_reqs, _budget = tokens.shape
+    num_reqs = tokens.shape[0]
     spec_len = num_speculative_tokens
     target_token_ids = target_logits.argmax(dim=-1)
-    if sampled_token_ids is None:
-        sampled_token_ids = torch.full(
-            (num_reqs, spec_len + 1),
-            _PAD_TOKEN_ID,
-            dtype=torch.long,
-            device=device,
-        )
-    else:
-        sampled_token_ids = sampled_token_ids[:num_reqs, : spec_len + 1]
-        sampled_token_ids.fill_(_PAD_TOKEN_ID)
-    if path_node_ids is None:
-        path_out = torch.full(
-            (num_reqs, spec_len), -1, dtype=torch.long, device=device
-        )
-    else:
-        path_out = path_node_ids[:num_reqs, :spec_len]
-        path_out.fill_(-1)
+    sampled_token_ids = sampled_token_ids[:num_reqs, : spec_len + 1]
+    sampled_token_ids.fill_(_PAD_TOKEN_ID)
+    path_out = path_node_ids[:num_reqs, :spec_len]
+    path_out.fill_(-1)
     greedy_tree_reject_triton(
         tokens.contiguous(),
         tree.first_child.contiguous(),
@@ -121,16 +103,14 @@ def _greedy_tree_reject_triton(
     return sampled_token_ids
 
 
-# Python / Torch golden retained for UT and CPU.
-
-
-def _greedy_tree_reject_impl(
+def greedy_tree_reject_torch(
     tree: TreeLayout,
     target_logits: torch.Tensor,
     num_speculative_tokens: int,
-    path_node_ids: torch.Tensor | None = None,
-    sampled_token_ids: torch.Tensor | None = None,
+    path_node_ids: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
 ) -> torch.Tensor:
+    """Torch golden for greedy tree reject (UT / CPU / enable_triton=False)."""
     tokens = tree.tokens
     first_child = tree.first_child
     next_sibling = tree.next_sibling
@@ -138,26 +118,10 @@ def _greedy_tree_reject_impl(
     num_reqs, budget = tokens.shape
     spec_len = num_speculative_tokens
     target_token_ids = target_logits.argmax(dim=-1)
-    if sampled_token_ids is None:
-        sampled_token_ids = torch.full(
-            (num_reqs, spec_len + 1),
-            _PAD_TOKEN_ID,
-            dtype=torch.long,
-            device=device,
-        )
-    else:
-        sampled_token_ids = sampled_token_ids[:num_reqs, : spec_len + 1]
-        sampled_token_ids.fill_(_PAD_TOKEN_ID)
-    if path_node_ids is None:
-        path_out = torch.full(
-            (num_reqs, spec_len),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-    else:
-        path_out = path_node_ids[:num_reqs, :spec_len]
-        path_out.fill_(-1)
+    sampled_token_ids = sampled_token_ids[:num_reqs, : spec_len + 1]
+    sampled_token_ids.fill_(_PAD_TOKEN_ID)
+    path_out = path_node_ids[:num_reqs, :spec_len]
+    path_out.fill_(-1)
     neg_one = _scalar(_neg_one, device, -1, torch.long)
 
     for req_idx in range(num_reqs):
@@ -193,9 +157,6 @@ def _greedy_tree_reject_impl(
         )
 
     return sampled_token_ids
-
-
-greedy_tree_reject_torch = _greedy_tree_reject_impl
 
 
 def _pack_tree_target_logits(
@@ -306,29 +267,29 @@ class TreeRejectionSampler(RejectionSampler):
         path_node_ids.fill_(-1)
         sampled_buf = self._sampled_buf[:num_reqs]
         method = get_ascend_config().tree_spec_config.rejection_sampler
-        if method == "magicmtp":
-            # Prefer node-indexed proposal logits from the tree builder
-            # (Domino / Markov corrected). Fall back to the caller's tensor
-            # (depth-indexed or already node-indexed).
-            proposal = getattr(input_batch, "tree_proposal_logits", None)
-            if proposal is None:
-                proposal = draft_logits
-            sampled = block_tree_reject(
-                tree,
-                target_logits,
-                proposal,
-                self.num_speculative_steps,
-                path_node_ids=path_node_ids,
-                sampled_token_ids=sampled_buf,
-            )
-        else:
-            sampled = greedy_tree_reject(
-                tree,
-                target_logits,
-                self.num_speculative_steps,
-                path_node_ids=path_node_ids,
-                sampled_token_ids=sampled_buf,
-            )
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        with tree_time("rejection_sample"):
+            if method == "magicmtp":
+                proposal = getattr(input_batch, "tree_proposal_logits", None)
+                if proposal is None:
+                    proposal = draft_logits
+                sampled = block_tree_reject(
+                    tree,
+                    target_logits,
+                    proposal,
+                    self.num_speculative_steps,
+                    path_node_ids=path_node_ids,
+                    sampled_token_ids=sampled_buf,
+                )
+            else:
+                sampled = greedy_tree_reject(
+                    tree,
+                    target_logits,
+                    self.num_speculative_steps,
+                    path_node_ids=path_node_ids,
+                    sampled_token_ids=sampled_buf,
+                )
         num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
         cu = input_batch.cu_num_logits[: num_reqs + 1]
         num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
@@ -372,7 +333,7 @@ def _update_parent_residual(
     denom = z + (1 - p)
     p_new = torch.where(denom > 0, z / denom, torch.zeros((), dtype=mb.dtype, device=mb.device))
     mb_new = torch.where(z > 0, residual / z, torch.zeros_like(mb))
-    idx = torch.arange(ms.shape[-1], device=ms.device)
+    idx = _arange_buf(_vocab_arange, ms.shape[-1], ms.device)
     ms_new = torch.where(idx == token, torch.zeros_like(ms), ms)
     mass = ms_new.sum()
     ms_new = torch.where(mass > 0, ms_new / mass, ms_new)
@@ -472,7 +433,7 @@ def _write_path(
     parents: torch.Tensor,
     tokens: torch.Tensor,
     y: torch.Tensor,
-    path_node_ids: torch.Tensor | None = None,
+    path_node_ids: torch.Tensor,
 ) -> None:
     device = sampled.device
     zero = _scalar(_zero_long, device, 0, torch.long)
@@ -495,10 +456,9 @@ def _write_path(
         safe = (cur - 1).clamp(min=0)
         tok = torch.where(is_node, tokens[safe], pad)
         sampled[req_idx, slot] = torch.where(write, tok, sampled[req_idx, slot])
-        if path_node_ids is not None:
-            path_node_ids[req_idx, slot] = torch.where(
-                write, cur, path_node_ids[req_idx, slot]
-            )
+        path_node_ids[req_idx, slot] = torch.where(
+            write, cur, path_node_ids[req_idx, slot]
+        )
         d = torch.where(is_node, d - 1, d)
         cur = torch.where(is_node, parents[safe].to(torch.long), cur)
 
@@ -508,10 +468,10 @@ def block_tree_reject(
     target_logits: torch.Tensor,
     draft_logits: torch.Tensor | None,
     num_speculative_tokens: int,
+    path_node_ids: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
     etas: torch.Tensor | None = None,
     recover_u: torch.Tensor | None = None,
-    path_node_ids: torch.Tensor | None = None,
-    sampled_token_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MagicMTP Block Verify on a draft tree, from leaf to root.
 
@@ -535,8 +495,9 @@ def block_tree_reject(
 
     ``etas`` is ``[num_reqs, max_visits]`` accept/reject draws. ``recover_u``
     is ``[num_reqs]`` for the final ``Y``. Unused outputs are ``-1``.
-    When ``path_node_ids`` is set it is filled with accepted draft node ids
-    ``[num_reqs, spec_len]`` (``-1`` unused).
+    ``path_node_ids`` is filled with accepted draft node ids
+    ``[num_reqs, spec_len]`` (``-1`` unused). ``sampled_token_ids`` is a
+    preallocated ``[R, spec_len+1]`` buffer.
     """
     tokens = tree.tokens
     device = tokens.device
@@ -545,10 +506,8 @@ def block_tree_reject(
     vocab = target_logits.shape[-1]
     target_probs = torch.softmax(target_logits.float(), dim=-1)
     has_draft = draft_logits is not None
-    node_indexed = (
-        has_draft and draft_logits is not None and draft_logits.shape[1] == budget + 1
-    )
-    if has_draft and draft_logits is not None:
+    node_indexed = has_draft and draft_logits.shape[1] == budget + 1
+    if has_draft:
         logits_f = draft_logits.float()
         if node_indexed:
             # Unused node rows stay -inf from builders; avoid NaN softmax.
@@ -565,21 +524,10 @@ def block_tree_reject(
         etas = torch.rand(num_reqs, budget, device=device)
     if recover_u is None:
         recover_u = torch.rand(num_reqs, device=device)
-    if sampled_token_ids is None:
-        sampled = torch.full(
-            (num_reqs, spec_len + 1),
-            _PAD_TOKEN_ID,
-            dtype=torch.long,
-            device=device,
-        )
-    else:
-        sampled = sampled_token_ids[:num_reqs, : spec_len + 1]
-        sampled.fill_(_PAD_TOKEN_ID)
-    if path_node_ids is None:
-        path_out = None
-    else:
-        path_out = path_node_ids[:num_reqs, :spec_len]
-        path_out.fill_(-1)
+    sampled = sampled_token_ids[:num_reqs, : spec_len + 1]
+    sampled.fill_(_PAD_TOKEN_ID)
+    path_out = path_node_ids[:num_reqs, :spec_len]
+    path_out.fill_(-1)
     zero_long = _scalar(_zero_long, device, 0, torch.long)
     vocab_idx = _arange_buf(_vocab_arange, vocab, device)
 
@@ -590,7 +538,7 @@ def block_tree_reject(
         ns = tree.next_sibling[req_idx].clone().to(torch.long)
         mb = target_probs[req_idx].clone()
         ms = target_probs.new_zeros(budget + 1, vocab)
-        if has_draft and draft_probs is not None:
+        if has_draft:
             if node_indexed:
                 ms = draft_probs[req_idx].clone()
             else:

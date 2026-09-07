@@ -113,19 +113,28 @@ def _prefix_corrected_candidates(
     ``candidate_logits`` is ``[R, width, C]`` over the base top-C set (the
     actual Domino proposal before the width×k top cut).
     """
-    s_proj = F.linear(parent_hidden, scorer.w_s, None)
-    mid = scorer.middle(z.unsqueeze(1) + s_proj)
-    bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)
-    if candidate_bias is not None:
-        bias = bias + candidate_bias.unsqueeze(1)
-    candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias
-    candidate_logits = candidate_logits.float()
-    top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
-    log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)
-    top_scores = top_vals - log_z
-    width = parent_hidden.size(1)
-    cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
-    sel_ids = torch.gather(cand_ids, 2, top_ids)
+    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
+
+    with tree_time_accum("build_score_linear"):
+        s_proj = F.linear(parent_hidden, scorer.w_s, None)
+    with tree_time_accum("build_score_middle"):
+        mid = scorer.middle(z.unsqueeze(1) + s_proj)
+    with tree_time_accum("build_score_einsum"):
+        bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)
+        if candidate_bias is not None:
+            bias = bias + candidate_bias.unsqueeze(1)
+    with tree_time_accum("build_score_logits"):
+        candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias
+        candidate_logits = candidate_logits.float()
+    with tree_time_accum("build_score_topk"):
+        top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
+    with tree_time_accum("build_score_logsumexp"):
+        log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)
+        top_scores = top_vals - log_z
+    with tree_time_accum("build_score_id_gather"):
+        width = parent_hidden.size(1)
+        cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
+        sel_ids = torch.gather(cand_ids, 2, top_ids)
     return top_scores, sel_ids, candidate_logits
 
 
@@ -205,7 +214,6 @@ class PrefixTreeBuilder(TreeBuilder):
         self._node_arange: torch.Tensor | None = None
         self._budget_ids: torch.Tensor | None = None
         self._frontier_pad: torch.Tensor | None = None
-        self._score_scratch_buf: torch.Tensor | None = None
 
     def _ensure_scratch(
         self,
@@ -249,9 +257,6 @@ class PrefixTreeBuilder(TreeBuilder):
             )
             self._frontier_buf = torch.empty((r, w), dtype=torch.long, device=device)
             self._frontier_pad = torch.zeros((r, w), dtype=torch.long, device=device)
-            self._score_scratch_buf = torch.empty(
-                (r, w * w), dtype=torch.float32, device=device
-            )
             self._old_to_new_buf = torch.empty((r, mn), dtype=torch.long, device=device)
             self._req_arange = torch.arange(r, device=device, dtype=torch.long)
             self._width_arange = torch.arange(w, device=device, dtype=torch.long)
@@ -272,12 +277,6 @@ class PrefixTreeBuilder(TreeBuilder):
                     (r, mn, self._scratch_gru), dtype=dtype, device=device
                 )
         else:
-            if self._score_scratch_buf is None:
-                r = self._scratch_reqs
-                w = min(self.topk, self._scratch_vocab, self.budget)
-                self._score_scratch_buf = torch.empty(
-                    (r, w * w), dtype=torch.float32, device=device
-                )
             if need_proposal and self._prop_temp_buf is None:
                 r = self._scratch_reqs
                 v = self._scratch_vocab
@@ -321,204 +320,12 @@ class PrefixTreeBuilder(TreeBuilder):
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
-            use_tree_triton,
-        )
-
-        need_proposal = proposal_logits is not None
-        with_correction = self.correction_scorer is not None
-        if (
-            use_tree_triton()
-            and with_correction
-            and not need_proposal
-            and root_token_ids is not None
-            and draft_hidden is not None
-        ):
-            return self._build_impl_domino_triton(
-                draft_logits,
-                root_token_ids=root_token_ids,
-                draft_hidden=draft_hidden,
-            )
         return self._build_impl_torch(
             draft_logits,
             root_token_ids=root_token_ids,
             draft_hidden=draft_hidden,
             proposal_logits=proposal_logits,
         )
-
-    def _build_impl_domino_triton(
-        self,
-        draft_logits: torch.Tensor,
-        *,
-        root_token_ids: torch.Tensor,
-        draft_hidden: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Greedy Domino expand: Cube score/GRU via torch, select/write via Triton."""
-        from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
-            prefix_expand_depth_triton,
-        )
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import (
-            tree_time,
-            tree_time_accum,
-            tree_time_accum_flush,
-        )
-
-        budget = self.budget
-        topk = self.topk
-        depth_bonus = self.depth_bonus
-        prefix_len = self.prefix_len
-        correction_scorer = self.correction_scorer
-        num_reqs, spec_num, vocab = draft_logits.shape
-        device = draft_logits.device
-        k = min(topk, vocab, budget)
-        width = k
-        supertree_budget = width * spec_num
-        gru_hidden_dim = correction_scorer.gru_hidden_dim
-
-        with tree_time("build_precompute"):
-            self._ensure_scratch(
-                num_reqs,
-                vocab,
-                spec_num,
-                device,
-                need_proposal=False,
-                gru_hidden_dim=gru_hidden_dim,
-                dtype=draft_logits.dtype,
-            )
-
-            raw_c = self.candidate_size
-            if raw_c is None:
-                candidate_count = k
-            else:
-                candidate_count = max(k, min(int(raw_c), vocab))
-            base_float = draft_logits.float()
-            candidate_vals, candidate_ids = torch.topk(
-                base_float, k=candidate_count, dim=-1
-            )
-            flat_cids = candidate_ids.reshape(-1)
-            candidate_weight = correction_scorer.fc2_weight.index_select(
-                0, flat_cids
-            ).view(num_reqs, spec_num, candidate_count, -1)
-            candidate_bias = None
-            if correction_scorer.fc2_bias is not None:
-                candidate_bias = correction_scorer.fc2_bias.index_select(
-                    0, flat_cids
-                ).view(num_reqs, spec_num, candidate_count)
-            z_parts = correction_scorer.project_z(draft_hidden[:, :spec_num])
-
-            max_nodes = supertree_budget + 1
-            tokens = self._tokens_buf[:num_reqs, :supertree_budget]
-            tokens.fill_(-1)
-            depths = self._depths_buf[:num_reqs, :supertree_budget]
-            depths.zero_()
-            parents = self._parents_buf[:num_reqs, :max_nodes]
-            parents.zero_()
-            path_scores = self._path_scores_buf[:num_reqs, :max_nodes]
-            path_scores.zero_()
-            hidden_states = self._hidden_buf[:num_reqs, :max_nodes, :gru_hidden_dim]
-            hidden_states.zero_()
-            hidden_states[:, 0] = correction_scorer.update_hidden(
-                root_token_ids.reshape(-1), hidden_states[:, 0]
-            )
-
-            frontier = self._frontier_buf[:num_reqs, :width]
-            frontier.zero_()
-            score_scratch = self._score_scratch_buf[:num_reqs, : width * k]
-            frontier_len = 1
-            num_nodes = 0
-            width_arange = self._width_arange[:width]
-
-        for child_depth in range(1, spec_num + 1):
-            if num_nodes >= supertree_budget:
-                break
-            take = min(width, frontier_len * k, supertree_budget - num_nodes)
-            if take <= 0:
-                break
-            depth_slot = child_depth - 1
-            with tree_time_accum("build_expand_score"):
-                parent_hidden = torch.gather(
-                    hidden_states,
-                    1,
-                    frontier.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
-                )
-                valid_parent = width_arange[None, :] < frontier_len
-                if depth_slot < prefix_len:
-                    logits = draft_logits[:, depth_slot].float()
-                    top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
-                    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-                    top_scores = (top_vals - log_z).unsqueeze(1).expand(
-                        -1, width, -1
-                    )
-                    cand_ids = top_ids.unsqueeze(1).expand(-1, width, -1)
-                else:
-                    top_scores, cand_ids, _ = _prefix_corrected_candidates(
-                        correction_scorer,
-                        z_parts[:, depth_slot],
-                        parent_hidden,
-                        candidate_vals[:, depth_slot],
-                        candidate_ids[:, depth_slot],
-                        candidate_weight[:, depth_slot],
-                        candidate_bias[:, depth_slot]
-                        if candidate_bias is not None
-                        else None,
-                        k,
-                    )
-                top_scores = torch.where(
-                    valid_parent[:, :, None],
-                    top_scores,
-                    torch.full_like(top_scores, float("-inf")),
-                )
-            with tree_time_accum("build_expand_select"):
-                prefix_expand_depth_triton(
-                    top_scores.float().contiguous(),
-                    cand_ids.to(torch.long).contiguous(),
-                    frontier,
-                    path_scores,
-                    score_scratch,
-                    tokens,
-                    depths,
-                    parents,
-                    frontier_len,
-                    take,
-                    child_depth,
-                    num_nodes,
-                    width,
-                    k,
-                )
-            with tree_time_accum("build_expand_gru"):
-                start = num_nodes + 1
-                sel_parents = parents[:, start : start + take]
-                sel_tokens = tokens[:, num_nodes : num_nodes + take]
-                parent_hidden_sel = torch.gather(
-                    hidden_states,
-                    1,
-                    sel_parents.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
-                )
-                hidden_states[:, start : start + take] = (
-                    correction_scorer.update_hidden(
-                        sel_tokens.reshape(-1),
-                        parent_hidden_sel.reshape(-1, gru_hidden_dim),
-                    ).view(num_reqs, take, gru_hidden_dim)
-                )
-            frontier_len = take
-            num_nodes += take
-
-        tree_time_accum_flush()
-        with tree_time("build_prune"):
-            return self._finalize_nodes(
-                tokens,
-                depths,
-                parents,
-                path_scores,
-                num_nodes,
-                budget,
-                depth_bonus,
-                num_reqs,
-                vocab,
-                need_proposal=False,
-                prop_temp=None,
-                proposal_logits=None,
-            )
 
     def _finalize_nodes(
         self,
@@ -677,12 +484,15 @@ class PrefixTreeBuilder(TreeBuilder):
 
             with tree_time_accum("build_expand_score"):
                 if with_correction:
-                    parent_hidden = torch.gather(
-                        hidden_states,
-                        1,
-                        frontier.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
-                    )
                     if depth_slot < prefix_len:
+                        # Needed later by build_expand_gru; not Domino-scored.
+                        parent_hidden = torch.gather(
+                            hidden_states,
+                            1,
+                            frontier.unsqueeze(-1).expand(
+                                -1, -1, gru_hidden_dim
+                            ),
+                        )
                         logits = draft_logits[:, depth_slot].float()
                         top_vals, top_ids = torch.topk(logits, k=k, dim=-1)
                         log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
@@ -700,6 +510,14 @@ class PrefixTreeBuilder(TreeBuilder):
                                 req_idx=req_idx,
                             )
                     else:
+                        with tree_time_accum("build_score_gather"):
+                            parent_hidden = torch.gather(
+                                hidden_states,
+                                1,
+                                frontier.unsqueeze(-1).expand(
+                                    -1, -1, gru_hidden_dim
+                                ),
+                            )
                         top_scores, cand_ids, cand_logits = (
                             _prefix_corrected_candidates(
                                 correction_scorer,

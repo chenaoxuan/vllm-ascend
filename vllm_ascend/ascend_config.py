@@ -422,6 +422,7 @@ class AscendConfig:
                 "budget": null,
                 "topk": null,
                 "rejection_sampler": "greedy",
+                "triton_ops": null,
                 "params": {}
             },
             "sparse_kv_offload_config": {
@@ -1072,6 +1073,12 @@ class TreeSpecConfig:
     ``rejection_sampler`` selects tree verify: ``greedy`` (token-id match) or
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
 
+    ``triton_ops`` selects which tree Triton kernels run (rest stay on torch):
+
+    - ``None`` (default): all ops on when ``VLLM_ASCEND_TREE_SPEC_TRITON`` allows
+    - ``[]``: force all torch
+    - non-empty list: only listed names (see ``SUPPORTED_TRITON_OPS``)
+
     Usage::
 
         llm = LLM(
@@ -1083,6 +1090,7 @@ class TreeSpecConfig:
                     "budget": 16,
                     "topk": 4,
                     "rejection_sampler": "magicmtp",
+                    "triton_ops": ["greedy_reject", "kv_compact"],
                     "params": {
                         "candidate_size": 8,
                     },
@@ -1093,6 +1101,12 @@ class TreeSpecConfig:
 
     SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("priority", "beam", "prefix")
     SUPPORTED_REJECTION_SAMPLERS: ClassVar[tuple[str, ...]] = ("greedy", "magicmtp")
+    SUPPORTED_TRITON_OPS: ClassVar[tuple[str, ...]] = (
+        "attention_mask",
+        "finalize_layout",
+        "greedy_reject",
+        "kv_compact",
+    )
     PREFIX_PARAM_KEYS: ClassVar[frozenset[str]] = frozenset({"candidate_size"})
 
     enabled: bool = False
@@ -1103,6 +1117,8 @@ class TreeSpecConfig:
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
     # When true (or VLLM_ASCEND_TREE_SPEC_TIMER=1), print segment timings at exit.
     enable_timer: bool = False
+    # None = all Triton (legacy); [] = all torch; else whitelist.
+    triton_ops: list[str] | None = None
 
     @field_validator("params", mode="before")
     @classmethod
@@ -1112,6 +1128,18 @@ class TreeSpecConfig:
                 f"tree_spec_config.params must be a dict, got {type(value).__name__}."
             )
         return value
+
+    @field_validator("triton_ops", mode="before")
+    @classmethod
+    def _triton_ops_list_or_none(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(
+                f"tree_spec_config.triton_ops must be a list or null, "
+                f"got {type(value).__name__}."
+            )
+        return [str(x) for x in value]
 
     @model_validator(mode="after")
     def _validate(self):
@@ -1138,6 +1166,13 @@ class TreeSpecConfig:
             raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
         if self.topk is not None and self.topk < 1:
             raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
+        if self.triton_ops is not None:
+            unknown_ops = sorted(set(self.triton_ops) - set(self.SUPPORTED_TRITON_OPS))
+            if unknown_ops:
+                raise ValueError(
+                    f"tree_spec_config.triton_ops has unknown names {unknown_ops}; "
+                    f"supported: {self.SUPPORTED_TRITON_OPS}"
+                )
         unknown = set(self.params) - self.PREFIX_PARAM_KEYS
         if unknown:
             logger.warning_once(

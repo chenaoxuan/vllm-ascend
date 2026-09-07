@@ -46,7 +46,7 @@ def configure_tree_timer(
 
     ``enabled=None`` keeps current state or turns on via
     ``VLLM_ASCEND_TREE_SPEC_TIMER``. ``backend`` is printed as ``torch`` or
-    ``triton``.
+    ``triton``; triton skips ``torch.npu.synchronize`` (Ascend segfault).
     """
     global _ENABLED, _BACKEND, _WARMUP_STEPS, _REGISTERED
     if enabled is None:
@@ -82,7 +82,17 @@ def tree_timer_begin_step() -> None:
     _RECORDING = _STEP > _WARMUP_STEPS
 
 
+def _device_sync_safe() -> bool:
+    """Full ``torch.npu.synchronize`` after Ascend Triton launches can segfault.
+
+    Torch/eager segments still fence; triton segments use host wall-clock only.
+    """
+    return _BACKEND != "triton"
+
+
 def _sync() -> None:
+    if not _device_sync_safe():
+        return
     if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
         try:
             torch.npu.synchronize()
@@ -95,7 +105,7 @@ def _sync() -> None:
 
 @contextmanager
 def tree_time(segment: str) -> Iterator[None]:
-    """Time one segment with device synchronize; no-op when disabled."""
+    """Time one segment; device fence only for non-triton backend."""
     if not tree_timer_enabled():
         yield
         return
@@ -113,9 +123,10 @@ def print_tree_timer_report() -> None:
     """Print aggregated segment timings to stdout (no file)."""
     if not (_ENABLED or _env_enabled()):
         return
+    sync_mode = "device" if _device_sync_safe() else "host_only"
     lines = [
         "========== tree-spec timer report ==========",
-        f"backend={_BACKEND} steps={_STEP} warmup={_WARMUP_STEPS}",
+        f"backend={_BACKEND} sync={sync_mode} steps={_STEP} warmup={_WARMUP_STEPS}",
     ]
     if _META:
         meta_str = " ".join(f"{k}={v}" for k, v in sorted(_META.items()))

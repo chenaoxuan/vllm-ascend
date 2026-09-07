@@ -3,28 +3,31 @@ from vllm.triton_utils import tl, triton
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
-@triton.jit(do_not_specialize=["num_mask"])
+@triton.jit(
+    do_not_specialize=["num_mask", "query_len", "kv_len", "max_nodes"]
+)
 def tree_attention_mask_kernel(
     mask_ptr,  # [R, 1, Q, Kv] int8
     visibility_ptr,  # [R, B, B] int8
     prev_kv_ptr,  # [R] int32
     num_mask,
+    query_len,
+    kv_len,
+    max_nodes,
     stride_mask_r,
     stride_mask_q,
     stride_mask_k,
     stride_vis_r,
     stride_vis_i,
-    MAX_NODES: tl.constexpr,
-    QUERY_LEN: tl.constexpr,
-    KV_LEN: tl.constexpr,
 ):
+    # Runtime tl.range — constexpr QUERY×KV unroll segfaults on Ascend for long KV.
     pid = tl.program_id(0)
     nprog = tl.num_programs(0)
     req = pid
     while req < num_mask:
         prev = tl.load(prev_kv_ptr + req)
-        for q in range(QUERY_LEN):
-            for k in range(KV_LEN):
+        for q in tl.range(0, query_len):
+            for k in tl.range(0, kv_len):
                 base = (
                     mask_ptr
                     + req * stride_mask_r
@@ -38,7 +41,7 @@ def tree_attention_mask_kernel(
                     (q >= 1)
                     & (k > prev)
                     & (draft_col >= 0)
-                    & (draft_col < MAX_NODES)
+                    & (draft_col < max_nodes)
                 )
                 vis = tl.load(
                     visibility_ptr
@@ -65,21 +68,23 @@ def fill_tree_attention_mask_triton(
     max_nodes = tree_visibility.shape[-1]
     query_len = attn_mask.shape[2]
     kv_len = attn_mask.shape[3]
+    # Bool view must share storage with attn_mask (in-place FIA mask).
     mask_i8 = attn_mask.view(torch.int8)
     vis_i8 = tree_visibility.to(torch.int8).contiguous()
+    prev = prev_kv_lens.to(torch.int32).contiguous()
     vec = get_vectorcore_num()
     grid = min(max(num_mask, 1), max(vec, 1))
     tree_attention_mask_kernel[(grid,)](
         mask_i8,
         vis_i8,
-        prev_kv_lens.to(torch.int32).contiguous(),
+        prev,
         num_mask,
+        query_len,
+        kv_len,
+        max_nodes,
         mask_i8.stride(0),
         mask_i8.stride(2),
         mask_i8.stride(3),
         vis_i8.stride(0),
         vis_i8.stride(1),
-        MAX_NODES=max_nodes,
-        QUERY_LEN=query_len,
-        KV_LEN=kv_len,
     )

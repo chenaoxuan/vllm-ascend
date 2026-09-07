@@ -229,6 +229,13 @@ class NPUModelRunner(GPUModelRunner):
             self.req_states.tree_num_nodes[idx] = tree.num_nodes
             self.req_states.tree_first_child[idx] = tree.first_child
             self.req_states.tree_next_sibling[idx] = tree.next_sibling
+            proposal = self.speculator.tree_proposal_logits
+            if proposal is not None and getattr(
+                self.req_states, "tree_proposal_logits", None
+            ) is not None:
+                self.req_states.tree_proposal_logits[idx] = proposal[
+                    : input_batch.num_reqs
+                ]
 
         if self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -751,6 +758,9 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
                 input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
                 input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+                proposal = getattr(self.req_states, "tree_proposal_logits", None)
+                if proposal is not None:
+                    input_batch.tree_proposal_logits = proposal[idx_mapping]
                 input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
 
             input_batch = vllm_model_runner.pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)

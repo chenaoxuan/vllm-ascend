@@ -107,8 +107,13 @@ def _prefix_corrected_candidates(
     candidate_weight: torch.Tensor,
     candidate_bias: torch.Tensor | None,
     k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Prefix-only Domino candidate correction for one depth (not Markov)."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prefix-only Domino candidate correction for one depth (not Markov).
+
+    Returns ``(top_scores, sel_ids, candidate_logits)`` where
+    ``candidate_logits`` is ``[R, width, C]`` over the base top-C set (the
+    actual Domino proposal before the width×k top cut).
+    """
     s_proj = F.linear(parent_hidden, scorer.w_s, None)
     mid = scorer.middle(z.unsqueeze(1) + s_proj)
     bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)
@@ -122,7 +127,31 @@ def _prefix_corrected_candidates(
     width = parent_hidden.size(1)
     cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
     sel_ids = torch.gather(cand_ids, 2, top_ids)
-    return top_scores, sel_ids
+    return top_scores, sel_ids, candidate_logits
+
+
+def _scatter_parent_proposal(
+    proposal_logits: torch.Tensor,
+    parent_ids: torch.Tensor,
+    valid_parent: torch.Tensor,
+    full_logits: torch.Tensor,
+) -> None:
+    """Write ``full_logits[r, j]`` into ``proposal_logits[r, parent_ids[r, j]]``.
+
+    Proposal buffers are FP32 (NPU IndexPut does not accept BF16 selfRef).
+    """
+    num_reqs, width, _vocab = full_logits.shape
+    device = full_logits.device
+    full_logits = full_logits.to(dtype=proposal_logits.dtype)
+    req_idx = torch.arange(num_reqs, device=device)
+    for j in range(width):
+        write = valid_parent[:, j]
+        pid = parent_ids[:, j].clamp(min=0, max=proposal_logits.shape[1] - 1)
+        proposal_logits[req_idx, pid] = torch.where(
+            write.unsqueeze(-1),
+            full_logits[:, j],
+            proposal_logits[req_idx, pid],
+        )
 
 
 class PrefixTreeBuilder(TreeBuilder):
@@ -156,6 +185,7 @@ class PrefixTreeBuilder(TreeBuilder):
         *,
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
+        proposal_logits: torch.Tensor | None = None,
     ) -> TreeLayout:
         budget = self.budget
         topk = self.topk
@@ -206,6 +236,15 @@ class PrefixTreeBuilder(TreeBuilder):
         path_scores = torch.zeros(
             (num_reqs, max_nodes), dtype=torch.float32, device=device
         )
+        prop_temp = None
+        if proposal_logits is not None:
+            # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
+            prop_temp = torch.full(
+                (num_reqs, max_nodes, vocab),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
+            )
         hidden_states = None
         if with_correction:
             root_h0 = torch.zeros(
@@ -245,8 +284,13 @@ class PrefixTreeBuilder(TreeBuilder):
                     log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
                     top_scores = (top_vals - log_z).unsqueeze(1).expand(-1, width, -1)
                     cand_ids = top_ids.unsqueeze(1).expand(-1, width, -1)
+                    if prop_temp is not None:
+                        full = logits.unsqueeze(1).expand(-1, width, -1)
+                        _scatter_parent_proposal(
+                            prop_temp, frontier, valid_parent, full
+                        )
                 else:
-                    top_scores, cand_ids = _prefix_corrected_candidates(
+                    top_scores, cand_ids, cand_logits = _prefix_corrected_candidates(
                         correction_scorer,
                         z_parts[:, depth_slot],
                         parent_hidden,
@@ -258,10 +302,32 @@ class PrefixTreeBuilder(TreeBuilder):
                         else None,
                         k,
                     )
+                    if prop_temp is not None:
+                        full = torch.full(
+                            (num_reqs, width, vocab),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        ids = candidate_ids[:, depth_slot].unsqueeze(1).expand(
+                            -1, width, -1
+                        )
+                        full.scatter_(2, ids, cand_logits.to(full.dtype))
+                        _scatter_parent_proposal(
+                            prop_temp, frontier, valid_parent, full
+                        )
             else:
                 top_vals, top_ids = torch.topk(log_probs[:, depth_slot, :], k=k, dim=-1)
                 top_scores = top_vals.unsqueeze(1).expand(-1, width, -1)
                 cand_ids = top_ids.unsqueeze(1).expand(-1, width, -1)
+                if prop_temp is not None:
+                    full = (
+                        draft_logits[:, depth_slot]
+                        .float()
+                        .unsqueeze(1)
+                        .expand(-1, width, -1)
+                    )
+                    _scatter_parent_proposal(prop_temp, frontier, valid_parent, full)
 
             top_scores = torch.where(
                 valid_parent[:, :, None],
@@ -329,10 +395,23 @@ class PrefixTreeBuilder(TreeBuilder):
             ).unsqueeze(0)
             old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, budget))
             parent_ids = torch.gather(old_to_new, 1, old_parents)
+            if proposal_logits is not None and prop_temp is not None:
+                proposal_logits.fill_(float("-inf"))
+                proposal_logits[:, 0] = prop_temp[:, 0]
+                # Remap kept nodes' proposal rows into final ids 1..budget.
+                gathered = torch.gather(
+                    prop_temp,
+                    1,
+                    kept_ids.unsqueeze(-1).expand(-1, -1, vocab),
+                )
+                proposal_logits[:, 1 : budget + 1] = gathered
             num_nodes = budget
         else:
             tokens = tokens[:, :num_nodes]
             depths = depths[:, :num_nodes]
             parent_ids = parents[:, 1 : num_nodes + 1]
+            if proposal_logits is not None and prop_temp is not None:
+                proposal_logits.fill_(float("-inf"))
+                proposal_logits[:, : num_nodes + 1] = prop_temp[:, : num_nodes + 1]
 
         return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)

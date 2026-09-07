@@ -173,6 +173,93 @@ def test_build_prefix_trees_with_domino_correction() -> None:
     assert layout.depths[1, :2].tolist() == [1, 2]
 
 
+def test_builders_fill_corrected_proposal_logits() -> None:
+    """MagicMTP proposal buffer stores Domino / Markov corrected logits, not raw."""
+
+    class _FakeDSparkDraft:
+        def __init__(self, vocab: int) -> None:
+            self._vocab = vocab
+
+        def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+            return token_ids.new_zeros(*token_ids.shape, 2, dtype=torch.float32)
+
+        def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+            # Strong bias toward token 0 so proposal != raw depth row.
+            bias = markov_embed.new_zeros(markov_embed.shape[0], self._vocab)
+            bias[:, 0] = 50.0
+            return bias
+
+        def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+            return draft_ids
+
+    # Priority: shared-depth rows copied to parent nodes.
+    pri_logits = torch.tensor(
+        [[[10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]]]
+    )
+    pri_out = empty_tree_layout(1, 3, device="cpu")
+    pri_prop = torch.full((1, 4, 3), float("-inf"))
+    PriorityTreeBuilder(budget=3, topk=3).build(
+        pri_logits, pri_out, proposal_logits=pri_prop
+    )
+    assert torch.allclose(pri_prop[0, 0], pri_logits[0, 0])
+    assert torch.allclose(pri_prop[0, 1], pri_logits[0, 1])
+
+    # Beam + Markov: root proposal includes +50 on token 0.
+    beam_logits = torch.zeros(1, 2, 4)
+    beam_logits[0, 0] = torch.tensor([1.0, 2.0, 3.0, 0.0])
+    beam_out = empty_tree_layout(1, 2, device="cpu")
+    beam_prop = torch.full((1, 3, 4), float("-inf"))
+    BeamTreeBuilder(budget=2, topk=1, draft_model=_FakeDSparkDraft(4)).build(
+        beam_logits,
+        beam_out,
+        root_token_ids=torch.tensor([1]),
+        proposal_logits=beam_prop,
+    )
+    assert beam_prop[0, 0, 0] > beam_logits[0, 0, 0] + 40.0
+
+    # Domino: corrected parent proposal boosts token 1 vs raw depth-0 row.
+    class _FakeDominoScorer:
+        gru_hidden_dim = 2
+
+        def __init__(self, vocab: int) -> None:
+            mid = 2
+            self.fc2_weight = torch.zeros(vocab, mid)
+            # Boost token 1 (in base top-k) in the correction head.
+            self.fc2_weight[1] = 20.0
+            self.fc2_bias = None
+            self.w_s = torch.ones(mid, self.gru_hidden_dim)
+            self.middle = nn.Identity()
+
+        def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+            return parallel_hiddens.new_ones(
+                *parallel_hiddens.shape[:-1], self.fc2_weight.shape[-1]
+            )
+
+        def update_hidden(
+            self, token_ids: torch.Tensor, h_state: torch.Tensor
+        ) -> torch.Tensor:
+            return h_state
+
+    dom_logits = torch.tensor([[[5.0, 4.0, 3.0], [1.0, 1.0, 1.0]]])
+    dom_out = empty_tree_layout(1, 3, device="cpu")
+    dom_prop = torch.full((1, 4, 3), float("-inf"))
+    PrefixTreeBuilder(
+        budget=3,
+        topk=3,
+        correction_scorer=_FakeDominoScorer(3),
+        prefix_len=0,
+        pruned=False,
+    ).build(
+        dom_logits,
+        dom_out,
+        root_token_ids=torch.tensor([0]),
+        draft_hidden=torch.zeros(1, 2, 4),
+        proposal_logits=dom_prop,
+    )
+    assert torch.isfinite(dom_prop[0, 0]).any()
+    assert dom_prop[0, 0, 1] > dom_logits[0, 0, 1]
+
+
 def test_tree_kv_slot_layout_and_compact() -> None:
     """Siblings share RoPE positions but unique KV slots; compact packs the path."""
     num_computed = 10

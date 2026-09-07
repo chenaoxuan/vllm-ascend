@@ -284,3 +284,60 @@ def test_prefix_expand_depth_torch_golden_matches_builder():
     assert torch.equal(tokens_t, tokens_k)
     assert torch.equal(parents_t, parents_k)
     assert torch.equal(frontier, frontier_k)
+
+
+def test_prefix_domino_score_and_gru_mix_torch_golden():
+    """Domino score + GRU mix torch goldens (Cube path; Triton wrappers alias torch)."""
+    from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
+        prefix_domino_score_torch,
+        prefix_domino_score_triton,
+        prefix_gru_mix_torch,
+        prefix_gru_mix_triton,
+    )
+
+    # Distinct candidate logits so topk order is stable.
+    s_proj = torch.tensor([[[0.0, 0.0], [0.0, 0.0]]], dtype=torch.float32)
+    z = torch.zeros(1, 2, dtype=torch.float32)
+    cand_vals = torch.tensor([[4.0, 2.0, 1.0]], dtype=torch.float32)
+    cand_ids = torch.tensor([[10, 20, 30]], dtype=torch.long)
+    cand_w = torch.zeros(1, 3, 2, dtype=torch.float32)
+    valid = torch.tensor([[True, False]])
+    top_t, ids_t = prefix_domino_score_torch(
+        s_proj, z, cand_vals, cand_ids, cand_w, None, valid, k=2, use_silu=False
+    )
+    assert ids_t[0, 0].tolist() == [10, 20]
+    assert top_t[0, 1, 0].item() == float("-inf")
+
+    top_k = torch.empty_like(top_t)
+    ids_k = torch.empty_like(ids_t)
+    prefix_domino_score_triton(
+        s_proj,
+        z,
+        cand_vals,
+        cand_ids,
+        cand_w,
+        None,
+        valid,
+        top_k,
+        ids_k,
+        k=2,
+        use_silu=False,
+    )
+    assert torch.equal(ids_t, ids_k)
+    assert torch.allclose(top_t, top_k, atol=1e-5)
+
+    gru_h = 2
+    tokens = torch.tensor([[1, 2]], dtype=torch.long)
+    parent_h = torch.zeros(1, 2, gru_h)
+    parent_h[0, 0] = torch.tensor([0.5, -0.5])
+    parent_h[0, 1] = torch.tensor([0.25, 0.75])
+    gru_table = torch.zeros(4, 3 * gru_h)
+    gru_table[2] = torch.tensor([1.0, -1.0, 0.5, -0.5, 0.2, -0.2])
+    gh = torch.zeros(1, 2, 3 * gru_h)
+    out_t = torch.empty(1, 2, gru_h)
+    prefix_gru_mix_torch(tokens, parent_h, gh, gru_table, out_t)
+    assert torch.allclose(out_t[0, 0], 0.5 * parent_h[0, 0], atol=1e-5)
+
+    out_k = torch.empty_like(out_t)
+    prefix_gru_mix_triton(tokens, parent_h, gh, gru_table, out_k)
+    assert torch.allclose(out_t, out_k, atol=1e-5)

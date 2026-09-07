@@ -68,6 +68,12 @@ def greedy_tree_reject_triton(
     path_out,
     spec_len: int,
 ) -> None:
+    # Bind locals so pointer and stride always refer to the same storage.
+    tokens = tokens.contiguous()
+    first_child = first_child.contiguous()
+    next_sibling = next_sibling.contiguous()
+    target_token_ids = target_token_ids.contiguous()
+    # sampled / path are in-place outputs; layout tensors are already contiguous.
     num_reqs, budget = tokens.shape
     vec = get_vectorcore_num()
     grid = min(max(num_reqs, 1), max(vec, 1))

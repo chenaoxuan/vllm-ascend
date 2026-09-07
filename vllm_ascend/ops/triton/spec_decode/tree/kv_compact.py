@@ -25,7 +25,8 @@ def compact_tree_kv_slots_kernel(
         req_state = tl.load(idx_mapping_ptr + req)
         safe = tl.where(req_state >= 0, req_state, 0)
         prefix = tl.load(num_computed_ptr + safe)
-        for d in range(spec_len):
+        # Dynamic extent must use tl.range on Ascend (plain range(spec_len) is unsafe).
+        for d in tl.range(0, spec_len):
             node = tl.load(path_ptr + req * stride_path_r + d)
             valid = (node >= 0) & (req_state >= 0)
             depth = d + 1
@@ -57,20 +58,21 @@ def compact_tree_kv_slots_triton(
     dst_slots,
     block_size: int,
 ) -> None:
-    num_reqs, spec_len = path_node_ids.shape
+    path = path_node_ids.contiguous()
+    num_reqs, spec_len = path.shape
     vec = get_vectorcore_num()
     grid = min(max(num_reqs, 1), max(vec, 1))
     compact_tree_kv_slots_kernel[(grid,)](
         block_table,
         num_computed,
         idx_mapping,
-        path_node_ids,
+        path,
         src_slots,
         dst_slots,
         num_reqs,
         spec_len,
         block_size,
         block_table.stride(0),
-        path_node_ids.stride(0),
+        path.stride(0),
         src_slots.stride(0),
     )

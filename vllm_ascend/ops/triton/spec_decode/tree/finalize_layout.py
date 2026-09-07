@@ -64,22 +64,25 @@ def finalize_tree_layout_triton(
 ) -> None:
     import torch
 
-    num_reqs = parent_ids.shape[0]
+    # Pointers and strides must refer to the same storage. Do not
+    # ``.contiguous()`` the in-place outputs (would drop writes on a copy).
+    par = parent_ids.contiguous().to(torch.long)
+    vis = visibility.view(torch.int8) if visibility.dtype == torch.bool else visibility
+    num_reqs = par.shape[0]
     budget = visibility.shape[1]
-    vis_i8 = visibility.view(torch.int8) if visibility.dtype == torch.bool else visibility
     vec = get_vectorcore_num()
     grid = min(max(num_reqs, 1), max(vec, 1))
     finalize_tree_layout_kernel[(grid,)](
-        parent_ids.contiguous().to(torch.long),
-        first_child.contiguous(),
-        next_sibling.contiguous(),
-        vis_i8.contiguous(),
+        par,
+        first_child,
+        next_sibling,
+        vis,
         num_reqs,
-        parent_ids.stride(0),
+        par.stride(0),
         first_child.stride(0),
         next_sibling.stride(0),
-        vis_i8.stride(0),
-        vis_i8.stride(1),
+        vis.stride(0),
+        vis.stride(1),
         NUM_NODES=num_nodes,
         BUDGET=budget,
     )

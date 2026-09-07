@@ -78,6 +78,22 @@ class AscendModelState(DefaultModelState):
             if self.pcp_manager is not None
             else None
         )
+        tree_visibility = input_batch.tree_visibility
+        # Dummy batch has no tree; capture still needs the 4D tree mask topology.
+        if (
+            for_capture
+            and tree_visibility is None
+            and dflash_tree_spec_enabled(self.vllm_config)
+        ):
+            from vllm_ascend.ascend_config import get_ascend_config
+            from vllm_ascend.attention.attention_mask import _dummy_tree_visibility
+
+            tree_visibility = _dummy_tree_visibility(
+                num_reqs,
+                self.device,
+                budget=get_ascend_config().tree_spec_config.budget,
+            )
+
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.attn_metadata = build_attn_metadata(
@@ -103,7 +119,7 @@ class AscendModelState(DefaultModelState):
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,
-            tree_visibility=input_batch.tree_visibility
+            tree_visibility=tree_visibility
         )
         return self.attn_metadata
 

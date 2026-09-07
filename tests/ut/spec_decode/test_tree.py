@@ -416,6 +416,8 @@ def test_prefix_domino_shift_label_samples_bonus_hidden() -> None:
             self.num_query_per_req = 1 + num_spec
             self.use_local_argmax_reduction = False
             self.draft_tokens = torch.zeros(2, num_spec, dtype=torch.long)
+            self.hidden_size = 4
+            self.dtype = torch.float32
 
         tree_cfg = SimpleNamespace(
             method=method,

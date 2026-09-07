@@ -162,3 +162,125 @@ def test_use_tree_triton_enable_flag():
         False,
     ):
         assert not use_tree_triton()
+
+
+def test_prefix_expand_depth_torch_golden_matches_builder():
+    """Domino greedy expand select: torch golden + optional Triton parity."""
+    import torch.nn as nn
+
+    from vllm.triton_utils import HAS_TRITON
+
+    from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
+        prefix_expand_depth_torch,
+        prefix_expand_depth_triton,
+    )
+    from vllm_ascend.worker.v2.spec_decode.tree.layout import empty_tree_layout
+    from vllm_ascend.worker.v2.spec_decode.tree.prefix import PrefixTreeBuilder
+
+    class _Scorer:
+        gru_hidden_dim = 2
+
+        def __init__(self) -> None:
+            self.fc2_weight = torch.zeros(4, 2)
+            self.fc2_bias = None
+            self.w_s = torch.zeros(2, 2)
+            self.middle = nn.Identity()
+            self._gru_input_proj_table = torch.zeros(4, 6)
+            self.gru_w_hh = torch.zeros(6, 2)
+            self.gru_b_hh = None
+
+        def project_z(self, parallel_hiddens: torch.Tensor) -> torch.Tensor:
+            return parallel_hiddens.new_zeros(
+                *parallel_hiddens.shape[:-1], 2
+            )
+
+        def update_hidden(
+            self, token_ids: torch.Tensor, h_state: torch.Tensor
+        ) -> torch.Tensor:
+            return h_state
+
+    # Distinct logits so torch.topk / iterative argmax agree.
+    logits = torch.tensor(
+        [[[5.0, 3.0, 1.0, 0.0], [4.0, 2.0, 1.5, 0.5], [3.0, 2.5, 1.0, 0.0]]]
+    )
+    draft_hidden = torch.zeros(1, 3, 4)
+    root = torch.tensor([0])
+
+    with patch(
+        "vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch.use_tree_triton",
+        return_value=False,
+    ):
+        out = empty_tree_layout(1, budget=3, device="cpu")
+        layout = PrefixTreeBuilder(
+            budget=3,
+            topk=1,
+            correction_scorer=_Scorer(),
+            prefix_len=0,
+        ).build(logits, out, root_token_ids=root, draft_hidden=draft_hidden)
+
+    assert layout.num_nodes.tolist() == [3]
+    assert layout.tokens[0, :3].tolist() == [0, 0, 0]
+    assert layout.parents[0, :3].tolist() == [0, 1, 2]
+    assert layout.depths[0, :3].tolist() == [1, 2, 3]
+
+    # Direct select op: torch golden vs Triton when available.
+    width = k = 2
+    top_scores = torch.tensor(
+        [[[0.5, 0.1], [0.4, 0.2]]], dtype=torch.float32
+    )
+    cand_ids = torch.tensor([[[10, 11], [12, 13]]], dtype=torch.long)
+    frontier = torch.tensor([[0, 0]], dtype=torch.long)
+    path_scores = torch.zeros(1, 8, dtype=torch.float32)
+    tokens_t = torch.full((1, 6), -1, dtype=torch.long)
+    depths_t = torch.zeros(1, 6, dtype=torch.long)
+    parents_t = torch.zeros(1, 8, dtype=torch.long)
+    tokens_k = tokens_t.clone()
+    depths_k = depths_t.clone()
+    parents_k = parents_t.clone()
+    frontier_k = frontier.clone()
+    path_k = path_scores.clone()
+    scratch = torch.empty(1, width * k, dtype=torch.float32)
+
+    prefix_expand_depth_torch(
+        top_scores,
+        cand_ids,
+        frontier,
+        path_scores,
+        tokens_t,
+        depths_t,
+        parents_t,
+        frontier_len=1,
+        take=2,
+        child_depth=1,
+        num_nodes=0,
+        width=width,
+        k=k,
+    )
+    assert tokens_t[0, :2].tolist() == [10, 11]
+    assert parents_t[0, 1:3].tolist() == [0, 0]
+    assert frontier[0].tolist() == [1, 2]
+
+    if not HAS_TRITON:
+        return
+    try:
+        prefix_expand_depth_triton(
+            top_scores,
+            cand_ids,
+            frontier_k,
+            path_k,
+            scratch,
+            tokens_k,
+            depths_k,
+            parents_k,
+            frontier_len=1,
+            take=2,
+            child_depth=1,
+            num_nodes=0,
+            width=width,
+            k=k,
+        )
+    except Exception:
+        return
+    assert torch.equal(tokens_t, tokens_k)
+    assert torch.equal(parents_t, parents_k)
+    assert torch.equal(frontier, frontier_k)

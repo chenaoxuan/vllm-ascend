@@ -42,6 +42,19 @@ class TreeLayout:
 _scatter_node_id_buf: torch.Tensor | None = None
 
 
+def ensure_finalize_scratch(num_reqs: int, device: torch.device) -> None:
+    """Pre-size the finalize scatter buffer so ACLGraph capture does not grow it."""
+    global _scatter_node_id_buf
+    if (
+        _scatter_node_id_buf is None
+        or _scatter_node_id_buf.shape[0] < num_reqs
+        or _scatter_node_id_buf.device != device
+    ):
+        _scatter_node_id_buf = torch.empty(
+            (num_reqs, 1), dtype=torch.int32, device=device
+        )
+
+
 def empty_tree_layout(
     num_reqs: int,
     budget: int,
@@ -71,6 +84,7 @@ def finalize_tree_layout(
     depths: torch.Tensor,
     parent_ids: torch.Tensor,
     num_nodes: int,
+    force_torch: bool = False,
 ) -> TreeLayout:
     """Write selected nodes into ``out`` and fill sibling links + visibility.
 
@@ -80,10 +94,11 @@ def finalize_tree_layout(
         depths: [R, num_nodes] depths (from 1).
         parent_ids: [R, num_nodes] parent node ids (0 = root).
         num_nodes: number of non-root nodes (same for every request in the batch).
+        force_torch: skip Triton (ACLGraph capture cannot use that kernel).
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
-    if use_tree_triton():
+    if not force_torch and use_tree_triton():
         return _finalize_tree_layout_triton(
             out, tokens, depths, parent_ids, num_nodes
         )

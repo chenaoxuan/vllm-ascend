@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -139,6 +141,7 @@ def _scatter_parent_proposal(
     """Write ``full_logits[r, j]`` into ``proposal_logits[r, parent_ids[r, j]]``.
 
     Proposal buffers are FP32 (NPU IndexPut does not accept BF16 selfRef).
+    Same-layer ``parent_ids`` are unique per request (invalid slots masked).
     """
     num_reqs, width, _vocab = full_logits.shape
     device = full_logits.device
@@ -147,14 +150,14 @@ def _scatter_parent_proposal(
         req_idx = torch.arange(num_reqs, device=device)
     else:
         req_idx = req_idx[:num_reqs]
-    for j in range(width):
-        write = valid_parent[:, j]
-        pid = parent_ids[:, j].clamp(min=0, max=proposal_logits.shape[1] - 1)
-        proposal_logits[req_idx, pid] = torch.where(
-            write.unsqueeze(-1),
-            full_logits[:, j],
-            proposal_logits[req_idx, pid],
-        )
+    req = req_idx.unsqueeze(1).expand(-1, width)
+    pid = parent_ids.clamp(min=0, max=proposal_logits.shape[1] - 1)
+    existing = proposal_logits[req, pid]
+    proposal_logits[req, pid] = torch.where(
+        valid_parent.unsqueeze(-1),
+        full_logits,
+        existing,
+    )
 
 
 def expand_prefix_layer(
@@ -170,17 +173,19 @@ def expand_prefix_layer(
     live: int,
     num_nodes: int,
     child_depth: int,
+    force_torch: bool = False,
 ) -> torch.Tensor:
     """Select ``width`` children for one expand layer and write node slices.
 
     ``live`` / ``num_nodes`` / ``child_depth`` are host ints (from depth).
     ``parent_pos`` is a device ``[R, width]`` output (GRU gather index).
+    ``force_torch`` skips Triton (ACLGraph capture cannot use that kernel).
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
         use_tree_triton,
     )
 
-    if use_tree_triton():
+    if not force_torch and use_tree_triton():
         return _expand_prefix_layer_triton(
             top_scores,
             cand_ids,
@@ -206,6 +211,7 @@ def expand_prefix_layer(
         live=live,
         num_nodes=num_nodes,
         child_depth=child_depth,
+        timed=not force_torch,
     )
 
 
@@ -258,10 +264,12 @@ def _expand_prefix_layer_torch(
     live: int,
     num_nodes: int,
     child_depth: int,
+    timed: bool = True,
 ) -> torch.Tensor:
     from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
 
-    with tree_time_accum("build_expand_select"):
+    ctx = tree_time_accum("build_expand_select") if timed else nullcontext()
+    with ctx:
         num_reqs, width, _ = top_scores.shape
         if live < width:
             valid_parent = torch.arange(width, device=top_scores.device) < live
@@ -334,6 +342,11 @@ class PrefixTreeBuilder(TreeBuilder):
         self._width_arange: torch.Tensor | None = None
         self._node_arange: torch.Tensor | None = None
         self._budget_ids: torch.Tensor | None = None
+        self._scratch_frozen = False
+
+    def freeze_scratch(self) -> None:
+        """Stop reallocating scratch after ACLGraph capture."""
+        self._scratch_frozen = True
 
     def _ensure_scratch(
         self,
@@ -346,6 +359,8 @@ class PrefixTreeBuilder(TreeBuilder):
         gru_hidden_dim: int = 0,
         dtype: torch.dtype = torch.float32,
     ) -> None:
+        if self._scratch_frozen:
+            return
         grow = (
             self._tokens_buf is None
             or num_reqs > self._scratch_reqs
@@ -413,7 +428,9 @@ class PrefixTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> TreeLayout:
+        """Expand logits into ``out``. ``graph_safe`` uses torch ops and skips timers."""
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
         tokens, depths, parent_ids, num_nodes = self._build_impl(
@@ -422,9 +439,20 @@ class PrefixTreeBuilder(TreeBuilder):
             root_token_ids=root_token_ids,
             draft_hidden=draft_hidden,
             proposal_logits=proposal_logits,
+            graph_safe=graph_safe,
         )
-        with tree_time("build_finalize_layout"):
-            return finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+        layout_ctx = (
+            nullcontext() if graph_safe else tree_time("build_finalize_layout")
+        )
+        with layout_ctx:
+            return finalize_tree_layout(
+                out,
+                tokens,
+                depths,
+                parent_ids,
+                num_nodes,
+                force_torch=graph_safe,
+            )
 
     def _build_impl(
         self,
@@ -434,12 +462,14 @@ class PrefixTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         return self._build_impl_torch(
             draft_logits,
             root_token_ids=root_token_ids,
             draft_hidden=draft_hidden,
             proposal_logits=proposal_logits,
+            graph_safe=graph_safe,
         )
 
     def _finalize_nodes(
@@ -499,12 +529,19 @@ class PrefixTreeBuilder(TreeBuilder):
         root_token_ids: torch.Tensor | None = None,
         draft_hidden: torch.Tensor | None = None,
         proposal_logits: torch.Tensor | None = None,
+        graph_safe: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         from vllm_ascend.worker.v2.spec_decode.tree.timer import (
             tree_time,
             tree_time_accum,
             tree_time_accum_flush,
         )
+
+        def _noop_timer(_segment: str):
+            return nullcontext()
+
+        tick = _noop_timer if graph_safe else tree_time
+        accum = _noop_timer if graph_safe else tree_time_accum
 
         budget = self.budget
         topk = self.topk
@@ -524,7 +561,7 @@ class PrefixTreeBuilder(TreeBuilder):
             correction_scorer.gru_hidden_dim if with_correction else 0
         )
 
-        with tree_time("build_precompute"):
+        with tick("build_precompute"):
             self._ensure_scratch(
                 num_reqs,
                 vocab,
@@ -596,7 +633,7 @@ class PrefixTreeBuilder(TreeBuilder):
             valid_parent = width_arange[None, :] < live
             start = num_nodes + 1
 
-            with tree_time_accum("build_expand_score"):
+            with accum("build_expand_score"):
                 if with_correction:
                     if depth_slot < prefix_len:
                         # Needed later by build_expand_gru; not Domino-scored.
@@ -692,6 +729,7 @@ class PrefixTreeBuilder(TreeBuilder):
                 live=live,
                 num_nodes=num_nodes,
                 child_depth=child_depth,
+                force_torch=graph_safe,
             )
             frontier = (
                 self._node_arange[start : start + width]
@@ -700,7 +738,7 @@ class PrefixTreeBuilder(TreeBuilder):
             )
 
             if with_correction:
-                with tree_time_accum("build_expand_gru"):
+                with accum("build_expand_gru"):
                     parent_hidden_sel = parent_hidden.gather(
                         1,
                         parent_pos.unsqueeze(-1).expand(-1, -1, gru_hidden_dim),
@@ -713,8 +751,9 @@ class PrefixTreeBuilder(TreeBuilder):
 
             num_nodes += width
 
-        tree_time_accum_flush()
-        with tree_time("build_prune"):
+        if not graph_safe:
+            tree_time_accum_flush()
+        with tick("build_prune"):
             return self._finalize_nodes(
                 tokens,
                 depths,

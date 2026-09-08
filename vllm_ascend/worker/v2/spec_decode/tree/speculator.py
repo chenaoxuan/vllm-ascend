@@ -180,6 +180,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             use_tree_triton,
         )
 
+        self._prefix_graphs: dict[int, Any] = {}
         timer_backend = "triton" if use_tree_triton() else "torch"
         configure_tree_timer(
             enabled=bool(tree_cfg.enable_timer),
@@ -302,7 +303,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             mm_inputs,
             is_profile=is_profile,
         )
-        # FULL replay only runs draft forward; build the tree afterwards.
+        # FULL replay only runs draft forward; prefix may replay a second graph.
         if not dummy_run:
             self._finalize_tree(input_batch.num_reqs)
         return tokens
@@ -322,6 +323,102 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+        self._capture_prefix_graphs()
+
+    def _draft_capture_num_reqs(self) -> list[int]:
+        manager = self.query_cudagraph_manager
+        if manager is None:
+            return []
+        seen: set[int] = set()
+        qlen = max(int(self.num_query_per_req), 1)
+        for descs in manager._capture_descs.values():
+            for desc in descs:
+                n = desc.num_reqs
+                if not n:
+                    n = desc.num_tokens // qlen
+                if n:
+                    seen.add(int(n))
+        return sorted(seen)
+
+    def _prepare_prefix_graph_scratch(self) -> None:
+        from vllm_ascend.worker.v2.spec_decode.tree.layout import (
+            ensure_finalize_scratch,
+        )
+
+        gru_hidden_dim = 0
+        if self._domino_scorer is not None:
+            gru_hidden_dim = self._domino_scorer.gru_hidden_dim
+        self.tree_builder._ensure_scratch(
+            self.max_num_reqs,
+            self.vocab_size,
+            self.num_speculative_steps,
+            self.device,
+            need_proposal=self.tree_proposal_logits is not None,
+            gru_hidden_dim=gru_hidden_dim,
+            dtype=self.dtype,
+        )
+        self.tree_builder.freeze_scratch()
+        ensure_finalize_scratch(self.max_num_reqs, self.device)
+
+    def _run_prefix_finalize(self, num_reqs: int, *, graph_safe: bool) -> None:
+        """compute_logits + prefix build; captured as one NPUGraph per num_reqs."""
+        hidden = self._draft_hidden_buf
+        num_sample = num_reqs * self.num_speculative_steps
+        sample_hidden_states = hidden[self.sample_indices[:num_sample]]
+        logits = self.model.compute_logits(sample_hidden_states)
+        logits = logits.view(num_reqs, self.num_speculative_steps, -1)
+        layout = self._load_layout_from_buffers(num_reqs)
+        nqp = self.num_query_per_req
+        root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
+            num_reqs, nqp
+        )[:, 0]
+        proposal = None
+        if self.tree_proposal_logits is not None:
+            proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
+        self.tree = self.tree_builder.build(
+            logits,
+            layout,
+            root_token_ids=root_token_ids,
+            draft_hidden=sample_hidden_states.view(
+                num_reqs, self.num_speculative_steps, -1
+            ),
+            proposal_logits=proposal,
+            graph_safe=graph_safe,
+        )
+
+    def _capture_prefix_graphs(self) -> None:
+        if self.method != "prefix" or self.tree_builder is None:
+            return
+        manager = self.query_cudagraph_manager
+        if manager is None or not manager.needs_capture():
+            return
+        sizes = self._draft_capture_num_reqs()
+        if not sizes:
+            return
+        if not hasattr(torch, "npu") or not hasattr(torch.npu, "NPUGraph"):
+            return
+        from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
+        from vllm.platforms import current_platform
+
+        self._prepare_prefix_graph_scratch()
+        pool = current_platform.get_global_graph_pool()
+        for num_reqs in sizes:
+            try:
+                validate_cudagraph_capturing_enabled()
+                with torch.inference_mode():
+                    self._run_prefix_finalize(num_reqs, graph_safe=True)
+                    graph = torch.npu.NPUGraph()
+                    with torch.npu.graph(graph, pool=pool):
+                        self._run_prefix_finalize(num_reqs, graph_safe=True)
+                self._prefix_graphs[num_reqs] = graph
+                logger.info("Captured prefix tree ACLGraph num_reqs=%s", num_reqs)
+            except Exception as exc:
+                logger.warning(
+                    "Prefix tree ACLGraph capture failed for num_reqs=%s; "
+                    "eager fallback for this size. %s",
+                    num_reqs,
+                    exc,
+                )
 
     def _run_draft_forward(
         self,
@@ -332,7 +429,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        """Draft model forward only; tree build stays outside ACLGraph."""
+        """Draft model forward only; prefix tree uses a separate ACLGraph."""
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
         with tree_time("draft_model_forward"):
@@ -350,6 +447,17 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if self.tree_builder is None or self._tree_finalized:
             return
         from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        if self.method == "prefix":
+            graph = self._prefix_graphs.get(num_reqs)
+            if graph is not None:
+                graph.replay()
+                self.tree = self._load_layout_from_buffers(num_reqs)
+                self._tree_finalized = True
+                return
+            self._run_prefix_finalize(num_reqs, graph_safe=False)
+            self._tree_finalized = True
+            return
 
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
@@ -374,11 +482,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             ),
             proposal_logits=proposal,
         )
-        if self.method == "prefix":
+        with tree_time("build_draft_tree"):
             self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
-        else:
-            with tree_time("build_draft_tree"):
-                self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
         self._tree_finalized = True
 
     def _generate_draft(

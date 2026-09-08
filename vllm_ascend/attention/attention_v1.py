@@ -1184,6 +1184,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_mask, batch_size, q_len
         )
 
+    @staticmethod
+    def _tree_fia_bsnd_shape(
+        num_tokens: int, num_decodes: int
+    ) -> tuple[int, int] | None:
+        """BSND batch for tree verify: prefer ``1+budget`` so multi-size dummy
+        / TND query_start_loc pad does not fall through to TND+sparse_mode=0.
+        That path treats the mask as splitfuse and requires sparse 3/4.
+        """
+        tree_q = 1 + get_ascend_config().tree_spec_config.budget
+        if tree_q > 0 and num_tokens >= tree_q and num_tokens % tree_q == 0:
+            n_dec = num_tokens // tree_q
+            if n_dec > 0:
+                return n_dec, tree_q
+        if num_decodes > 0 and num_tokens % num_decodes == 0:
+            return num_decodes, num_tokens // num_decodes
+        return None
+
     def _tree_decode_fia_eligible(self, attn_metadata: AscendMetadata) -> bool:
         mask = attn_metadata.attn_mask
         return (
@@ -1210,10 +1227,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
             key, value, attn_metadata
         )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
-        num_decodes = attn_metadata.num_decodes
-        q_len = num_tokens // num_decodes
-        fia_query = query[:num_tokens].view(num_decodes, q_len, self.num_heads, self.head_size)
-        fia_output = output[:num_tokens].view(num_decodes, q_len, self.num_heads, self.head_size)
+        bsnd = self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes)
+        if bsnd is None:
+            return self.full_graph_fia(query, key, value, attn_metadata, output)
+        num_decodes, q_len = bsnd
+        fia_query = query[: num_decodes * q_len].view(
+            num_decodes, q_len, self.num_heads, self.head_size
+        )
+        fia_output = output[: num_decodes * q_len].view(
+            num_decodes, q_len, self.num_heads, self.head_size
+        )
         actual_seq_lengths_q = [q_len] * num_decodes
         if isinstance(actual_seq_lengths_kv, torch.Tensor):
             actual_seq_lengths_kv = actual_seq_lengths_kv[:num_decodes]
@@ -1767,30 +1790,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
         num_tokens: int,
         num_decodes: int,
     ) -> torch.Tensor:
-        use_bsnd = (
-            block_table is not None
-            and num_decodes > 0
-            and num_tokens % num_decodes == 0
-        )
+        bsnd = self._tree_fia_bsnd_shape(num_tokens, num_decodes)
+        use_bsnd = block_table is not None and bsnd is not None
         if use_bsnd:
-            q_len = num_tokens // num_decodes
-            fia_query = query[:num_tokens].view(num_decodes, q_len, self.num_heads, self.head_size)
+            num_decodes, q_len = bsnd
+            fia_query = query[: num_decodes * q_len].view(
+                num_decodes, q_len, self.num_heads, self.head_size
+            )
             input_layout = "BSND"
             actual_seq_q = [q_len] * num_decodes
+            sparse_mode = 0
         else:
             fia_query = query[:num_tokens]
             input_layout = "TND"
             actual_seq_q = attn_metadata.actual_seq_lengths_q[:num_decodes]
+            q_len = None
+            # TND + custom mask is splitfuse; FIA requires sparse 3/4.
+            sparse_mode = 3
+            attn_mask = AttentionMaskBuilder(fia_query.device).get_splitfuse_attn_mask()
         if isinstance(actual_seq_lengths_kv, torch.Tensor):
             kv_lens = actual_seq_lengths_kv[:num_decodes].tolist()
         else:
             kv_lens = list(actual_seq_lengths_kv[:num_decodes])
         bt = block_table[:num_decodes] if block_table is not None else None
-        attn_mask = self._bsnd_tree_attn_mask(
-            attn_metadata.attn_mask,
-            fia_query.shape[0] if use_bsnd else num_decodes,
-            q_len if use_bsnd else None,
-        )
+        if use_bsnd:
+            attn_mask = self._bsnd_tree_attn_mask(
+                attn_metadata.attn_mask,
+                num_decodes,
+                q_len,
+            )
         attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
             query=fia_query,
             key=key,
@@ -1811,7 +1839,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             current_value=current_value,
             attn_metadata=attn_metadata,
             is_prefill_no_cache=False,
-            sparse_mode=0,
+            sparse_mode=sparse_mode,
         )
         return attn_output.reshape(num_tokens, self.num_heads, self.head_size)
 

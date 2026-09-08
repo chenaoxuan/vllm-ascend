@@ -5,6 +5,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.logger import logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import (  # type: ignore[import-not-found]
@@ -21,6 +22,30 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_sizes, model_capture_wrapper
 from vllm_ascend.worker.v2.utils import communicator_switch
+
+
+def merge_draft_aclgraph_capture_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+    max_num_reqs: int,
+    max_cudagraph_capture_size: int | None,
+) -> list[int]:
+    """Add ``k * decode_query_len`` gears the shared capture list may omit.
+
+    Target verify uses ``1+budget`` (e.g. 49) while DFlash/Domino draft uses
+    ``num_query_per_req`` (16 with shift_label, else ``1+spec``). Upstream
+    rounds each shared size up to ``decode_query_len`` and drops anything
+    that needs more than ``max_num_seqs`` requests, so ``[17, 49]`` with
+    query length 16 and ``max_num_seqs=1`` captures no draft graph.
+    """
+    extra: list[int] = []
+    if decode_query_len > 0 and max_cudagraph_capture_size is not None:
+        extra = [
+            decode_query_len * k
+            for k in range(1, max_num_reqs + 1)
+            if decode_query_len * k <= max_cudagraph_capture_size
+        ]
+    return sorted(set(list(capture_sizes or []) + extra))
 
 
 class DFlashAclGraphManager(DFlashCudaGraphManager):
@@ -47,12 +72,30 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # speculative decoding), so derive them from the capture descriptors
         # instead of the raw config sizes.
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
+        logger.info(
+            "Draft ACLGraph sizes=%s decode_query_len=%s",
+            self.capture_sizes,
+            decode_query_len,
+        )
         # DFlash's parallel drafting forward has its own dedicated draft graph
         # path, independent of Eagle's prefill/decode split, so it always uses
         # the default draft params bucket (is_draft_model_prefill stays False in
         # both capture and replay to keep them consistent).
         if super().needs_capture():
             set_draft_graph_params(self.capture_sizes)
+
+    def _init_candidates(self) -> None:
+        orig = self.compilation_config.cudagraph_capture_sizes
+        self.compilation_config.cudagraph_capture_sizes = merge_draft_aclgraph_capture_sizes(
+            orig,
+            self.decode_query_len,
+            self.max_num_reqs,
+            self.compilation_config.max_cudagraph_capture_size,
+        )
+        try:
+            super()._init_candidates()
+        finally:
+            self.compilation_config.cudagraph_capture_sizes = orig
 
     def capture(
         self,

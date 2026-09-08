@@ -281,6 +281,7 @@ def build_attn_metadata(
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             tree_visibility=tree_visibility,
+            for_cudagraph_capture=for_cudagraph_capture,
             **common_attn_metadata_extra_kwargs,
         )
 

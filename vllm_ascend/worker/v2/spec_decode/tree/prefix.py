@@ -113,28 +113,19 @@ def _prefix_corrected_candidates(
     ``candidate_logits`` is ``[R, width, C]`` over the base top-C set (the
     actual Domino proposal before the width×k top cut).
     """
-    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
-
-    with tree_time_accum("build_score_linear"):
-        s_proj = F.linear(parent_hidden, scorer.w_s, None)
-    with tree_time_accum("build_score_middle"):
-        mid = scorer.middle(z.unsqueeze(1) + s_proj)
-    with tree_time_accum("build_score_einsum"):
-        bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)
-        if candidate_bias is not None:
-            bias = bias + candidate_bias.unsqueeze(1)
-    with tree_time_accum("build_score_logits"):
-        candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias
-        candidate_logits = candidate_logits.float()
-    with tree_time_accum("build_score_topk"):
-        top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
-    with tree_time_accum("build_score_logsumexp"):
-        log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)
-        top_scores = top_vals - log_z
-    with tree_time_accum("build_score_id_gather"):
-        width = parent_hidden.size(1)
-        cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
-        sel_ids = torch.gather(cand_ids, 2, top_ids)
+    s_proj = F.linear(parent_hidden, scorer.w_s, None)
+    mid = scorer.middle(z.unsqueeze(1) + s_proj)
+    bias = torch.einsum("rwm,rcm->rwc", mid, candidate_weight)
+    if candidate_bias is not None:
+        bias = bias + candidate_bias.unsqueeze(1)
+    candidate_logits = candidate_vals.unsqueeze(1).to(bias.dtype) + bias
+    candidate_logits = candidate_logits.float()
+    top_vals, top_ids = torch.topk(candidate_logits, k=k, dim=-1)
+    log_z = torch.logsumexp(candidate_logits, dim=-1, keepdim=True)
+    top_scores = top_vals - log_z
+    width = parent_hidden.size(1)
+    cand_ids = candidate_ids.unsqueeze(1).expand(-1, width, -1)
+    sel_ids = torch.gather(cand_ids, 2, top_ids)
     return top_scores, sel_ids, candidate_logits
 
 
@@ -633,14 +624,13 @@ class PrefixTreeBuilder(TreeBuilder):
                                 req_idx=req_idx,
                             )
                     else:
-                        with tree_time_accum("build_score_gather"):
-                            parent_hidden = torch.gather(
-                                hidden_states,
-                                1,
-                                frontier.unsqueeze(-1).expand(
-                                    -1, -1, gru_hidden_dim
-                                ),
-                            )
+                        parent_hidden = torch.gather(
+                            hidden_states,
+                            1,
+                            frontier.unsqueeze(-1).expand(
+                                -1, -1, gru_hidden_dim
+                            ),
+                        )
                         top_scores, cand_ids, cand_logits = (
                             _prefix_corrected_candidates(
                                 correction_scorer,

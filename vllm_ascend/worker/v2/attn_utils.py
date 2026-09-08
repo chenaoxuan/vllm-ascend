@@ -254,6 +254,7 @@ def build_attn_metadata(
             max_seq_len=max_seq_len,
             causal=group_causal,
             tree_visibility=tree_visibility,
+            for_cudagraph_capture=for_cudagraph_capture,
             **common_attn_metadata_extra_kwargs,
         )
 

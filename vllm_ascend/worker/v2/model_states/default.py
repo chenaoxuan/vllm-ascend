@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.attention.attention_mask import dummy_tree_mask_for_capture
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
@@ -79,11 +80,13 @@ class AscendModelState(DefaultModelState):
             else None
         )
         tree_visibility = input_batch.tree_visibility
-        # Dummy batch has no tree; capture still needs the 4D tree mask topology.
+        # Dummy batch has no tree. Only tree-verify gears (k × 1+budget) need
+        # the 4D mask; mixed capture sizes must keep 2D splitfuse.
         if (
             for_capture
             and tree_visibility is None
             and dflash_tree_spec_enabled(self.vllm_config)
+            and dummy_tree_mask_for_capture(num_input_tokens, num_reqs)
         ):
             from vllm_ascend.ascend_config import get_ascend_config
             from vllm_ascend.attention.attention_mask import _dummy_tree_visibility

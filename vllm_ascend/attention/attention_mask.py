@@ -81,6 +81,36 @@ def _dummy_tree_visibility(
     return vis.unsqueeze(0).expand(num_decode, -1, -1).contiguous()
 
 
+def tree_fia_bsnd_shape(num_tokens: int) -> tuple[int, int] | None:
+    """``(num_decode, 1+budget)`` when the batch is tree-verify shaped."""
+    tree_q = _tree_query_len()
+    if tree_q is None or tree_q <= 0 or num_tokens < tree_q or num_tokens % tree_q != 0:
+        return None
+    n_dec = num_tokens // tree_q
+    if n_dec <= 0:
+        return None
+    return n_dec, tree_q
+
+
+def dummy_tree_mask_for_capture(num_tokens: int, num_reqs: int) -> bool:
+    """Dummy FULL capture only needs the 4D tree mask for ``k × (1+budget)``."""
+    bsnd = tree_fia_bsnd_shape(num_tokens)
+    return bsnd is not None and bsnd[0] == num_reqs
+
+
+def _seq_lens_are_tree_query(
+    seq_lens: torch.Tensor | None, num_decode: int
+) -> bool:
+    """Dummy FULL capture sets seq_len == query_len; tree verify is 1+budget."""
+    tree_q = _tree_query_len()
+    if tree_q is None or seq_lens is None or num_decode <= 0:
+        return False
+    sl = seq_lens[:num_decode]
+    if sl.numel() != num_decode or sl.device.type != "cpu":
+        return False
+    return all(v == tree_q for v in sl.tolist())
+
+
 def _need_dummy_tree_mask_for_capture() -> bool:
     """Target FULL capture only; draft decode must keep its own FIA mask."""
     from vllm.forward_context import is_forward_context_available
@@ -198,7 +228,9 @@ class AttentionMaskBuilder:
                            model_config: ModelConfig,
                            tree_visibility: torch.Tensor | None = None,
                            seq_lens: torch.Tensor | None = None,
-                           num_decode: int = 0
+                           num_decode: int = 0,
+                           num_tokens: int = 0,
+                           for_capture: bool = False,
                            ):
         if not causal:
             # FIA applies any provided mask as defaultMask (sparse_mode=0),
@@ -210,9 +242,26 @@ class AttentionMaskBuilder:
             return None
 
         if num_decode > 0:
-            if tree_visibility is None and _need_dummy_tree_mask_for_capture():
+            tree_shaped = (
+                num_tokens > 0 and dummy_tree_mask_for_capture(num_tokens, num_decode)
+            )
+            if (
+                tree_visibility is None
+                and (
+                    tree_shaped
+                    if for_capture
+                    else (
+                        _need_dummy_tree_mask_for_capture()
+                        and _seq_lens_are_tree_query(seq_lens, num_decode)
+                    )
+                )
+            ):
                 tree_visibility = _dummy_tree_visibility(num_decode, self.device)
             if tree_visibility is not None:
+                # Dummy FULL gears that are not k × (1+budget) must keep the
+                # 2D splitfuse mask. TND + sparse 3 rejects a 4D tree mask.
+                if for_capture and not tree_shaped:
+                    return self.get_splitfuse_attn_mask()
                 return self.get_tree_attention_mask(
                     tree_visibility, seq_lens, num_decode
                 )

@@ -19,51 +19,44 @@ def tree_attention_mask_kernel(
     stride_mask_k,
     stride_vis_r,
     stride_vis_i,
-    BLOCK_K: tl.constexpr,
 ):
-    # 2D grid: dim0 = request (grid-stride over num_mask), dim1 = query row.
-    # Each program fills one (req, q) mask row, vectorized over KV in BLOCK_K
-    # tiles. This replaces the old scalar `for q: for k:` double loop, so the
-    # long KV dimension is consumed by SIMD instead of by loop iterations --
-    # the dominant cost when batch (num_mask) grows.
-    pid_r = tl.program_id(0)
-    nprog_r = tl.num_programs(0)
-    q = tl.program_id(1)
-
-    req = pid_r
+    # Scalar q×k loop. The BLOCK_K / 2D-grid rewrite was not equivalent on
+    # Ascend (accept length dropped ~0.5): vectorized int8 where/store and
+    # SIMD gather over a tile that straddles prev do not match per-k loads.
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+    req = pid
     while req < num_mask:
         prev = tl.load(prev_kv_ptr + req)
-        row_base = mask_ptr + req * stride_mask_r + q * stride_mask_q
-        k_off = tl.arange(0, BLOCK_K)
-
-        if q == 0:
-            # First query row only attends to the committed prefix; the whole
-            # draft region stays masked. Skip the visibility gather entirely.
-            for k_blk in tl.range(0, kv_len, BLOCK_K):
-                k = k_blk + k_off
-                in_range = k < kv_len
-                masked = tl.full((BLOCK_K,), 1, tl.int8)
-                masked = tl.where(in_range & (k <= prev), 0, masked)
-                tl.store(row_base + k * stride_mask_k, masked, mask=in_range)
-        else:
-            vis_row = (
-                visibility_ptr + req * stride_vis_r + (q - 1) * stride_vis_i
-            )
-            for k_blk in tl.range(0, kv_len, BLOCK_K):
-                k = k_blk + k_off
-                in_range = k < kv_len
-                # default: masked out (1); committed prefix is visible (0).
-                masked = tl.full((BLOCK_K,), 1, tl.int8)
-                masked = tl.where(in_range & (k <= prev), 0, masked)
-                # draft region: visible iff visibility[req, q-1, draft_col] != 0.
+        for q in tl.range(0, query_len):
+            for k in tl.range(0, kv_len):
+                base = (
+                    mask_ptr
+                    + req * stride_mask_r
+                    + q * stride_mask_q
+                    + k * stride_mask_k
+                )
+                masked = tl.full((), 1, tl.int8)
+                masked = tl.where(k <= prev, 0, masked)
                 draft_col = k - (prev + 1)
-                in_draft = in_range & (k > prev) & (draft_col < max_nodes)
-                vis = tl.load(vis_row + draft_col, mask=in_draft, other=0)
+                in_draft = (
+                    (q >= 1)
+                    & (k > prev)
+                    & (draft_col >= 0)
+                    & (draft_col < max_nodes)
+                )
+                vis = tl.load(
+                    visibility_ptr
+                    + req * stride_vis_r
+                    + (q - 1) * stride_vis_i
+                    + draft_col,
+                    mask=in_draft,
+                    other=0,
+                )
                 masked = tl.where(in_draft & (vis != 0), 0, masked)
                 masked = tl.where(in_draft & (vis == 0), 1, masked)
-                tl.store(row_base + k * stride_mask_k, masked, mask=in_range)
-
-        req += nprog_r
+                tl.store(base, masked)
+        req += nprog
 
 
 def fill_tree_attention_mask_triton(
@@ -84,17 +77,8 @@ def fill_tree_attention_mask_triton(
     vis_i8 = tree_visibility.to(torch.int8).contiguous()
     prev = prev_kv_lens.to(torch.int32).contiguous()
     vec = get_vectorcore_num()
-    # dim0: grid-stride over requests (capped at vectorcore count);
-    # dim1: one program per query row for extra parallelism, which keeps the
-    # vector cores saturated as batch grows (32 -> 64) instead of serializing
-    # extra requests through the same programs.
-    grid_r = min(num_mask, vec)
-    grid_q = query_len
-    raw = kv_len
-    bk = 1 << (raw.bit_length() - 1) if raw > 0 else 256
-    block_k = min(max(bk, 128), 1024)
-
-    tree_attention_mask_kernel[(grid_r, grid_q)](
+    grid = min(max(num_mask, 1), max(vec, 1))
+    tree_attention_mask_kernel[(grid,)](
         mask_i8,
         vis_i8,
         prev,
@@ -107,5 +91,4 @@ def fill_tree_attention_mask_triton(
         mask_i8.stride(3),
         vis_i8.stride(0),
         vis_i8.stride(1),
-        BLOCK_K=block_k,
     )

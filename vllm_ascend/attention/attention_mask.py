@@ -298,14 +298,14 @@ class AttentionMaskBuilder:
         if max_caps is not None:
             query_len = max(query_len, max_caps[1])
         num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])
-        # seq_lens is CPU metadata in the attention builder.
-        kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
+        # seq_lens is host metadata (CPU). Caps already cover max_model_len.
         if max_caps is not None:
-            kv_len = max(kv_len, max_caps[2])
+            kv_len = max_caps[2]
             alloc_b = max(num_decode, max_caps[0])
             alloc_q = max(query_len, max_caps[1])
             alloc_kv = kv_len
         else:
+            kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
             alloc_b, alloc_q, alloc_kv = num_decode, query_len, kv_len
         # Paged FIA custom mask is (B, 1, Q_S, KV_S). A 3D (B, Q, Kv) tensor
         # looks like (Q, Kv) at bs=1 but shares the leading request's mask at bs>1.
@@ -333,10 +333,10 @@ class AttentionMaskBuilder:
                 fill_tree_attention_mask_triton,
             )
 
-            prev = torch.empty(num_mask, dtype=torch.int32, device=self.device)
-            for i in range(num_mask):
-                prev[i] = int(seq_lens[i]) - query_len
-            # H2D: small [num_mask] host ints for FIA mask builder.
+            prev = seq_lens[:num_mask].to(dtype=torch.int32)
+            if prev.device != self.device:
+                prev = prev.to(self.device, non_blocking=True)  # H2D
+            prev = prev - query_len
             fill_tree_attention_mask_triton(
                 mask_slice, tree_visibility[:num_mask], prev
             )

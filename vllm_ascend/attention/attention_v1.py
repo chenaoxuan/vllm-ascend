@@ -384,6 +384,11 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+        # TND: last actual_seq_q must equal the padded hidden length (queryT).
+        # A short prefill can miss the dummy qsl entry; append the graph size.
+        num_input_tokens = common_attn_metadata.num_input_tokens
+        if actual_seq_lengths_q and num_input_tokens > actual_seq_lengths_q[-1]:
+            actual_seq_lengths_q = actual_seq_lengths_q + [num_input_tokens]
         seq_lens_list = seq_lens.tolist()
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout

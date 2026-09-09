@@ -72,10 +72,6 @@ from vllm_ascend.worker.v2.spec_decode import (
 )
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
-from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
-    compact_tree_kv_along_path,
-    iter_unique_kv_cache_tensors,
-)
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -141,6 +137,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.tree_kv_compact = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -242,6 +239,16 @@ class NPUModelRunner(GPUModelRunner):
             # Wait until propose() has populated this step's draft tokens.
             self.pp_handler.broadcast_draft_tokens()
         return output
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        if dflash_tree_spec_enabled(self.vllm_config) and isinstance(
+            self.speculator, AscendTreeSpeculator
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
+
+            self.tree_kv_compact = TreeKvCompact(self)
+            self.speculator.tree_kv_compact = self.tree_kv_compact
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self), _use_ascend_pcp_manager_for_vllm_0271():
@@ -904,11 +911,11 @@ class NPUModelRunner(GPUModelRunner):
         """
         sampler = getattr(self, "rejection_sampler", None)
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
-        if path_node_ids is not None:
+        if path_node_ids is not None and self.tree_kv_compact is not None:
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
             with tree_time("compact_kv_path"):
-                self._compact_accepted_tree_kv(idx_mapping, path_node_ids)
+                self.tree_kv_compact.run(idx_mapping, path_node_ids)
             sampler.path_node_ids = None
 
         super().postprocess_sampled(
@@ -923,34 +930,6 @@ class NPUModelRunner(GPUModelRunner):
         # from num_computed_tokens_np in _update_seq_lens_cpu instead.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()
-
-    def _compact_accepted_tree_kv(self, idx_mapping, path_node_ids):
-        """Copy accepted-path KV from tree slots onto the linear prefix."""
-        ctx = self.compilation_config.static_forward_context
-        num_computed = self.req_states.num_computed_tokens.gpu
-        seen: set[int] = set()
-        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            caches: list[torch.Tensor] = []
-            for layer_name in group.layer_names:
-                layer = ctx.get(layer_name)
-                if layer is None:
-                    continue
-                for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
-                    ptr = tensor.untyped_storage().data_ptr()
-                    if ptr in seen:
-                        continue
-                    seen.add(ptr)
-                    caches.append(tensor)
-            if not caches:
-                continue
-            compact_tree_kv_along_path(
-                caches,
-                self.block_tables.block_tables[group_id].gpu,
-                self.block_tables.kernel_block_sizes[group_id],
-                idx_mapping,
-                num_computed,
-                path_node_ids,
-            )
 
     def _copy_num_computed_tokens_to_cpu(self):
         # npu attention backend still need to use seq_lens_cpu,
@@ -1014,19 +993,21 @@ class NPUModelRunner(GPUModelRunner):
         else:
             num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
-        if num_tokens_padded == num_reqs_padded * self.decode_query_len:
-            # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
-            assert num_reqs <= num_reqs_padded
-
-            last_loc = query_start_loc_np[num_reqs]
+        # Host numpy. ``last_loc`` is the real scheduled token count.
+        last_loc = int(query_start_loc_np[num_reqs])
+        uniform_actual = last_loc == num_reqs * self.decode_query_len
+        uniform_padded = num_tokens_padded == num_reqs_padded * self.decode_query_len
+        if uniform_actual and uniform_padded:
+            # Each real request has decode_query_len tokens; pad extra dummy
+            # requests at that same width (e.g. 2×17 → 3×17).
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
-                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
+                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len
+                + last_loc
             )
-        else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
-            assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
+        elif last_loc < num_tokens_padded:
+            # Short prefill (or mixed) padded to a decode-sized graph, e.g.
+            # 16 tokens → 17-token FULL gear. Treating that as uniform decode
+            # leaves actual_seq_q[-1]==16 while queryT==17 and FIA tiling dies.
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 

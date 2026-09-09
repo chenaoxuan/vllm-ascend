@@ -352,12 +352,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Prefer _seq_lens_cpu (always available, updated during draft
         # iterations) over seq_lens_cpu (None in async spec decode mode).
         if common_attn_metadata._seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
+            seq_lens_host = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+            seq_lens_host = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
-            seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+            seq_lens_host = common_attn_metadata.seq_lens[:num_reqs].to("cpu")  # D2H
 
+        seq_lens = seq_lens_host
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
@@ -369,12 +370,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         attn_state = common_attn_metadata.attn_state
 
-        # Get attn_mask from singleton AttentionMaskBuilder
+        # Tree mask builder reads seq_lens on host. parallel_drafting / cross-attn
+        # keep device ``seq_lens`` for FIA actual_seq_kvlen.
         attn_mask = self.attn_mask_builder.get_attention_mask(
             common_attn_metadata.causal,
             self.model_config,
             tree_visibility=common_attn_metadata.tree_visibility,
-            seq_lens=seq_lens,
+            seq_lens=seq_lens_host,
             num_decode=num_decodes,
             num_tokens=common_attn_metadata.num_actual_tokens,
             for_capture=common_attn_metadata.for_cudagraph_capture,

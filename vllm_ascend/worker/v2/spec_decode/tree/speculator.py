@@ -83,6 +83,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._domino_scorer = None
         self._domino_prefix_len = 0
         self._tree_finalized = True
+        self.tree_kv_compact = None
         dflash_cfg = _hf_dflash_config(draft_hf)
         self._domino_shift_label = (
             self.method == "prefix"
@@ -274,16 +275,20 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if path_node_ids is not None and not dummy_run:
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-            tensors = [last_hidden_states]
-            if aux_hidden_states:
-                tensors.extend(aux_hidden_states)
-            with tree_time("compact_query_path"):
-                compact_tree_query_along_path(
-                    tensors,
-                    input_batch.query_start_loc,
-                    path_node_ids,
-                    linearize_positions=input_batch.positions,
-                )
+            tree_q = 1 + (get_ascend_config().tree_spec_config.budget or 0)
+            # Skip when this step is not a full tree verify (e.g. 16 tokens
+            # padded to the 17-token FULL gear at max_seq_len).
+            if last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q:
+                tensors = [last_hidden_states]
+                if aux_hidden_states:
+                    tensors.extend(aux_hidden_states)
+                with tree_time("compact_query_path"):
+                    compact_tree_query_along_path(
+                        tensors,
+                        input_batch.query_start_loc,
+                        path_node_ids,
+                        linearize_positions=input_batch.positions,
+                    )
         self._tree_finalized = False
         tokens = super().propose(
             input_batch,
@@ -324,6 +329,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
         self._capture_prefix_graphs()
+        if self.tree_kv_compact is not None:
+            self.tree_kv_compact.capture(self._draft_capture_num_reqs())
 
     def _draft_capture_num_reqs(self) -> list[int]:
         manager = self.query_cudagraph_manager

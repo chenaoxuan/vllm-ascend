@@ -1,12 +1,12 @@
 import torch
 
+
 # Cached arange / column buffers keyed by device (grow on demand).
 _depth_arange: dict[torch.device, torch.Tensor] = {}
 _dst_off_arange: dict[torch.device, torch.Tensor] = {}
 _root_col: dict[torch.device, torch.Tensor] = {}
 _valid_root_col: dict[torch.device, torch.Tensor] = {}
 _token_arange: dict[torch.device, torch.Tensor] = {}
-# Growable src/dst slot buffers for the triton path, keyed by device.
 _kv_src_slots: dict[torch.device, torch.Tensor] = {}
 _kv_dst_slots: dict[torch.device, torch.Tensor] = {}
 
@@ -50,9 +50,6 @@ def compact_tree_kv_along_path(
     ``[num_reqs, spec_len]`` with ``-1`` unused. ``num_computed`` is
     ``[max_reqs]`` at the start of the verify step. All tensors are device-side
     except the Python ``block_size``.
-
-    Reads are gathered into a temporary before scatter so overlapping src/dst
-    slots (including swaps) stay correct.
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
@@ -78,14 +75,12 @@ def _compact_tree_kv_along_path_triton(
         compact_tree_kv_slots_triton,
     )
 
-    # Skip the copy when already int64+contiguous; only convert otherwise.
     if path_node_ids.dtype == torch.long and path_node_ids.is_contiguous():
         node = path_node_ids
     else:
         node = path_node_ids.to(dtype=torch.long).contiguous()
     num_reqs, spec_len = node.shape
     device = node.device
-    # Reuse growable slot buffers (keyed by device) instead of malloc per call.
     src_full = _kv_src_slots.get(device)
     dst_full = _kv_dst_slots.get(device)
     if (
@@ -115,9 +110,6 @@ def _compact_tree_kv_along_path_triton(
     for cache in caches:
         tail = cache.shape[2:]
         flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
-        # index_select returns a fresh copy (gather), so no .clone() is needed
-        # before the in-place scatter. Overlapping src/dst slots stay correct
-        # because `gathered` is an independent snapshot of the pre-scatter state.
         gathered = torch.index_select(flat, 0, src_flat).view(
             num_reqs, spec_len, *tail
         )
@@ -152,6 +144,19 @@ def compact_tree_kv_along_path_torch(
         flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
         gathered = flat[src_slots].clone()
         flat[dst_slots] = gathered
+
+
+def iter_unique_kv_cache_tensors(kv_cache) -> list[torch.Tensor]:
+    """Yield slot-major K/V tensors from a layer ``kv_cache`` binding."""
+    if kv_cache is None:
+        return []
+    if isinstance(kv_cache, (tuple, list)):
+        return [t for t in kv_cache if isinstance(t, torch.Tensor) and t.ndim >= 2]
+    if isinstance(kv_cache, torch.Tensor) and kv_cache.ndim >= 2:
+        if kv_cache.shape[0] == 2 and kv_cache.ndim >= 3:
+            return [kv_cache[0], kv_cache[1]]
+        return [kv_cache]
+    return []
 
 
 def compact_tree_query_along_path(
@@ -192,10 +197,19 @@ def compact_tree_query_along_path(
     src_off = torch.where(valid, src_off, dst_off)
     src_idx = qsl.unsqueeze(1) + src_off
     dst_idx = qsl.unsqueeze(1) + dst_off
+    # Truncated near max_seq_len can be 16 tokens on a 17-token graph while
+    # path_node_ids still hold full-tree ids (e.g. 19). Stay in-bounds.
+    n_tok = tensors[0].shape[0]
+    last = n_tok - 1
+    in_bound = (src_idx >= 0) & (src_idx <= last) & (dst_idx >= 0) & (dst_idx <= last)
+    valid = valid & in_bound
+    safe_dst = dst_idx.clamp(min=0, max=last)
+    src_idx = torch.where(valid, src_idx, safe_dst)
+    dst_idx = safe_dst
     for tensor in tensors:
         gathered = tensor[src_idx].clone()
         tensor[dst_idx] = gathered
-    base = linearize_positions[qsl].unsqueeze(1)
+    base = linearize_positions[qsl.clamp(min=0, max=last)].unsqueeze(1)
     new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
     cur = linearize_positions[dst_idx]
     linearize_positions[dst_idx] = torch.where(valid, new_pos, cur)
@@ -226,16 +240,3 @@ def mask_rejected_dflash_context_slots(
     in_req = (idx >= starts[req]) & (idx < ends[req])
     rejected = in_req & (idx >= valid_ends[req])
     context_slot_mapping.masked_fill_(rejected, pad_slot_id)
-
-
-def iter_unique_kv_cache_tensors(kv_cache) -> list[torch.Tensor]:
-    """Yield slot-major K/V tensors from a layer ``kv_cache`` binding."""
-    if kv_cache is None:
-        return []
-    if isinstance(kv_cache, (tuple, list)):
-        return [t for t in kv_cache if isinstance(t, torch.Tensor) and t.ndim >= 2]
-    if isinstance(kv_cache, torch.Tensor) and kv_cache.ndim >= 2:
-        if kv_cache.shape[0] == 2 and kv_cache.ndim >= 3:
-            return [kv_cache[0], kv_cache[1]]
-        return [kv_cache]
-    return []

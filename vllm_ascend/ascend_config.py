@@ -1074,7 +1074,7 @@ class TreeSpecConfig:
     ``magicmtp`` (MagicMTP Block Verify on the draft tree). Default ``greedy``.
 
     ``enable_triton`` (default True) runs tree hot-path Triton kernels when
-    Triton is available; set False to force torch golden paths.
+    Triton is available; set False to force torch fallbacks.
 
     Usage::
 

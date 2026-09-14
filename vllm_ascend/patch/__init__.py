@@ -1280,7 +1280,7 @@
 #       position 0). ``prepare_dflash_inputs`` is wrapped to apply
 #       ``mask_rejected_dflash_context_slots`` on the same suffix (idempotent).
 #    Test:
-#       tests/ut/spec_decode/test_tree.py::test_tree_query_compact_along_non_prefix_path
+#       None (tree spec CPU UTs removed).
 #    Related PR (if no, explain why):
 #       No. Plugin-side tree + DFlash slot layout; upstream already PADs.
 #    Future Plan:

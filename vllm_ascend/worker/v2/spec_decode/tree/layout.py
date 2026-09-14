@@ -55,29 +55,6 @@ def ensure_finalize_scratch(num_reqs: int, device: torch.device) -> None:
         )
 
 
-def empty_tree_layout(
-    num_reqs: int,
-    budget: int,
-    device: torch.device | str = "cpu",
-) -> TreeLayout:
-    """Allocate a padded TreeLayout for a builder to fill in place."""
-    return TreeLayout(
-        tokens=torch.full((num_reqs, budget), -1, dtype=torch.long, device=device),
-        depths=torch.zeros((num_reqs, budget), dtype=torch.int32, device=device),
-        parents=torch.full((num_reqs, budget), -1, dtype=torch.int32, device=device),
-        num_nodes=torch.zeros((num_reqs,), dtype=torch.int32, device=device),
-        visibility=torch.zeros(
-            (num_reqs, budget, budget), dtype=torch.bool, device=device
-        ),
-        first_child=torch.full(
-            (num_reqs, budget + 1), -1, dtype=torch.int32, device=device
-        ),
-        next_sibling=torch.full(
-            (num_reqs, budget + 1), -1, dtype=torch.int32, device=device
-        ),
-    )
-
-
 def finalize_tree_layout(
     out: TreeLayout,
     tokens: torch.Tensor,

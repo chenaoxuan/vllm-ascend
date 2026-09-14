@@ -183,39 +183,6 @@ def _prepare_tree_spec_pos_seq_lens_kernel(
         tl.store(slot_pos_ptr + start + block, slot_pos, mask=mask)
 
 
-def _prepare_tree_spec_pos_seq_lens_torch(
-    idx_mapping: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    is_prefilling: torch.Tensor,
-    num_computed_tokens: torch.Tensor,
-    tree_depths: torch.Tensor,
-    pos: torch.Tensor,
-    slot_pos: torch.Tensor,
-    seq_lens: torch.Tensor,
-) -> None:
-    """CPU reference of the tree RoPE / KV-slot fill. Host ints only."""
-    num_reqs = idx_mapping.shape[0]
-    seq_lens[num_reqs:].zero_()
-    device = pos.device
-    for req_id in range(num_reqs):
-        req_state_idx = int(idx_mapping[req_id])
-        computed = int(num_computed_tokens[req_state_idx])
-        start = int(query_start_loc[req_id])
-        end = int(query_start_loc[req_id + 1])
-        query_len = end - start
-        seq_lens[req_id] = computed + query_len
-        offsets = torch.arange(query_len, device=device, dtype=pos.dtype)
-        linear = computed + offsets
-        slot_pos[start:end] = linear
-        if int(is_prefilling[req_id]) == 1:
-            pos[start:end] = linear
-            continue
-        pos[start] = computed
-        depths = tree_depths[req_state_idx, : query_len - 1].to(dtype=pos.dtype)
-        pos[start + 1 : end] = computed + depths
-
-
-
 def prepare_tree_spec_pos_seq_lens(
     idx_mapping: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -226,20 +193,8 @@ def prepare_tree_spec_pos_seq_lens(
     slot_pos: torch.Tensor,
     seq_lens: torch.Tensor,
 ) -> None:
-    """Fill RoPE ``pos`` and unique KV ``slot_pos``. Device tensors except CPU UT."""
+    """Fill RoPE ``pos`` and unique KV ``slot_pos`` on device."""
     num_reqs = idx_mapping.shape[0]
-    if pos.device.type == "cpu":
-        _prepare_tree_spec_pos_seq_lens_torch(
-            idx_mapping,
-            query_start_loc,
-            is_prefilling,
-            num_computed_tokens,
-            tree_depths,
-            pos,
-            slot_pos,
-            seq_lens,
-        )
-        return
     _prepare_tree_spec_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
         slot_pos,

@@ -98,7 +98,7 @@ def finalize_tree_layout(
     """
     from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import use_tree_triton
 
-    if not force_torch and use_tree_triton():
+    if use_tree_triton():
         return _finalize_tree_layout_triton(
             out, tokens, depths, parent_ids, num_nodes
         )

@@ -110,7 +110,7 @@ def greedy_tree_reject_torch(
     path_node_ids: torch.Tensor,
     sampled_token_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Torch golden for greedy tree reject (UT / CPU / enable_triton=False)."""
+    """Torch fallback when tree Triton is off."""
     tokens = tree.tokens
     first_child = tree.first_child
     next_sibling = tree.next_sibling

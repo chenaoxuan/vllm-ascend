@@ -270,7 +270,7 @@ class AttentionMaskBuilder:
             return self.get_attn_mask(2048, torch.bool)
 
         return self.get_splitfuse_attn_mask()
-    
+
     def get_tree_attention_mask(self, tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
                                 num_decode):
@@ -278,81 +278,73 @@ class AttentionMaskBuilder:
             tree_time,
             tree_timer_begin_step,
         )
-
-        tree_timer_begin_step()
-        with tree_time("build_attn_mask"):
-            return self._get_tree_attention_mask_impl(
-                tree_visibility, seq_lens, num_decode
-            )
-
-    def _get_tree_attention_mask_impl(self, tree_visibility: torch.Tensor,
-                                     seq_lens: torch.Tensor,
-                                     num_decode):
         from vllm_ascend.worker.v2.spec_decode.tree.triton_dispatch import (
             use_tree_triton,
         )
 
-        max_nodes = tree_visibility.shape[-1]
-        query_len = 1 + max_nodes
-        max_caps = self._resolved_tree_caps()
-        if max_caps is not None:
-            query_len = max(query_len, max_caps[1])
-        num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])
-        # seq_lens is host metadata (CPU). Caps already cover max_model_len.
-        if max_caps is not None:
-            kv_len = max_caps[2]
-            alloc_b = max(num_decode, max_caps[0])
-            alloc_q = max(query_len, max_caps[1])
-            alloc_kv = kv_len
-        else:
-            kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
-            alloc_b, alloc_q, alloc_kv = num_decode, query_len, kv_len
-        # Paged FIA custom mask is (B, 1, Q_S, KV_S). A 3D (B, Q, Kv) tensor
-        # looks like (Q, Kv) at bs=1 but shares the leading request's mask at bs>1.
-        # Allocate once to max caps so FULL capture/replay keep a stable pointer.
-        cap_b, cap_q, cap_kv = self._tree_mask_caps
-        if (
-            self._tree_attn_mask is None
-            or alloc_b > cap_b
-            or alloc_q > cap_q
-            or alloc_kv > cap_kv
-            or self._tree_attn_mask.device != self.device
-        ):
-            self._tree_attn_mask = torch.empty(
-                alloc_b, 1, alloc_q, alloc_kv, dtype=torch.bool, device=self.device
-            )
-            self._tree_mask_caps = (alloc_b, alloc_q, alloc_kv)
-            cap_kv = alloc_kv
-        # Use the allocated KV width so graph capture binds a fixed shape.
-        attn_mask = self._tree_attn_mask[:num_decode, :, :query_len, :cap_kv]
-        # Triton needs a contiguous bool→int8 view; sliced caps (kv_len < cap)
-        # are non-contiguous and must stay on the torch path.
-        mask_slice = attn_mask[:num_mask]
-        if use_tree_triton() and mask_slice.is_contiguous():
-            from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
-                fill_tree_attention_mask_triton,
-            )
+        tree_timer_begin_step()
+        with tree_time("build_attn_mask"):
+            max_nodes = tree_visibility.shape[-1]
+            query_len = 1 + max_nodes
+            max_caps = self._resolved_tree_caps()
+            if max_caps is not None:
+                query_len = max(query_len, max_caps[1])
+            num_mask = min(num_decode, tree_visibility.shape[0], seq_lens.shape[0])
+            # seq_lens is host metadata (CPU). Caps already cover max_model_len.
+            if max_caps is not None:
+                kv_len = max_caps[2]
+                alloc_b = max(num_decode, max_caps[0])
+                alloc_q = max(query_len, max_caps[1])
+                alloc_kv = kv_len
+            else:
+                kv_len = align_up(int(seq_lens[:num_mask].max()), 128)
+                alloc_b, alloc_q, alloc_kv = num_decode, query_len, kv_len
+            # Paged FIA custom mask is (B, 1, Q_S, KV_S). A 3D (B, Q, Kv) tensor
+            # looks like (Q, Kv) at bs=1 but shares the leading request's mask at bs>1.
+            # Allocate once to max caps so FULL capture/replay keep a stable pointer.
+            cap_b, cap_q, cap_kv = self._tree_mask_caps
+            if (
+                self._tree_attn_mask is None
+                or alloc_b > cap_b
+                or alloc_q > cap_q
+                or alloc_kv > cap_kv
+                or self._tree_attn_mask.device != self.device
+            ):
+                self._tree_attn_mask = torch.empty(
+                    alloc_b, 1, alloc_q, alloc_kv, dtype=torch.bool, device=self.device
+                )
+                self._tree_mask_caps = (alloc_b, alloc_q, alloc_kv)
+                cap_kv = alloc_kv
+            # Use the allocated KV width so graph capture binds a fixed shape.
+            attn_mask = self._tree_attn_mask[:num_decode, :, :query_len, :cap_kv]
+            # Triton needs a contiguous bool→int8 view; sliced caps (kv_len < cap)
+            # are non-contiguous and must stay on the torch path.
+            mask_slice = attn_mask[:num_mask]
+            if use_tree_triton() and mask_slice.is_contiguous():
+                from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
+                    fill_tree_attention_mask_triton,
+                )
 
-            prev = seq_lens[:num_mask].to(dtype=torch.int32)
-            if prev.device != self.device:
-                prev = prev.to(self.device, non_blocking=True)  # H2D
-            prev = prev - query_len
-            fill_tree_attention_mask_triton(
-                mask_slice, tree_visibility[:num_mask], prev
-            )
-            if num_decode > num_mask:
-                attn_mask[num_mask:].fill_(True)
+                prev = seq_lens[:num_mask].to(dtype=torch.int32)
+                if prev.device != self.device:
+                    prev = prev.to(self.device, non_blocking=True)  # H2D
+                prev = prev - query_len
+                fill_tree_attention_mask_triton(
+                    mask_slice, tree_visibility[:num_mask], prev
+                )
+                if num_decode > num_mask:
+                    attn_mask[num_mask:].fill_(True)
+                self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
+                return attn_mask
+            attn_mask.fill_(True)
+            for i in range(num_mask):
+                req_mask = attn_mask[i, 0]
+                prev_kv_len = int(seq_lens[i]) - query_len
+                req_mask[:, : prev_kv_len + 1] = False
+                # tree_visibility: True = can attend; FIA bool mask: True = masked out.
+                # Draft columns are slot-indexed (contiguous j). KV slot_mapping uses
+                # unique token-index coordinates while RoPE positions stay depth-based.
+                draft_start = prev_kv_len + 1
+                req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
             self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
             return attn_mask
-        attn_mask.fill_(True)
-        for i in range(num_mask):
-            req_mask = attn_mask[i, 0]
-            prev_kv_len = int(seq_lens[i]) - query_len
-            req_mask[:, : prev_kv_len + 1] = False
-            # tree_visibility: True = can attend; FIA bool mask: True = masked out.
-            # Draft columns are slot-indexed (contiguous j). KV slot_mapping uses
-            # unique token-index coordinates while RoPE positions stay depth-based.
-            draft_start = prev_kv_len + 1
-            req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
-        self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
-        return attn_mask

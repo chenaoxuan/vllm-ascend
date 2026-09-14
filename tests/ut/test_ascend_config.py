@@ -37,7 +37,6 @@ from vllm_ascend.ascend_config import (
     SchedulerConfig,
     ShortRequestFirstConfig,
     SparseKVOffloadConfig,
-    TreeSpecConfig,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -189,14 +188,6 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.weight_nz_mode, 1)
-        self.assertFalse(ascend_config.tree_spec_config.enabled)
-        self.assertIsNone(ascend_config.tree_spec_config.method)
-        self.assertIsNone(ascend_config.tree_spec_config.budget)
-        self.assertIsNone(ascend_config.tree_spec_config.topk)
-        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
-        self.assertEqual(ascend_config.tree_spec_config.params, {})
-        self.assertTrue(ascend_config.tree_spec_config.enable_triton)
-        self.assertFalse(ascend_config.tree_spec_config.enable_timer)
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -258,140 +249,6 @@ class TestAscendConfig(TestBase):
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertTrue(ascend_config.xlite_graph_config.full_mode)
         self.assertEqual(ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size, 0)
-
-    @_clean_up_ascend_config
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_with_tree_spec_config(self, mock_fix_incompatible_config):
-        test_vllm_config = VllmConfig()
-        test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "method": "priority", "budget": 8, "topk": 4},
-            "refresh": True,
-        }
-        ascend_config = init_ascend_config(test_vllm_config)
-        self.assertTrue(ascend_config.tree_spec_config.enabled)
-        self.assertEqual(ascend_config.tree_spec_config.method, "priority")
-        self.assertEqual(ascend_config.tree_spec_config.budget, 8)
-        self.assertEqual(ascend_config.tree_spec_config.topk, 4)
-        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "greedy")
-        self.assertTrue(ascend_config.tree_spec_config.enable_triton)
-
-    @_clean_up_ascend_config
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_tree_spec_rejection_sampler_magicmtp(self, mock_fix_incompatible_config):
-        test_vllm_config = VllmConfig()
-        test_vllm_config.additional_config = {
-            "tree_spec_config": {
-                "enabled": True,
-                "method": "priority",
-                "budget": 8,
-                "topk": 4,
-                "rejection_sampler": "magicmtp",
-            },
-            "refresh": True,
-        }
-        ascend_config = init_ascend_config(test_vllm_config)
-        self.assertEqual(ascend_config.tree_spec_config.rejection_sampler, "magicmtp")
-
-    def test_tree_spec_config_validation_and_enable_triton(self):
-        cfg = TreeSpecConfig(
-            enabled=True,
-            method="priority",
-            budget=8,
-            topk=4,
-            enable_triton=False,
-        )
-        self.assertFalse(cfg.enable_triton)
-        self.assertTrue(
-            TreeSpecConfig(enabled=True, method="priority", budget=8, topk=4).enable_triton
-        )
-        with self.assertRaisesRegex(ValueError, "tree_spec_config.rejection_sampler must be one of"):
-            TreeSpecConfig(enabled=True, method="priority", budget=8, topk=4, rejection_sampler="block")
-        with self.assertRaisesRegex(ValueError, "tree_spec_config.method must be one of"):
-            TreeSpecConfig(enabled=True, method="best_first", budget=8, topk=4)
-        with self.assertRaisesRegex(ValueError, "tree_spec_config.method is required"):
-            TreeSpecConfig(enabled=True, budget=8, topk=4)
-
-    @_clean_up_ascend_config
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_tree_spec_requires_method(self, mock_fix_incompatible_config):
-        test_vllm_config = VllmConfig()
-        test_vllm_config.additional_config = {
-            "tree_spec_config": {"enabled": True, "budget": 8, "topk": 4},
-            "refresh": True,
-        }
-        with self.assertRaisesRegex(ValueError, "tree_spec_config.method is required"):
-            init_ascend_config(test_vllm_config)
-
-    @_clean_up_ascend_config
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_tree_spec_backend_pairing(self, mock_fix_incompatible_config):
-        def _spec(method: str):
-            return SimpleNamespace(
-                method=method,
-                use_dspark=lambda: method == "dspark",
-                use_dflash=lambda: method == "dflash",
-            )
-
-        for tree_method, draft_method in (
-            ("priority", "dflash"),
-            ("prefix", "dflash"),
-            ("beam", "dspark"),
-        ):
-            test_vllm_config = VllmConfig()
-            test_vllm_config.speculative_config = _spec(draft_method)
-            test_vllm_config.additional_config = {
-                "tree_spec_config": {
-                    "enabled": True,
-                    "method": tree_method,
-                    "budget": 8,
-                    "topk": 4,
-                },
-                "refresh": True,
-            }
-            ascend_config = init_ascend_config(test_vllm_config)
-            self.assertEqual(ascend_config.tree_spec_config.method, tree_method)
-
-        for tree_method, draft_method in (
-            ("priority", "dspark"),
-            ("prefix", "dspark"),
-            ("beam", "dflash"),
-        ):
-            test_vllm_config = VllmConfig()
-            test_vllm_config.speculative_config = _spec(draft_method)
-            test_vllm_config.additional_config = {
-                "tree_spec_config": {
-                    "enabled": True,
-                    "method": tree_method,
-                    "budget": 8,
-                    "topk": 4,
-                },
-                "refresh": True,
-            }
-            with self.assertRaisesRegex(ValueError, "requires .*speculative_config method"):
-                init_ascend_config(test_vllm_config)
-
-    @_clean_up_ascend_config
-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_init_ascend_config_tree_spec_params(self, mock_fix_incompatible_config):
-        test_vllm_config = VllmConfig()
-        test_vllm_config.additional_config = {
-            "tree_spec_config": {
-                "enabled": True,
-                "method": "prefix",
-                "budget": 16,
-                "topk": 2,
-                "params": {
-                    "candidate_size": 4,
-                    "unknown_for_later": 1,
-                },
-            },
-            "refresh": True,
-        }
-        params = init_ascend_config(test_vllm_config).tree_spec_config.params
-        self.assertEqual(params["candidate_size"], 4)
-        self.assertEqual(params["unknown_for_later"], 1)
-        with self.assertRaisesRegex(ValueError, "tree_spec_config.params must be a dict"):
-            TreeSpecConfig(enabled=True, method="prefix", budget=8, topk=2, params=["not-a-dict"])
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

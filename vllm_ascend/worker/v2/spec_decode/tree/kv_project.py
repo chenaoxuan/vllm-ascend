@@ -137,12 +137,15 @@ class TreeKvCompact:
         src_pos = torch.where(valid, src_pos, dst_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
         for caches, block_table, block_size, gathers in self._groups:
-            src_block = block_table[
-                req_f, torch.div(src_pos, block_size, rounding_mode="floor")
-            ]
-            dst_block = block_table[
-                req_f, torch.div(dst_pos, block_size, rounding_mode="floor")
-            ]
+            max_block = block_table.shape[1] - 1
+            src_bi = torch.div(src_pos, block_size, rounding_mode="floor").clamp(
+                min=0, max=max_block
+            )
+            dst_bi = torch.div(dst_pos, block_size, rounding_mode="floor").clamp(
+                min=0, max=max_block
+            )
+            src_block = block_table[req_f, src_bi]
+            dst_block = block_table[req_f, dst_bi]
             src_flat = (src_block * block_size + src_pos % block_size).to(
                 dtype=torch.long
             ).reshape(-1)

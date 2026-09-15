@@ -40,12 +40,16 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import (
     AttentionMaskBuilder,
-    align_up,
     tree_fia_bsnd_shape,
+)
+from vllm_ascend.attention.tree_spec import (
+    GqaTreeSpecAdapter,
+    tree_decode_threshold,
+    tree_spec_enabled,
+    tree_treat_short_extends_as_decodes,
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -69,7 +73,6 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
-from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 if vllm_version_is("0.28.0"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -253,11 +256,12 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
-        self.tree_spec_enabled = dflash_tree_spec_enabled()
+        self.tree_spec_enabled = tree_spec_enabled()
+        self.tree_adapter = GqaTreeSpecAdapter() if self.tree_spec_enabled else None
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             if self.tree_spec_enabled:
-                self.decode_threshold = 1 + get_ascend_config().tree_spec_config.budget
+                self.decode_threshold = tree_decode_threshold(vllm_config)
             else:
                 self.decode_threshold = 1 + spec_token_num
                 assert self.decode_threshold <= 16, (
@@ -271,12 +275,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
-        if self.tree_spec_enabled:
-            self.attn_mask_builder.configure_tree_mask(
-                max_num_decode=int(scheduler_config.max_num_seqs),
-                query_len=self.decode_threshold,
-                kv_len=align_up(int(self.model_config.max_model_len), 128),
-            )
+        if self.tree_adapter is not None:
+            self.tree_adapter.configure_builder(self, vllm_config, device)
 
     @classmethod
     def get_cudagraph_support(
@@ -303,9 +303,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
-            treat_short_extends_as_decodes=(
-                (not self.tree_spec_enabled or common_attn_metadata.is_prefilling is None)
-                and not self.pcp_enabled
+            treat_short_extends_as_decodes=tree_treat_short_extends_as_decodes(
+                common_attn_metadata,
+                tree_enabled=self.tree_spec_enabled,
+                extra_disable=self.pcp_enabled,
             ),
         )
 
@@ -1235,7 +1236,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         mask = attn_metadata.attn_mask
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         return (
-            dflash_tree_spec_enabled()
+            tree_spec_enabled()
             and not _EXTRA_CTX.is_draft_model
             and mask is not None
             and mask.ndim == 4
@@ -1723,7 +1724,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
-                tree_spec = dflash_tree_spec_enabled()
+                tree_spec = tree_spec_enabled()
                 # ChunkedPrefill mixing prefill+decode: split into a per-phase
                 # FIA call each (A5 only).
                 # NOTE: Batch-invariant execution also requires prefill and
@@ -1917,7 +1918,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         seq_lens_list = attn_metadata.seq_lens_list
         num_tokens = int(actual_seq_qlen[-1])
-        tree_spec = dflash_tree_spec_enabled()
+        tree_spec = tree_spec_enabled()
 
         # decode part
         if num_decode_tokens > 0:

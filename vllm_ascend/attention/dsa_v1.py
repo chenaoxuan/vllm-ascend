@@ -25,6 +25,13 @@ from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
     is_a5_bf16_kv_enabled,
 )
+from vllm_ascend.attention.tree_spec import (
+    DsaTreeSpecAdapter,
+    tree_decode_threshold,
+    tree_query_len,
+    tree_spec_enabled,
+    tree_treat_short_extends_as_decodes,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     enable_pcp,
@@ -358,6 +365,7 @@ class AscendDSAReqMetadata:
     ori_win_right: int | None = None
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
+    tree_ori_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -606,6 +614,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.decode_threshold = 1
         self.spec_slot_mapping = None
         self.dspark_swa_indices_buffer: torch.Tensor | None = None
+        self.tree_ori_indices_buffer: torch.Tensor | None = None
+        self.tree_ori_index_width: int | None = None
+        self.tree_spec_enabled = tree_spec_enabled(vllm_config)
+        self.tree_adapter = DsaTreeSpecAdapter() if self.tree_spec_enabled else None
+        # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
+        self.compressor_ratio = getattr(
+            kv_cache_spec,
+            "compress_ratio",
+            getattr(kv_cache_spec, "tokens_per_state", 0),
+        )
+        if self.tree_spec_enabled:
+            self.decode_threshold = tree_decode_threshold(vllm_config)
         if get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION) and not is_a5_bf16_kv_enabled(
             vllm_config
         ):
@@ -640,12 +660,20 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
-                f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
-                got {self.decode_threshold}"
-            )
+            if self.tree_spec_enabled:
+                self.decode_threshold = tree_decode_threshold(vllm_config)
+            else:
+                self.decode_threshold += spec_token_num
+                assert self.decode_threshold <= 16, (
+                    f"decode_threshold exceeded \
+                    npu_fused_infer_attention_score TND layout's limit of 16, \
+                    got {self.decode_threshold}"
+                )
+
+        # Tree ori indices live on the SWA builder: C4/C128 forward reads
+        # ``swa_req_metadata``. Draft builders skip this in ``build_for_drafting``.
+        if self.tree_adapter is not None and self.compressor_ratio <= 1:
+            self.tree_adapter.configure_builder(self, vllm_config, device)
 
         self.reorder_batch_threshold = self.decode_threshold
         self.num_decodes = 0
@@ -657,12 +685,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.common_ratio_to_sas_metadata: dict | None = None
         self.seq_lens: torch.Tensor = None
 
-        # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
-        self.compressor_ratio = getattr(
-            kv_cache_spec,
-            "compress_ratio",
-            getattr(kv_cache_spec, "tokens_per_state", 0),
-        )
         if not layer_names:
             raise ValueError("DSV4 compressor metadata builder requires at least one layer name")
         # vLLM assigns the builder result to every layer in an attention group.
@@ -731,6 +753,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _tree_short_prefill(self, input_batch, req_index: int) -> bool:
+        """Tree decode_threshold is 1+budget; first prefills shorter than that stay prefills."""
+        if not self.tree_spec_enabled:
+            return False
+        is_pref = getattr(input_batch, "is_prefilling_np", None)
+        if is_pref is not None and req_index < len(is_pref):
+            return bool(is_pref[req_index])
+        num_prompt = getattr(input_batch, "num_prompt_tokens", None)
+        num_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+        if num_prompt is None or num_computed is None:
+            return False
+        return int(num_computed[req_index]) < int(num_prompt[req_index])
+
     def reorder_batch(self, input_batch: "NPUInputBatch", scheduler_output: "SchedulerOutput") -> bool:
         # We now want to reorder the batch so that the "decode" requests are at
         # the front and the "prefill" requests are at the using the least amount
@@ -743,7 +778,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         for i, req_id in enumerate(input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if num_tokens <= self.decode_threshold:
+            if num_tokens <= self.decode_threshold and not self._tree_short_prefill(input_batch, i):
                 decodes.append(i)
             else:
                 prefills.append(i)
@@ -819,6 +854,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 split_decodes_and_prefills(
                     common_attn_metadata,
                     decode_threshold=self.decode_threshold,
+                    treat_short_extends_as_decodes=tree_treat_short_extends_as_decodes(
+                        common_attn_metadata,
+                        tree_enabled=self.tree_spec_enabled,
+                    ),
                 )
             )
             self.common_ratio_to_sas_metadata["num_decodes"] = self.num_decodes
@@ -897,6 +936,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         max_seqlen_kv: int | torch.Tensor,
         cu_seqlens_ori_kv: torch.Tensor | None,
         cu_seqlens_cmp_kv: torch.Tensor | None,
+        ori_win_left: int,
+        ori_win_right: int = 0,
     ) -> torch.Tensor:
         sas_metadata = metadata_cache.get(layer_name)
         if sas_metadata is None:
@@ -930,8 +971,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cmp_ratio=cmp_ratio,
                 ori_mask_mode=4,  # 4:sliding window
                 cmp_mask_mode=3,  # 3:causal
-                ori_win_left=self.model_config.hf_config.sliding_window - 1,
-                ori_win_right=0,
+                # Must match the runtime ori_win_* / ori_sparse_indices width.
+                # Tree verify and DSpark draft widen the window past SWA-only
+                # ``W-1``; a shorter SAS workspace drops the newest prefix slot
+                # (the root's just-written KV) and root logits collapse.
+                ori_win_left=ori_win_left,
+                ori_win_right=ori_win_right,
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,
@@ -1073,6 +1118,20 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 buffer=self.dspark_swa_indices_buffer,
             )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+        tree_ori_indices = None
+        if self.tree_adapter is not None and self.compressor_ratio <= 1:
+            tree_ori_indices = self.common_ratio_to_sas_metadata.get("tree_ori_indices")
+            if tree_ori_indices is None:
+                tree_ori_indices = self.tree_adapter.build_target_inputs(
+                    self,
+                    common_attn_metadata,
+                    num_decodes=self.num_decodes,
+                )
+                self.common_ratio_to_sas_metadata["tree_ori_indices"] = tree_ori_indices
+            if tree_ori_indices is not None:
+                window = int(self.model_config.hf_config.sliding_window)
+                budget = (tree_query_len() or 1) - 1
+                ori_win_left, ori_win_right = window + budget - 1, 0
         # Text-only requests and lightweight metadata fixtures do not carry
         # multimodal document ranges. Treat those as having no vision spans.
         mm_ranges = getattr(common_attn_metadata, "mm_req_doc_ranges", None)
@@ -1127,6 +1186,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_kv=max_seqlen_kv,
                     cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                     cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                    ori_win_left=ori_win_left,
+                    ori_win_right=ori_win_right,
                 )
 
             def build_qli_metadata() -> None:
@@ -1160,6 +1221,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 max_seqlen_kv=max_seqlen_kv,
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                ori_win_left=ori_win_left,
+                ori_win_right=ori_win_right,
             )
             qli_metadata = self._build_qli_metadata(
                 metadata_cache=metadata_cache,
@@ -1219,6 +1282,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             ori_win_right=ori_win_right,
             dspark_swa_indices=dspark_swa_indices,
             vision_swa_indices=vision_swa_indices,
+            tree_ori_indices=tree_ori_indices,
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
             assert num_compressed_tokens is not None
@@ -1251,10 +1315,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
+        # Draft keep the linear DSpark threshold; tree 1+budget is target-only.
+        draft_threshold = self.decode_threshold
+        if self.tree_spec_enabled and self.speculative_config is not None:
+            draft_threshold = 1 + self.speculative_config.num_speculative_tokens
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
-                decode_threshold=self.decode_threshold,
+                decode_threshold=draft_threshold,
             )
         )
         num_reqs = common_attn_metadata.num_reqs
@@ -2203,16 +2271,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             layout_kv=_dsa_layout_kv(self.vllm_config),
         )
 
-        # Vision prefill uses explicit original-KV indices so tokens inside an
-        # image span can see the complete span bidirectionally. Compressed KV
-        # selection remains active and is supplied independently below.
-        if swa_req_metadata.vision_swa_indices is not None:
-            attn_kwargs["ori_sparse_indices"] = swa_req_metadata.vision_swa_indices
+        # Tree target verify, vision prefill, then DSpark draft SWA (draft-only).
+        ori_sparse_indices = swa_req_metadata.tree_ori_indices
+        if ori_sparse_indices is None:
+            ori_sparse_indices = swa_req_metadata.vision_swa_indices
+        if ori_sparse_indices is None and self.compress_ratio <= 1:
+            ori_sparse_indices = swa_req_metadata.dspark_swa_indices
+        if ori_sparse_indices is not None:
+            attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
 
-        if self.compress_ratio <= 1:
-            if swa_req_metadata.dspark_swa_indices is not None:
-                attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
-        else:
+        if self.compress_ratio > 1:
             assert compressor_metadata is not None
             attn_kwargs.update(
                 cmp_kv=compress_kv_cache,

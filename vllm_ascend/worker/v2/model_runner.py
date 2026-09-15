@@ -467,7 +467,12 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         tree_depths = getattr(self.req_states, "tree_depths", None)
-        if tree_depths is not None:
+        use_tree_pos = (
+            tree_depths is not None
+            and self.ascend_config.tree_spec_config.topk is not None
+            and self.ascend_config.tree_spec_config.topk > 1
+        )
+        if use_tree_pos:
             is_prefilling = async_copy_to_gpu(
                 torch.from_numpy(batch_req_state.is_prefilling_np),
                 device=self.device,
@@ -594,7 +599,10 @@ class NPUModelRunner(GPUModelRunner):
             proposal = getattr(self.req_states, "tree_proposal_logits", None)
             if proposal is not None:
                 input_batch.tree_proposal_logits = proposal[idx_mapping]
-            input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
+            if use_tree_pos:
+                input_batch.slot_positions = self.input_buffers.slot_positions[
+                    :num_tokens_after_padding
+                ]
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.

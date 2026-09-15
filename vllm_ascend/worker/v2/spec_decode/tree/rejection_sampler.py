@@ -242,6 +242,12 @@ class TreeRejectionSampler(RejectionSampler):
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
     ) -> SamplerOutput:
+        # topk=1 is a chain: verify against packed input_ids like DSpark,
+        # not first_child / greedy_tree_reject.
+        if get_ascend_config().tree_spec_config.topk <= 1:
+            self.path_node_ids = None
+            return super().__call__(logits, input_batch, draft_logits)
+
         tree = TreeLayout(
             tokens=input_batch.tree_tokens,
             depths=input_batch.tree_depths,

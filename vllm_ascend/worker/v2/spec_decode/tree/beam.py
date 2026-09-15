@@ -62,7 +62,7 @@ class BeamTreeBuilder(TreeBuilder):
 
         # Temp proposal indexed by root=0 and pool slot i -> i+1. Remapped later.
         # FP32 to match tree_proposal_logits; NPU IndexPut rejects BF16.
-        max_pool = spec_num * k * k
+        max_pool = spec_num * k
         prop_temp = None
         if proposal_logits is not None:
             prop_temp = torch.full(
@@ -72,7 +72,14 @@ class BeamTreeBuilder(TreeBuilder):
                 device=device,
             )
 
+        # Commit only the kept beam at each depth. Dumping every k-ary
+        # expansion into the pool and then taking a global top-``budget``
+        # by cumulative log-score keeps only depth 1–2 (deeper scores are
+        # more negative), so greedy can never accept past 2 drafts.
+        remaining = int(budget)
         for depth in range(spec_num):
+            if remaining <= 0:
+                break
             batch = frontier_tokens.size(1)
             step_logits = _markov_correct_logits(
                 draft_model, draft_logits[:, depth], frontier_tokens
@@ -94,21 +101,30 @@ class BeamTreeBuilder(TreeBuilder):
                 top_ids = draft_model.map_draft_to_target(top_ids)
             candidate_scores = frontier_scores.unsqueeze(-1) + top_vals
             num_candidates = batch * k
+            depths_left = spec_num - depth
+            if depth == 0:
+                n_add = min(k, remaining)
+            elif depths_left == 1:
+                n_add = min(k, remaining)
+            else:
+                n_add = min(k, max(1, remaining // depths_left))
+            n_add = min(n_add, num_candidates, remaining)
+            cand_flat = candidate_scores.reshape(num_reqs, -1)
+            top_ids_flat = top_ids.reshape(num_reqs, -1)
+            parent_flat = frontier_pools.repeat_interleave(k, dim=-1)
+            selected = cand_flat.topk(n_add, dim=-1).indices
+            sel_tokens = torch.gather(top_ids_flat, 1, selected)
+            sel_scores = torch.gather(cand_flat, 1, selected)
+            sel_parents = torch.gather(parent_flat, 1, selected)
 
-            pool_tokens = torch.cat(
-                [pool_tokens, top_ids.reshape(num_reqs, -1)], dim=-1
-            )
-            pool_scores = torch.cat(
-                [pool_scores, candidate_scores.reshape(num_reqs, -1)], dim=-1
-            )
-            pool_parents = torch.cat(
-                [pool_parents, frontier_pools.repeat_interleave(k, dim=-1)], dim=-1
-            )
+            pool_tokens = torch.cat([pool_tokens, sel_tokens], dim=-1)
+            pool_scores = torch.cat([pool_scores, sel_scores], dim=-1)
+            pool_parents = torch.cat([pool_parents, sel_parents], dim=-1)
             pool_depth = torch.cat(
                 [
                     pool_depth,
                     torch.full(
-                        (num_reqs, num_candidates),
+                        (num_reqs, n_add),
                         depth,
                         dtype=torch.long,
                         device=device,
@@ -116,29 +132,18 @@ class BeamTreeBuilder(TreeBuilder):
                 ],
                 dim=-1,
             )
-
-            keep = min(k, num_candidates)
-            cand_flat = candidate_scores.reshape(num_reqs, -1)
-            top_ids_flat = top_ids.reshape(num_reqs, -1)
-            selected = cand_flat.topk(keep, dim=-1).indices
-            frontier_tokens = torch.gather(top_ids_flat, 1, selected)
-            frontier_scores = torch.gather(cand_flat, 1, selected)
-            frontier_pools = (pool_tokens.size(-1) - num_candidates) + selected
+            frontier_tokens = sel_tokens
+            frontier_scores = sel_scores
+            base = pool_tokens.size(-1) - n_add
+            frontier_pools = base + torch.arange(
+                n_add, device=device, dtype=torch.long
+            ).unsqueeze(0).expand(num_reqs, -1)
+            remaining -= n_add
 
         num_pool = pool_tokens.size(-1)
         num_nodes = min(int(budget), num_pool)
-        order = torch.argsort(pool_depth, dim=-1, stable=True)
-        order = torch.gather(
-            order,
-            1,
-            torch.argsort(
-                torch.gather(pool_scores, 1, order),
-                dim=-1,
-                descending=True,
-                stable=True,
-            ),
-        )
-        packed = order[:, :num_nodes].sort(dim=-1).values
+        packed = torch.arange(num_nodes, device=device, dtype=torch.long)
+        packed = packed.unsqueeze(0).expand(num_reqs, -1)
 
         remap = torch.zeros(num_reqs, num_pool, dtype=torch.long, device=device)
         node_ids = torch.arange(

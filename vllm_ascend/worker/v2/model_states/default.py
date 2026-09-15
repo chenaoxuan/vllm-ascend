@@ -87,8 +87,8 @@ class AscendModelState(DefaultModelState):
             else None
         )
         tree_visibility = input_batch.tree_visibility
-        # Dummy batch has no tree. Only tree-verify gears (k × 1+budget) need
-        # the 4D mask; mixed capture sizes must keep 2D splitfuse.
+        # Dummy batch has no tree. Only target tree-verify gears (k × 1+budget)
+        # need the dummy identity; draft capture must keep its own mask/indices.
         if (
             for_capture
             and tree_visibility is None
@@ -96,13 +96,17 @@ class AscendModelState(DefaultModelState):
             and dummy_tree_mask_for_capture(num_input_tokens, num_reqs)
         ):
             from vllm_ascend.ascend_config import get_ascend_config
-            from vllm_ascend.attention.attention_mask import _dummy_tree_visibility
-
-            tree_visibility = _dummy_tree_visibility(
-                num_reqs,
-                self.device,
-                budget=get_ascend_config().tree_spec_config.budget,
+            from vllm_ascend.attention.tree_spec import (
+                dummy_tree_visibility,
+                is_draft_forward,
             )
+
+            if not is_draft_forward():
+                tree_visibility = dummy_tree_visibility(
+                    num_reqs,
+                    self.device,
+                    budget=get_ascend_config().tree_spec_config.budget,
+                )
 
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.

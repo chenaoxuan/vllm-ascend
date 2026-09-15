@@ -28,8 +28,9 @@ def init_speculator(
 ):
     """Override GPU init_speculator for Ascend NPUs.
 
-    DFlash (``priority`` / ``prefix``) and Qwen3 DSpark (``beam``) use
-    ``AscendTreeSpeculator`` when ``tree_spec_config.enabled`` is true.
+    DFlash (``priority`` / ``prefix``) and DSpark (``beam``, Qwen3 or
+    DeepSeek-V4 ``DSparkDraftModel``) use ``AscendTreeSpeculator`` when
+    ``tree_spec_config.enabled`` is true.
     Method/backend pairing is validated inside the tree host.
     """
     speculative_config = vllm_config.speculative_config
@@ -47,7 +48,7 @@ def init_speculator(
 
         return ExtractHiddenStatesSpeculator(vllm_config, device)
     if speculative_config.use_dspark():
-        if dflash_tree_spec_enabled(vllm_config) and _is_qwen3_dspark(
+        if dflash_tree_spec_enabled(vllm_config) and _is_tree_dspark(
             speculative_config
         ):
             from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
@@ -95,18 +96,16 @@ def init_speculator(
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
 
 
-def _is_qwen3_dspark(speculative_config) -> bool:
+def _is_tree_dspark(speculative_config) -> bool:
     draft = getattr(speculative_config, "draft_model_config", None)
     arches = getattr(draft, "architectures", None) or ()
-    return "Qwen3DSparkModel" in arches
+    if "Qwen3DSparkModel" in arches or "DSparkDraftModel" in arches:
+        return True
+    hf = getattr(draft, "hf_config", None)
+    return getattr(hf, "model_type", None) == "deepseek_v4"
 
 
 def dflash_tree_spec_enabled(vllm_config: VllmConfig=None) -> bool:
-    try:
-        from vllm_ascend.ascend_config import get_ascend_config
+    from vllm_ascend.attention.tree_spec import tree_spec_enabled
 
-        return bool(get_ascend_config().tree_spec_config.enabled)
-    except RuntimeError:
-        additional_config = getattr(vllm_config, "additional_config", {})
-        tree_cfg = additional_config.get("tree_spec_config") or {}
-        return bool(tree_cfg.get("enabled", False))
+    return tree_spec_enabled(vllm_config)

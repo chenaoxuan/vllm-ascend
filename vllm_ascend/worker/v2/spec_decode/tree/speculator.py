@@ -78,6 +78,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.draft_backend = (
             "dspark" if self.speculative_config.use_dspark() else "dflash"
         )
+        draft_arches = getattr(
+            vllm_config.speculative_config.draft_model_config, "architectures", None
+        ) or ()
+        self._dsv4_dspark_draft = (
+            self.draft_backend == "dspark"
+            and (
+                getattr(draft_hf, "model_type", None) == "deepseek_v4"
+                or "DSparkDraftModel" in draft_arches
+            )
+        )
 
         self.tree_builder = None
         self._domino_scorer = None
@@ -94,6 +104,20 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         if self._domino_shift_label:
             self.sample_from_anchor = True
             self.num_query_per_req = self.num_speculative_steps
+        # DSpark combine_hidden_states / hc_head emit hf hidden_size, not the
+        # HC-widened (hc_mult * H) buffer DFlash/MTP allocate via
+        # get_hidden_size(). DSV4 hc_mult=4: dest [T, 4H] vs src [T, H].
+        if self.draft_backend == "dspark":
+            draft_hidden = int(getattr(draft_hf, "hidden_size", 0) or 0)
+            if draft_hidden <= 0:
+                draft_hidden = int(self.draft_model_config.get_hidden_size())
+            self.hidden_size = draft_hidden
+            self.hidden_states = torch.zeros(
+                self.max_num_tokens,
+                draft_hidden,
+                dtype=self.dtype,
+                device=device,
+            )
         # Persistent so FULL replay can update hidden without re-entering Python.
         self._draft_hidden_buf = torch.empty(
             self.max_num_reqs * self.num_query_per_req,
@@ -203,13 +227,82 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
     ) -> nn.Module:
         if self.draft_backend == "dspark":
             from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+            from vllm_ascend.models.qwen3_dspark import process_weight
+            from vllm_ascend.utils import get_rotation_matrix, get_rotation_path
 
-            return load_dspark_model(target_model, self.vllm_config)
+            model = load_dspark_model(target_model, self.vllm_config)
+            rotation_path = get_rotation_path(self.vllm_config)
+            if rotation_path is not None and hasattr(model.model, "fc"):
+                rotation_weight = get_rotation_matrix(rotation_path)
+                fc = model.model.fc
+                with torch.no_grad():
+                    fc.weight.data.copy_(
+                        process_weight(fc.weight.data.cpu(), rotation_weight)
+                    )
+            return model
         return super().load_draft_model(target_model, target_attn_layer_names)
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         self._bind_correction_heads(target_model)
+
+    def set_attn(
+        self,
+        model_state: Any,
+        kv_cache_config: Any,
+        block_tables: Any,
+        target_input_buffers: Any,
+        target_attn_groups: Any,
+    ) -> None:
+        if self._dsv4_dspark_draft:
+            from vllm.config import set_current_vllm_config
+
+            with set_current_vllm_config(self.attn_vllm_config):
+                super().set_attn(
+                    model_state,
+                    kv_cache_config,
+                    block_tables,
+                    target_input_buffers,
+                    target_attn_groups,
+                )
+            return
+        super().set_attn(
+            model_state,
+            kv_cache_config,
+            block_tables,
+            target_input_buffers,
+            target_attn_groups,
+        )
+
+    def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
+        if not self._dsv4_dspark_draft:
+            return super().build_draft_attn_metadatas(
+                num_reqs_padded, seq_lens_cpu_upper_bound
+            )
+        from vllm_ascend.worker.v2.attn_utils import (
+            build_attn_metadata_wrapper,
+            build_draft_attn_metadata_factory,
+        )
+
+        num_tokens_padded = num_reqs_padded * self.num_query_per_req
+        with (
+            build_attn_metadata_wrapper(),
+            build_draft_attn_metadata_factory(
+                self.input_buffers.positions,
+                num_tokens_padded,
+                torch.from_numpy(self.input_batch.is_prefilling_np),
+            ),
+        ):
+            attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=self.input_batch.num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                step=self.num_query_per_req,
+                causal=self._group_causal,
+            )
+        self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
+        return [attn_metadata]
 
     def _bind_correction_heads(self, target_model: nn.Module) -> None:
         """Resolve Domino heads (prefix) then construct the tree builder."""
@@ -252,6 +345,25 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self._domino_shift_label,
         )
 
+    def _align_dspark_copy_buffer(self, width: int) -> None:
+        """DFlash.propose copy_ dest must match combine(aux) / last_hidden."""
+        buf = self.hidden_states
+        if buf.shape[-1] == width:
+            return
+        self.hidden_states = torch.zeros(
+            self.max_num_tokens,
+            width,
+            dtype=buf.dtype,
+            device=buf.device,
+        )
+        if self._draft_hidden_buf.shape[-1] != width:
+            self._draft_hidden_buf = torch.empty(
+                self.max_num_reqs * self.num_query_per_req,
+                width,
+                dtype=buf.dtype,
+                device=buf.device,
+            )
+
     def propose(
         self,
         input_batch: InputBatch,
@@ -291,25 +403,73 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                         linearize_positions=input_batch.positions,
                     )
         self._tree_finalized = False
-        tokens = super().propose(
-            input_batch,
-            attn_metadata,
-            slot_mappings,
-            last_hidden_states,
-            aux_hidden_states,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            temperature,
-            seeds,
-            num_tokens_across_dp,
-            dummy_run,
-            skip_attn_for_dummy_run,
-            mm_inputs,
-            is_profile=is_profile,
-            dp_sync=dp_sync,
-        )
+        if self.draft_backend == "dspark":
+            copy_w = (
+                aux_hidden_states[0].shape[-1]
+                if aux_hidden_states
+                else last_hidden_states.shape[-1]
+            )
+            self._align_dspark_copy_buffer(copy_w)
+        if self._dsv4_dspark_draft:
+            from vllm_ascend.utils import vllm_version_is
+            from vllm_ascend.worker.v2.attn_utils import (
+                build_attn_metadata_wrapper,
+                build_draft_attn_metadata_factory,
+            )
+
+            # Factory must wrap the Ascend ``build_attn_metadata`` installed by
+            # the wrapper. Skip AscendDFlashSpeculator.propose so it cannot
+            # reinstall the wrapper and drop the DSA positions/is_prefilling.
+            self.input_batch = input_batch
+            sync_state = num_tokens_across_dp if vllm_version_is("0.28.0") else dp_sync
+            if dummy_run and skip_attn_for_dummy_run:
+                sync_state = None
+            with (
+                build_attn_metadata_wrapper(),
+                build_draft_attn_metadata_factory(
+                    self.input_buffers.positions,
+                    self.max_num_tokens,
+                    torch.from_numpy(input_batch.is_prefilling_np),
+                ),
+            ):
+                tokens = super(AscendDFlashSpeculator, self).propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        else:
+            tokens = super().propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings,
+                last_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                last_sampled,
+                next_prefill_tokens,
+                temperature,
+                seeds,
+                num_tokens_across_dp,
+                dummy_run,
+                skip_attn_for_dummy_run,
+                mm_inputs,
+                is_profile=is_profile,
+                dp_sync=dp_sync,
+            )
         # FULL replay only runs draft forward; prefix may replay a second graph.
         if not dummy_run:
             self._finalize_tree(input_batch.num_reqs)

@@ -270,6 +270,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        dp_sync: Any = None,
     ) -> torch.Tensor:
         path_node_ids = getattr(input_batch, "path_node_ids", None)
         if path_node_ids is not None and not dummy_run:
@@ -307,6 +308,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             skip_attn_for_dummy_run,
             mm_inputs,
             is_profile=is_profile,
+            dp_sync=dp_sync,
         )
         # FULL replay only runs draft forward; prefix may replay a second graph.
         if not dummy_run:

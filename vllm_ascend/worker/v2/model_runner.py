@@ -73,10 +73,6 @@ from vllm_ascend.worker.v2.spec_decode import (
     dflash_tree_spec_enabled,
     init_speculator,
 )
-from vllm_ascend.worker.v2.sp_utils import (
-    _all_gather_hidden_states_and_aux,
-    _flashcomm_enabled,
-)
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState

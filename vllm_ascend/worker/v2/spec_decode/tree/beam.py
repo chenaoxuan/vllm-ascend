@@ -25,6 +25,63 @@ def _markov_correct_logits(
     return base + bias.view(*markov_emb.shape[:-1], -1)
 
 
+def _select_with_spine(
+    cand_flat: torch.Tensor, n_add: int, k: int
+) -> torch.Tensor:
+    """Keep the best child of frontier[:, 0] as selected[:, 0].
+
+    Later depths take a global top-``n_add``; that can drop the greedy chain
+    so packed-causal DSA never sees a depth>1 ancestor path.
+    """
+    spine = cand_flat[:, :k].argmax(dim=-1)
+    if n_add <= 1:
+        return spine.unsqueeze(1)
+    drop = torch.arange(cand_flat.shape[1], device=cand_flat.device).unsqueeze(
+        0
+    ) == spine.unsqueeze(1)
+    rest = cand_flat.masked_fill(drop, float("-inf")).topk(n_add - 1, dim=-1).indices
+    return torch.cat([spine.unsqueeze(1), rest], dim=1)
+
+
+def _spine_first_pool_indices(
+    pool_parents: torch.Tensor,
+    pool_scores: torch.Tensor,
+    pool_depth: torch.Tensor,
+    num_nodes: int,
+    spec_num: int,
+) -> torch.Tensor:
+    """Permute pool slots so the best path is packed as a causal prefix.
+
+    DSA tree verify is packed-causal SWA (ori_sparse_indices is a no-op).
+    BFS order puts all depth-1 siblings before any depth-2 node, so a
+    depth-2 query attends to every sibling instead of its parent.
+    """
+    num_reqs, num_pool = pool_parents.shape
+    device = pool_parents.device
+    req_idx = torch.arange(num_reqs, device=device)
+    used = torch.zeros(num_reqs, num_pool, dtype=torch.bool, device=device)
+    inf = num_pool + spec_num + 1
+    spine_rank = torch.full(
+        (num_reqs, num_pool), inf, dtype=torch.long, device=device
+    )
+    parent = torch.full((num_reqs,), -1, dtype=pool_parents.dtype, device=device)
+    for depth in range(spec_num):
+        cand = (pool_depth == depth) & (pool_parents == parent.unsqueeze(1)) & ~used
+        scores = pool_scores.masked_fill(~cand, float("-inf"))
+        pick = scores.argmax(dim=-1)
+        valid = cand.any(dim=-1)
+        safe = pick.clamp(min=0)
+        cur = spine_rank[req_idx, safe]
+        spine_rank[req_idx, safe] = torch.where(
+            valid, torch.full_like(cur, depth), cur
+        )
+        used[req_idx, safe] = used[req_idx, safe] | valid
+        parent = torch.where(valid, pick, parent)
+    rest_rank = inf + torch.arange(num_pool, device=device, dtype=torch.long)
+    rank = torch.where(used, spine_rank, rest_rank.unsqueeze(0))
+    return rank.topk(num_nodes, largest=False, dim=-1).indices
+
+
 class BeamTreeBuilder(TreeBuilder):
     """Level-wise beam (PCTree) expansion; optional DSpark Markov bias."""
 
@@ -50,6 +107,16 @@ class BeamTreeBuilder(TreeBuilder):
         num_reqs, spec_num, vocab = draft_logits.shape
         k = min(topk, vocab)
         device = draft_logits.device
+        markov_diag = False
+        if draft_model is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                path_log_enabled,
+            )
+
+            markov_diag = path_log_enabled()
+        base_top1: list[torch.Tensor] = []
+        corrected_top1: list[torch.Tensor] = []
+        spine_margins: list[torch.Tensor] = []
 
         frontier_tokens = root_token_ids.unsqueeze(1)
         frontier_scores = torch.zeros(num_reqs, 1, dtype=torch.float32, device=device)
@@ -76,6 +143,10 @@ class BeamTreeBuilder(TreeBuilder):
         # expansion into the pool and then taking a global top-``budget``
         # by cumulative log-score keeps only depth 1–2 (deeper scores are
         # more negative), so greedy can never accept past 2 drafts.
+        #
+        # Keep frontier[:, 0] as the best-path spine and always expand it:
+        # otherwise the global top-n_add at later depths can drop the greedy
+        # chain, and DSA packed-causal verify has no working tree mask.
         remaining = int(budget)
         for depth in range(spec_num):
             if remaining <= 0:
@@ -99,6 +170,14 @@ class BeamTreeBuilder(TreeBuilder):
             top_vals, top_ids = log_probs.topk(k, dim=-1)
             if draft_model is not None:
                 top_ids = draft_model.map_draft_to_target(top_ids)
+            if markov_diag and draft_model is not None:
+                base_ids = draft_logits[:, depth].argmax(dim=-1)
+                base_top1.append(draft_model.map_draft_to_target(base_ids))
+                corrected_top1.append(top_ids[:, 0, 0])
+                if k > 1:
+                    spine_margins.append(top_vals[:, 0, 0] - top_vals[:, 0, 1])
+                else:
+                    spine_margins.append(torch.zeros_like(top_vals[:, 0, 0]))
             candidate_scores = frontier_scores.unsqueeze(-1) + top_vals
             num_candidates = batch * k
             depths_left = spec_num - depth
@@ -112,7 +191,7 @@ class BeamTreeBuilder(TreeBuilder):
             cand_flat = candidate_scores.reshape(num_reqs, -1)
             top_ids_flat = top_ids.reshape(num_reqs, -1)
             parent_flat = frontier_pools.repeat_interleave(k, dim=-1)
-            selected = cand_flat.topk(n_add, dim=-1).indices
+            selected = _select_with_spine(cand_flat, n_add, k)
             sel_tokens = torch.gather(top_ids_flat, 1, selected)
             sel_scores = torch.gather(cand_flat, 1, selected)
             sel_parents = torch.gather(parent_flat, 1, selected)
@@ -142,8 +221,9 @@ class BeamTreeBuilder(TreeBuilder):
 
         num_pool = pool_tokens.size(-1)
         num_nodes = min(int(budget), num_pool)
-        packed = torch.arange(num_nodes, device=device, dtype=torch.long)
-        packed = packed.unsqueeze(0).expand(num_reqs, -1)
+        packed = _spine_first_pool_indices(
+            pool_parents, pool_scores, pool_depth, num_nodes, spec_num
+        )
 
         remap = torch.zeros(num_reqs, num_pool, dtype=torch.long, device=device)
         node_ids = torch.arange(
@@ -160,6 +240,28 @@ class BeamTreeBuilder(TreeBuilder):
         tokens = torch.gather(pool_tokens, 1, packed)
         depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
         finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
+        if markov_diag and base_top1:
+            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                log_markov_tree,
+                log_tree_plan,
+            )
+
+            num_depths = len(base_top1)
+            log_markov_tree(
+                root_token_ids,
+                torch.stack(base_top1, dim=1),
+                torch.stack(corrected_top1, dim=1),
+                tokens[:, :num_depths],
+                torch.stack(spine_margins, dim=1),
+            )
+            log_tree_plan(
+                out.tokens,
+                out.depths,
+                out.parents,
+                out.first_child,
+                out.num_nodes,
+                spec_num,
+            )
 
         if proposal_logits is not None and prop_temp is not None:
             proposal_logits.fill_(float("-inf"))

@@ -27,6 +27,7 @@ from vllm_ascend.attention.dsa_attn_kv_plan import (
 )
 from vllm_ascend.attention.tree_spec import (
     DsaTreeSpecAdapter,
+    is_target_tree_step,
     tree_decode_threshold,
     tree_query_len,
     tree_spec_enabled,
@@ -366,6 +367,10 @@ class AscendDSAReqMetadata:
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
     tree_ori_indices: torch.Tensor | None = None
+    # Packed sibling TND skips C4/state writes. Isolated serial writes then
+    # the verifier restores native circular/state blocks.
+    skip_compressed_cache_write: bool = False
+    tree_path_kv_isolated: bool = False
 
 
 @dataclass
@@ -498,6 +503,28 @@ def build_dspark_swa_indices(
         per_token_slots = buffer[:num_rows]
 
     return per_token_slots, per_token_lens
+
+
+def _log_dspark_swa_indices(
+    indices: torch.Tensor | None,
+    *,
+    compressor_ratio: int,
+    block_table: torch.Tensor | None,
+    gkey: str = "",
+    block_size: int = -1,
+) -> None:
+    """TP0 DSV4-PATH SWA index dump. No-op unless path_log is on."""
+    if indices is None:
+        return
+    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import log_swa_indices
+
+    log_swa_indices(
+        indices,
+        compressor_ratio=compressor_ratio,
+        block_table=block_table,
+        gkey=gkey,
+        block_size=block_size,
+    )
 
 
 def build_vision_bidirectional_swa_indices(
@@ -692,7 +719,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.hadamard = None
         self._init_hadamard(layer_names)
         max_num_reqs = scheduler_config.max_num_seqs * self._request_capacity_factor
-        self.start_pos_prefill: torch.Tensor = torch.zeros(max_num_reqs, dtype=torch.int32, device=self.device)
+        self._tree_path_seq_cap = max_num_reqs
+        if self.tree_spec_enabled:
+            try:
+                budget = int(get_ascend_config().tree_spec_config.budget)
+            except RuntimeError:
+                budget = 1
+            self._tree_path_seq_cap = max(max_num_reqs, max_num_reqs * max(budget, 1))
+        self.start_pos_prefill: torch.Tensor = torch.zeros(
+            self._tree_path_seq_cap, dtype=torch.int32, device=self.device
+        )
         self.sas_metadata_buffer: torch.Tensor = torch.zeros(
             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=self.device
         )
@@ -704,7 +740,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # during graph replay. Full-decode graphs pad the request count beyond
         # max_num_seqs (cudagraph capture sizes plus the FIA dummy request), so
         # size the per-request buffers for the graph-mode maximum.
-        max_qli_reqs = max_num_reqs
+        max_qli_reqs = max(max_num_reqs, self._tree_path_seq_cap)
         compilation_config = self.vllm_config.compilation_config
         if compilation_config.cudagraph_mode != CUDAGraphMode.NONE and compilation_config.cudagraph_capture_sizes:
             max_qli_reqs = max(max_qli_reqs, compilation_config.max_cudagraph_capture_size)
@@ -752,6 +788,26 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # Explicit override in case the underlying builder specialized this getter.
         # @override omitted only because of mypy limitation due to type variable.
         return AttentionCGSupport.UNIFORM_BATCH
+
+    def _is_dspark_draft(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> bool:
+        gkey = self.cache_group_key or ""
+        return not bool(common_attn_metadata.causal) and (
+            gkey.startswith("mtp.") or ".mtp." in f".{gkey}."
+        )
+
+    def _split_decode_threshold(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> int:
+        if (
+            self._is_dspark_draft(common_attn_metadata)
+            and self.speculative_config is not None
+        ):
+            return 1 + int(self.speculative_config.num_speculative_tokens)
+        return self.decode_threshold
 
     def _tree_short_prefill(self, input_batch, req_index: int) -> bool:
         """Tree decode_threshold is 1+budget; first prefills shorter than that stay prefills."""
@@ -848,40 +904,66 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert self.common_ratio_to_sas_metadata is not None
         self.set_num_actual_tokens(common_attn_metadata)
         num_input_tokens = common_attn_metadata.num_input_tokens
+        path_qsl = getattr(common_attn_metadata, "tree_path_query_start_loc", None)
+        using_path = path_qsl is not None
+        if using_path:
+            num_actual_reqs = path_qsl.shape[0] - 1
+        self._active_decode_threshold = self._split_decode_threshold(
+            common_attn_metadata
+        )
+        # DSpark context KV is pre-inserted before the block forward, so a
+        # short non-causal draft block is decode-shaped even when the target
+        # request is still in its first prefill.
+        self._active_treat_short_extends = (
+            True
+            if self._is_dspark_draft(common_attn_metadata)
+            else tree_treat_short_extends_as_decodes(
+                common_attn_metadata,
+                tree_enabled=self.tree_spec_enabled,
+            )
+        )
 
         if self.common_ratio_to_sas_metadata.get("num_decodes") is None:
-            self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
-                split_decodes_and_prefills(
-                    common_attn_metadata,
-                    decode_threshold=self.decode_threshold,
-                    treat_short_extends_as_decodes=tree_treat_short_extends_as_decodes(
+            if using_path:
+                num_paths = path_qsl.shape[0] - 1
+                self.num_decodes = num_paths
+                self.num_prefills = 0
+                self.num_decode_tokens = common_attn_metadata.num_actual_tokens
+                self.num_prefill_tokens = 0
+                self.seq_lens = common_attn_metadata.tree_path_seq_lens[:num_paths]
+                seq_lens_cpu = common_attn_metadata.tree_path_seq_lens_cpu
+                if seq_lens_cpu is None:
+                    seq_lens_cpu = self.seq_lens.cpu()  # D2H
+                input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+                cos, sin = get_cos_and_sin_dsa(input_positions, use_cache=True)
+            else:
+                self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
+                    split_decodes_and_prefills(
                         common_attn_metadata,
-                        tree_enabled=self.tree_spec_enabled,
-                    ),
+                        decode_threshold=self._active_decode_threshold,
+                        treat_short_extends_as_decodes=self._active_treat_short_extends,
+                    )
                 )
-            )
+                assert self.num_decodes + self.num_prefills == num_reqs
+                assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
+                self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+                if common_attn_metadata._seq_lens_cpu is not None:
+                    seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+                elif common_attn_metadata.seq_lens_cpu is not None:
+                    seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+                else:
+                    seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+                input_positions = common_attn_metadata.positions[:num_input_tokens].long()
+                cos, sin = get_cos_and_sin_dsa(
+                    input_positions,
+                    use_cache=self.num_prefills == 0,
+                )
             self.common_ratio_to_sas_metadata["num_decodes"] = self.num_decodes
             self.common_ratio_to_sas_metadata["num_prefills"] = self.num_prefills
             self.common_ratio_to_sas_metadata["num_decode_tokens"] = self.num_decode_tokens
             self.common_ratio_to_sas_metadata["num_prefill_tokens"] = self.num_prefill_tokens
-            assert self.num_decodes + self.num_prefills == num_reqs
-            assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
-            self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
             self.common_ratio_to_sas_metadata["seq_lens"] = self.seq_lens
-            # Prefer _seq_lens_cpu (always available, updated during draft
-            # iterations) over seq_lens_cpu (None in async spec decode mode).
-            if common_attn_metadata._seq_lens_cpu is not None:
-                seq_lens_cpu = common_attn_metadata._seq_lens_cpu
-            elif common_attn_metadata.seq_lens_cpu is not None:
-                seq_lens_cpu = common_attn_metadata.seq_lens_cpu
-            else:
-                seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
             self.common_ratio_to_sas_metadata["seq_lens_cpu"] = seq_lens_cpu
-            input_positions = common_attn_metadata.positions[:num_input_tokens].long()
-            cos, sin = get_cos_and_sin_dsa(
-                input_positions,
-                use_cache=self.num_prefills == 0,
-            )
             self.common_ratio_to_sas_metadata["cos"] = cos
             self.common_ratio_to_sas_metadata["sin"] = sin
         else:
@@ -906,6 +988,13 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
 
         self.block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+        if using_path:
+            path_bt = getattr(common_attn_metadata, "tree_path_block_table", None)
+            if path_bt is not None:
+                self.block_table = path_bt
+            else:
+                path_req = common_attn_metadata.tree_path_req_idx
+                self.block_table = self.block_table[path_req]
         req_metadata = self.build_req_metadata(
             common_attn_metadata=common_attn_metadata,
             seq_lens_cpu=seq_lens_cpu,
@@ -1076,14 +1165,54 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         assert self.common_ratio_to_sas_metadata is not None
         metadata_cache = self.common_ratio_to_sas_metadata
         assert self.num_actual_tokens is not None
-        num_reqs = common_attn_metadata.num_reqs
-        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-        seq_lens = self.seq_lens[:num_reqs]
+        path_qsl = getattr(common_attn_metadata, "tree_path_query_start_loc", None)
+        if path_qsl is not None:
+            num_reqs = path_qsl.shape[0] - 1
+            query_start_loc = path_qsl[: num_reqs + 1]
+            query_start_loc_cpu = common_attn_metadata.tree_path_query_start_loc_cpu
+            if query_start_loc_cpu is None:
+                query_start_loc_cpu = query_start_loc.cpu()  # D2H
+            else:
+                query_start_loc_cpu = query_start_loc_cpu[: num_reqs + 1]
+            seq_lens = common_attn_metadata.tree_path_seq_lens[:num_reqs]
+            if common_attn_metadata.tree_path_seq_lens_cpu is not None:
+                seq_lens_cpu = common_attn_metadata.tree_path_seq_lens_cpu[:num_reqs]
+            else:
+                seq_lens_cpu = seq_lens.cpu()  # D2H
+            num_actual_reqs = num_reqs
+        else:
+            num_reqs = common_attn_metadata.num_reqs
+            query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+            seq_lens = self.seq_lens[:num_reqs]
         seq_lens_q = query_start_loc[1:] - query_start_loc[:-1]
         max_seqlen_q = torch.max(query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]).item()
         max_seqlen_kv = torch.max(seq_lens_cpu[:num_reqs]).item()
         has_prefill = self.num_prefills > 0
+        gkey = self.cache_group_key or ""
+        if gkey.startswith("mtp.") or ".mtp." in f".{gkey}.":
+            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                host_i0,
+                path_log,
+            )
+
+            seq0 = host_i0(seq_lens)
+            q0 = host_i0(seq_lens_q)
+            path_log(
+                "draft_sas gkey=%s npref=%s ndec=%s causal=%s ntok=%s "
+                "seq0=%s q0=%s start0=%s threshold=%s short_decode=%s phase0=%s",
+                gkey,
+                self.num_prefills,
+                self.num_decodes,
+                int(bool(common_attn_metadata.causal)),
+                int(self.num_actual_tokens or -1),
+                seq0,
+                q0,
+                seq0 - q0 if seq0 >= 0 and q0 >= 0 else -1,
+                int(getattr(self, "_active_decode_threshold", self.decode_threshold)),
+                int(getattr(self, "_active_treat_short_extends", False)),
+                host_i0(getattr(common_attn_metadata, "is_prefilling", None)),
+            )
 
         self.start_pos_prefill.fill_(0)
         self.start_pos_prefill[:num_reqs] = seq_lens - seq_lens_q
@@ -1094,32 +1223,45 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             if num_actual_reqs < num_reqs:
                 self.start_pos_prefill[num_actual_reqs:num_reqs].fill_(0)
                 self.block_table[num_actual_reqs:num_reqs, ...].fill_(0)
-        layer_name = f"c{self.compressor_ratio}"
+        # RoPE registry keys are ``c4`` / ``c1`` / ``c128``. SAS metadata for
+        # two ratio=1 pools (96+ vs 192+) must not share that key.
+        rope_group = f"c{self.compressor_ratio}"
+        layer_name = f"{rope_group}:{self.cache_group_key}"
         cu_seqlens_ori_kv = None
         cu_seqlens_cmp_kv = None
         dspark_swa_indices = None
         vision_swa_indices = None
         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
-        if not has_prefill and not common_attn_metadata.causal:
+        if self._is_dspark_draft(common_attn_metadata):
             # DSpark non-causal parallel drafting: every draft query attends to
             # the trailing context window plus the whole current draft block.
-            # Not gated on the SAS metadata cache: the indices depend on the
-            # current step's block table / sequence lengths, so they must be
-            # rebuilt whenever a DSpark draft step runs.
+            # This is required for both the first prefill and later decode
+            # steps; prefill/decode only changes the SAS metadata layout.
             assert self.speculative_config is not None
             dspark_swa_indices, _ = build_dspark_swa_indices(
-                self.block_table[: self.num_decodes],
+                self.block_table[:num_reqs],
                 self.speculative_config.num_speculative_tokens,
                 self.model_config.hf_config.sliding_window,
                 self.storage_block_size,
-                query_start_loc[: self.num_decodes + 1],
-                self.seq_lens[: self.num_decodes],
-                self.num_decode_tokens,
+                query_start_loc[: num_reqs + 1],
+                self.seq_lens[:num_reqs],
+                self.num_actual_tokens,
                 buffer=self.dspark_swa_indices_buffer,
+            )
+            _log_dspark_swa_indices(
+                dspark_swa_indices,
+                compressor_ratio=self.compressor_ratio,
+                block_table=self.block_table[:num_reqs],
+                gkey=self.cache_group_key,
+                block_size=int(self.storage_block_size),
             )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
         tree_ori_indices = None
-        if self.tree_adapter is not None and self.compressor_ratio <= 1:
+        if (
+            path_qsl is None
+            and self.tree_adapter is not None
+            and self.compressor_ratio <= 1
+        ):
             tree_ori_indices = self.common_ratio_to_sas_metadata.get("tree_ori_indices")
             if tree_ori_indices is None:
                 tree_ori_indices = self.tree_adapter.build_target_inputs(
@@ -1240,7 +1382,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_actual_reqs = num_reqs
             else:
                 num_compressed_tokens = self._num_compressor_metadata_rows(num_reqs)
-            full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
+            full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(rope_group)
             slot_mapping = None
         else:
             num_compressed_tokens = self.num_actual_tokens
@@ -1283,6 +1425,36 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dspark_swa_indices=dspark_swa_indices,
             vision_swa_indices=vision_swa_indices,
             tree_ori_indices=tree_ori_indices,
+            skip_compressed_cache_write=(
+                not bool(
+                    getattr(common_attn_metadata, "tree_path_kv_isolated", False)
+                )
+                and (
+                    path_qsl is not None
+                    or (
+                        self.tree_spec_enabled
+                        and (get_ascend_config().tree_spec_config.topk or 0) > 1
+                        and is_target_tree_step(common_attn_metadata)
+                        and tree_query_len() is not None
+                        and int(max_seqlen_q) == tree_query_len()
+                    )
+                )
+            ),
+            tree_path_kv_isolated=bool(
+                getattr(common_attn_metadata, "tree_path_kv_isolated", False)
+            ),
+        )
+        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+            note_dsa_skip_write,
+        )
+
+        note_dsa_skip_write(
+            skip_write=req_metadata.skip_compressed_cache_write,
+            isolated=bool(
+                getattr(common_attn_metadata, "tree_path_kv_isolated", False)
+            ),
+            has_path_qsl=path_qsl is not None,
+            num_tokens=int(self.num_actual_tokens),
         )
         if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
             assert num_compressed_tokens is not None
@@ -1316,13 +1488,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
     ) -> AscendDSAMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
         # Draft keep the linear DSpark threshold; tree 1+budget is target-only.
-        draft_threshold = self.decode_threshold
-        if self.tree_spec_enabled and self.speculative_config is not None:
-            draft_threshold = 1 + self.speculative_config.num_speculative_tokens
+        draft_threshold = self._split_decode_threshold(common_attn_metadata)
+        self._active_decode_threshold = draft_threshold
+        self._active_treat_short_extends = True
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=draft_threshold,
+                treat_short_extends_as_decodes=True,
             )
         )
         num_reqs = common_attn_metadata.num_reqs
@@ -1407,13 +1580,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                         f"active={self.num_actual_tokens}, capacity={self.dspark_swa_indices_buffer.shape[0]}"
                     )
                 dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
-                build_dspark_swa = lambda: build_dspark_swa_indices(
-                    *dspark_swa_args,
-                    indices_output=dspark_swa_indices,
-                )
+                swa_bt = self.block_table[:num_reqs]
+                swa_ratio = self.compressor_ratio
+
+                def build_dspark_swa():
+                    build_dspark_swa_indices(
+                        *dspark_swa_args,
+                        indices_output=dspark_swa_indices,
+                    )
+                    _log_dspark_swa_indices(
+                        dspark_swa_indices,
+                        compressor_ratio=swa_ratio,
+                        block_table=swa_bt,
+                        gkey=self.cache_group_key,
+                        block_size=int(self.storage_block_size),
+                    )
+
             else:
                 dspark_swa_indices, _ = build_dspark_swa_indices(*dspark_swa_args)
                 dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
+                _log_dspark_swa_indices(
+                    dspark_swa_indices,
+                    compressor_ratio=self.compressor_ratio,
+                    block_table=self.block_table[:num_reqs],
+                    gkey=self.cache_group_key,
+                    block_size=int(self.storage_block_size),
+                )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
 
         cu_seqlens_ori_kv = (
@@ -2121,7 +2313,15 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             overlap_plan = IndexerOverlapPlan(
                 compute_attention_compressed_kv=compute_attention_compressed_kv,
                 scatter_attention_compressed_kv=scatter_attention_compressed_kv,
-                aux_stream=dsv4_dsa_overlap_stream() if self.multistream_dsv4_dsa_overlap else None,
+                aux_stream=(
+                    None
+                    if not write_cache
+                    else (
+                        dsv4_dsa_overlap_stream()
+                        if self.multistream_dsv4_dsa_overlap
+                        else None
+                    )
+                ),
             )
             return self.indexer(
                 hidden_states=hidden_states,
@@ -2191,8 +2391,18 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
 
+        skip_cmp_write = bool(
+            getattr(swa_req_metadata, "skip_compressed_cache_write", False)
+        )
+        isolated = bool(getattr(swa_req_metadata, "tree_path_kv_isolated", False))
+        write_swa_cache = not cache_is_prepared and (isolated or not skip_cmp_write)
+        write_cmp = not cache_is_prepared and not skip_cmp_write
         compressor_tail_fn = None
-        if self.multistream_dsv4_dsa_overlap and self.compress_ratio > 1:
+        if (
+            self.multistream_dsv4_dsa_overlap
+            and self.compress_ratio > 1
+            and write_cmp
+        ):
             compressor = self.compressor
             tail_compressor_metadata = layer_metadata.compressor
             assert compressor is not None
@@ -2205,7 +2415,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     metadata=tail_compressor_metadata,
                 )
 
-        if self.multistream_dsv4_dsa_overlap:
+        if self.multistream_dsv4_dsa_overlap and write_cmp:
             q, qr, qr_pertoken_scale, compressor_overlap_output = self._mla_prolog_multistream(
                 hidden_states,
                 cos,
@@ -2223,7 +2433,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 sin,
                 swa_kv_cache,
                 swa_req_metadata.slot_mapping,
-                write_swa_cache=not cache_is_prepared,
+                write_swa_cache=write_swa_cache,
             )
 
         compress_topk_idxs = None
@@ -2241,7 +2451,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 compress_kv_cache=compress_kv_cache,
                 state_cache=state_cache,
                 compressor_overlap_output=compressor_overlap_output,
-                write_cache=not cache_is_prepared,
+                write_cache=write_cmp,
             )
 
         notify_kv_cache_written(layer_name)

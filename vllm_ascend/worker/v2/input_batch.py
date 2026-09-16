@@ -90,6 +90,19 @@ class AscendInputBatch(InputBatch):
     tree_next_sibling: torch.Tensor | None = None
     tree_proposal_logits: torch.Tensor | None = None
     slot_positions: torch.Tensor | None = None
+    # DSV4 leaf-path TND verify (device unless *_cpu).
+    tree_path_query_start_loc: torch.Tensor | None = None
+    tree_path_query_start_loc_cpu: torch.Tensor | None = None
+    tree_path_seq_lens: torch.Tensor | None = None
+    tree_path_seq_lens_cpu: torch.Tensor | None = None
+    tree_path_req_idx: torch.Tensor | None = None
+    tree_path_node_ids: torch.Tensor | None = None
+    tree_path_token_req: torch.Tensor | None = None
+    tree_node_row: torch.Tensor | None = None
+    tree_prefix_lens: torch.Tensor | None = None
+    tree_path_kv_isolated: bool = False
+    tree_path_block_tables: tuple[torch.Tensor, ...] | None = None
+    tree_path_slot_mappings: torch.Tensor | None = None
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False

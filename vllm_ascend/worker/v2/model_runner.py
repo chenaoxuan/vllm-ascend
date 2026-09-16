@@ -71,7 +71,9 @@ from vllm_ascend.worker.v2.pp_utils import (
 )
 from vllm_ascend.worker.v2.spec_decode import (
     dflash_tree_spec_enabled,
+    dsv4_dspark_draft,
     init_speculator,
+    tree_target_query_len,
 )
 from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
@@ -131,6 +133,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.tree_kv_compact = None
+        self.dsv4_path_verifier = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -186,11 +189,14 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
-        # nodes, so the verify query is budget+1 rather than spec_depth+1.
+        # Qwen3 packed tree and DSV4 topk>1 are ``1+budget``. DSV4 topk=1
+        # is ``1+spec``. Path TND may emit more tokens later; MC2 dummy
+        # must stay on this scheduler width.
         if dflash_tree_spec_enabled(vllm_config):
-            self.decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
+            qlen = tree_target_query_len(vllm_config)
+            self.decode_query_len = (
+                qlen if qlen is not None else self.num_speculative_steps + 1
+            )
         else:
             self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
@@ -276,6 +282,11 @@ class NPUModelRunner(GPUModelRunner):
 
             self.tree_kv_compact = TreeKvCompact(self)
             self.speculator.tree_kv_compact = self.tree_kv_compact
+        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+            ensure_dsv4_path_verifier,
+        )
+
+        ensure_dsv4_path_verifier(self)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -295,6 +306,13 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
+        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+            ensure_dsv4_path_verifier,
+        )
+
+        verifier = ensure_dsv4_path_verifier(self)
+        if verifier is not None:
+            verifier.install_scratch()
 
     @torch.inference_mode()
     def execute_model(
@@ -446,6 +464,35 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
         if draft_tokens:
+            n_neg = 0
+            first = -1
+            n_tot = 0
+            for toks in draft_tokens.values():
+                n_tot += len(toks)
+                for i, t in enumerate(toks):
+                    if t < 0:
+                        if first < 0:
+                            first = i
+                        n_neg += 1
+            if n_neg:
+                from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                    path_log,
+                    tree_token_stats,
+                )
+
+                tmin, tmax, nneg_tree = tree_token_stats(
+                    self.req_states.draft_tokens[idx_mapping]
+                )
+                path_log(
+                    "spec_token_ids pad_neg1 count=%s first_idx=%s n=%s "
+                    "tree_tokens min=%s max=%s neg_count=%s",
+                    n_neg,
+                    first,
+                    n_tot,
+                    tmin,
+                    tmax,
+                    nneg_tree,
+                )
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
@@ -471,6 +518,7 @@ class NPUModelRunner(GPUModelRunner):
             tree_depths is not None
             and self.ascend_config.tree_spec_config.topk is not None
             and self.ascend_config.tree_spec_config.topk > 1
+            and not getattr(self.speculator, "_dsv4_dspark_draft", False)
         )
         if use_tree_pos:
             is_prefilling = async_copy_to_gpu(
@@ -604,6 +652,19 @@ class NPUModelRunner(GPUModelRunner):
                     :num_tokens_after_padding
                 ]
 
+        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+            dsv4_path_isolation_needed,
+        )
+
+        if dsv4_path_isolation_needed(self) or getattr(
+            self.speculator, "_dsv4_dspark_draft", False
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.path_pack import (
+                apply_dsv4_path_pack,
+            )
+
+            apply_dsv4_path_pack(self, input_batch)
+
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
         if vllm_version_is("0.28.0"):
@@ -656,6 +717,13 @@ class NPUModelRunner(GPUModelRunner):
             positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
+        path_slots = getattr(input_batch, "tree_path_slot_mappings", None)
+        if path_slots is not None:
+            n = min(slot_mappings.shape[1], path_slots.shape[1])
+            g = min(slot_mappings.shape[0], path_slots.shape[0])
+            slot_mappings[:g, :n].copy_(path_slots[:g, :n].to(dtype=slot_mappings.dtype))
+            if slot_mappings.shape[1] > n:
+                slot_mappings[:, n:].fill_(-1)
         return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
@@ -774,10 +842,54 @@ class NPUModelRunner(GPUModelRunner):
         sampler = getattr(self, "rejection_sampler", None)
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
         if path_node_ids is not None and self.tree_kv_compact is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+                needs_causal_kv_repair,
+                repair_tree_kv_causal,
+            )
             from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
             with tree_time("compact_kv_path"):
-                self.tree_kv_compact.run(idx_mapping, path_node_ids)
+                from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                    dsv4_path_isolation_needed,
+                )
+
+                if dsv4_path_isolation_needed(self):
+                    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                        path_log,
+                    )
+                    from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+                        commit_dsv4_accepted_chain,
+                    )
+
+                    verifier = getattr(self, "dsv4_path_verifier", None)
+                    if verifier is not None and getattr(verifier, "_expect_verify", False) and not getattr(verifier, "_wrap_hit", False):
+                        path_log(
+                            "wrap intercept=0 reason=wrap_not_called graph=%s",
+                            getattr(self.compilation_config, "cudagraph_mode", None),
+                        )
+                    if verifier is not None:
+                        verifier._expect_verify = False
+                        saved_qsl = getattr(verifier, "_post_query_start_loc", None)
+                        if saved_qsl is not None:
+                            query_start_loc = saved_qsl
+                        verifier._post_query_start_loc = None
+                    commit_dsv4_accepted_chain(
+                        self, idx_mapping, sampled_tokens, num_sampled
+                    )
+                elif needs_causal_kv_repair(self):
+                    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                        path_log,
+                    )
+
+                    acc = 0
+                    if num_sampled is not None and num_sampled.numel() > 0:
+                        acc = int(num_sampled.reshape(-1)[0].item())  # D2H
+                    path_log("postprocess path=repair accepted_len=%s", acc)
+                    repair_tree_kv_causal(
+                        self, idx_mapping, sampled_tokens, num_sampled
+                    )
+                else:
+                    self.tree_kv_compact.run(idx_mapping, path_node_ids)
             sampler.path_node_ids = None
 
         super().postprocess_sampled(

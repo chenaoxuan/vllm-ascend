@@ -37,7 +37,13 @@ def iter_unique_kv_cache_tensors(kv_cache) -> list[torch.Tensor]:
     if kv_cache is None:
         return []
     if isinstance(kv_cache, (tuple, list)):
-        return [t for t in kv_cache if isinstance(t, torch.Tensor) and t.ndim >= 2]
+        out: list[torch.Tensor] = []
+        for item in kv_cache:
+            if isinstance(item, torch.Tensor) and item.ndim >= 2:
+                out.append(item)
+            elif isinstance(item, (tuple, list)):
+                out.extend(iter_unique_kv_cache_tensors(item))
+        return out
     if isinstance(kv_cache, torch.Tensor) and kv_cache.ndim >= 2:
         if kv_cache.shape[0] == 2 and kv_cache.ndim >= 3:
             return [kv_cache[0], kv_cache[1]]

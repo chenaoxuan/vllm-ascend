@@ -1,12 +1,67 @@
-import logging
-
+import numpy as np
 import torch
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    is_forward_context_available,
+    set_forward_context,
+)
+from vllm.logger import init_logger
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ops.rotary_embedding import update_cos_sin
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
 )
 
-logger = logging.getLogger(__name__)
+logger = init_logger("vllm." + __name__)
+
+
+try:
+    from vllm.v1.kv_cache_interface import CircularBufferSpec as _CircularBufferSpec
+except ImportError:
+    _CircularBufferSpec = None
+
+
+def _spec_is_circular_buffer(spec) -> bool:
+    if _CircularBufferSpec is None or spec is None:
+        return False
+    if isinstance(spec, _CircularBufferSpec):
+        return True
+    first = getattr(spec, "first_spec", None)
+    return first is not None and isinstance(first, _CircularBufferSpec)
+
+
+def _group_is_linear_token_cache(group) -> bool:
+    """True when compact can treat the group as 1 token per slot."""
+    names = getattr(group, "layer_names", ()) or ()
+    if any("state_cache" in name for name in names):
+        return False
+    spec = group.kv_cache_spec
+    if _spec_is_circular_buffer(spec) or getattr(spec, "cache_role", None):
+        return False
+    inner = getattr(spec, "kv_cache_specs", None)
+    specs = list(inner.values()) if inner else [spec]
+    for item in specs:
+        if _spec_is_circular_buffer(item) or getattr(item, "cache_role", None):
+            return False
+        ratio = getattr(item, "tokens_per_state", None)
+        if ratio is None:
+            ratio = getattr(item, "compress_ratio", 1)
+        if ratio is not None and int(ratio) > 1:
+            return False
+    return True
+
+
+def needs_causal_kv_repair(runner) -> bool:
+    """DSV4 C4/state cannot be compacted as token slots after packed tree verify."""
+    groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None)
+    if not groups:
+        return False
+    return any(not _group_is_linear_token_cache(group) for group in groups)
 
 
 class TreeKvCompact:
@@ -90,6 +145,8 @@ class TreeKvCompact:
         groups = []
         seen: set[int] = set()
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
+            if not _group_is_linear_token_cache(group):
+                continue
             caches: list[torch.Tensor] = []
             gathers: list[torch.Tensor] = []
             for layer_name in group.layer_names:
@@ -161,3 +218,283 @@ class TreeKvCompact:
                 scratch = gather[:nslot]
                 torch.index_select(flat, 0, src_flat, out=scratch)
                 flat.index_copy_(0, dst_flat, scratch)
+
+
+def run_short_causal_forward(
+    runner,
+    input_batch: AscendInputBatch,
+    *,
+    model=None,
+    model_kwargs: dict | None = None,
+):
+    """Eager causal target forward. Caller owns input-buffer save/restore.
+
+    ``model`` should be the bare module when DSV4 path verify wraps
+    ``runner.model``. All tensors except metadata copies marked ``# D2H``
+    stay on device.
+    """
+    n = input_batch.num_tokens
+    eplb = getattr(runner, "eplb", None)
+    isolated = bool(
+        getattr(
+            getattr(runner, "dsv4_path_verifier", None),
+            "_in_isolated_forward",
+            False,
+        )
+    )
+    eplb_prepare = eplb is not None
+    if eplb_prepare:
+        eplb.prepare_forward(runner.model_config, n)
+    block_tables, slot_mappings = runner.prepare_attn(input_batch)
+    attn_metadata = runner.model_state.prepare_attn(
+        input_batch,
+        CUDAGraphMode.NONE,
+        block_tables,
+        slot_mappings,
+        runner.attn_groups,
+        runner.kv_cache_config,
+    )
+    slot_mappings_by_layer = build_slot_mappings_by_layer(
+        slot_mappings, runner.kv_cache_config
+    )
+    fwd_model = model if model is not None else getattr(
+        runner, "_dsv4_bare_model", runner.model
+    )
+    inputs = {
+        "input_ids": input_batch.input_ids,
+        "positions": input_batch.positions,
+        "inputs_embeds": None,
+        "intermediate_tensors": None,
+        **runner.model_state.prepare_inputs(input_batch, runner.req_states),
+    }
+    if model_kwargs:
+        inputs.update(model_kwargs)
+        inputs["input_ids"] = input_batch.input_ids
+        inputs["positions"] = input_batch.positions
+    batch_descriptor = BatchDescriptor(num_tokens=n)
+    parent_ctx = get_forward_context() if is_forward_context_available() else None
+    nested = parent_ctx is not None
+    verifier = getattr(runner, "dsv4_path_verifier", None)
+    if verifier is not None and getattr(verifier, "_diag_left", 0) > 0:
+        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import path_log
+
+        path_log(
+            "serial_fwd leaves=%s n_tok=%s nested_ctx=%s attn_num_tokens=%s "
+            "eplb_prepare=%s isolated=%s moe_comm_copy=0",
+            getattr(verifier, "_cur_leaves", None),
+            n,
+            int(nested),
+            n,
+            int(eplb_prepare),
+            int(isolated),
+        )
+    with set_forward_context(
+        attn_metadata,
+        runner.vllm_config,
+        num_tokens=n,
+        cudagraph_runtime_mode=CUDAGraphMode.NONE,
+        batch_descriptor=batch_descriptor,
+        slot_mapping=slot_mappings_by_layer,
+        is_padding=input_batch.is_padding,
+    ):
+        # Nested under packed execute_model (~72 tokens, flashinfer_all2allv).
+        # Serial waves are ~9 tokens: do NOT copy parent moe_comm_* or the
+        # all-to-all splits stay sized for the outer batch and poison logits.
+        return fwd_model(**inputs)
+
+
+def commit_dsv4_accepted_chain(
+    runner,
+    idx_mapping: torch.Tensor,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+) -> None:
+    """Write the accepted chain onto official prefix KV after isolated verify.
+
+    Serial leaves must restore SWA suffix *and* circular C4/state before this
+    runs, so the compressor ring still holds the pre-verify residual. The
+    re-forward is a normal decode of the K accepted tokens: SWA/C4 pages use
+    prefix+offset slots, circular state uses the allocated 1–2 ring blocks
+    with ``pos % capacity``. That is the write the next step should read.
+    """
+    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+        path_log,
+        pos_span,
+        tensor_rms,
+    )
+
+    acc = 0
+    if num_sampled.numel() > 0:
+        acc = int(num_sampled.reshape(-1)[0].item())  # D2H
+    path_log(
+        "postprocess path=commit_dsv4_accepted_chain accepted_len=%s "
+        "suffix_kv=official_prefix circular=decode_write",
+        acc,
+    )
+    meta = repair_tree_kv_causal(runner, idx_mapping, sampled_tokens, num_sampled)
+    spec = getattr(runner, "speculator", None)
+    if meta is None or spec is None:
+        return
+    n, pos, qsl, aux = meta
+    spec._dsv4_commit_n = n
+    spec._dsv4_commit_pos = pos
+    spec._dsv4_commit_qsl = qsl
+    spec._dsv4_commit_aux = [a.clone() for a in aux] if aux else None
+    mtp = None
+    getter = getattr(runner.model, "get_mtp_target_hidden_states", None)
+    if callable(getter):
+        mtp = getter()
+    spec._dsv4_commit_hidden = mtp[:n].clone() if mtp is not None else None
+    pmin, pmax = pos_span(pos, n)
+    aux_rms = [tensor_rms(a[:n] if a.shape[0] >= n else a) for a in aux] if aux else []
+    path_log(
+        "commit hidden=prefix n_tok=%s pos=%s..%s aux_layers=%s "
+        "skip_path_scatter=1 hidden_src=%s hidden_rms=%s aux_rms=%s",
+        n,
+        pmin,
+        pmax,
+        0 if not aux else len(aux),
+        "mtp" if mtp is not None else "none",
+        tensor_rms(spec._dsv4_commit_hidden),
+        aux_rms,
+    )
+
+
+def repair_tree_kv_causal(
+    runner,
+    idx_mapping: torch.Tensor,
+    sampled_tokens: torch.Tensor,
+    num_sampled: torch.Tensor,
+):
+    """Causal re-forward of accepted tokens onto official linear KV.
+
+    Used as the DSV4 tree commit after leaf-isolated verify (scratch / serial
+    suffix is not the prefix layout). All tensors except the metadata copies
+    marked ``# D2H`` stay on device.
+
+    Returns ``(n, positions, query_start_loc, aux)`` for the accepted prefix
+    when the forward runs, else ``None``. ``n`` is a host int.
+    """
+    orig_reqs = sampled_tokens.shape[0]
+    if orig_reqs <= 0:
+        return None
+    idx = idx_mapping[:orig_reqs]
+    keep = num_sampled[:orig_reqs] > 0
+    n_keep = int(keep.sum().item())  # D2H
+    if n_keep <= 0:
+        return None
+    num_reqs = orig_reqs
+    if n_keep < orig_reqs:
+        idx = idx[keep]
+        sampled_tokens = sampled_tokens[keep]
+        num_sampled = num_sampled[keep]
+        num_reqs = n_keep
+    safe_idx = idx.clamp(min=0)
+    device = sampled_tokens.device
+    max_q = sampled_tokens.shape[1]
+    local = torch.arange(max_q, device=device)
+    mask = local.unsqueeze(0) < num_sampled.unsqueeze(1)
+    qsl = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
+    qsl[1:] = num_sampled.to(dtype=torch.int32).cumsum(0)
+    n = int(qsl[-1].item())  # D2H
+    if n <= 0:
+        return None
+
+    prefix = runner.req_states.num_computed_tokens.gpu[safe_idx]
+    ids = sampled_tokens.masked_select(mask)
+    pos = (prefix.unsqueeze(1) + local.to(dtype=prefix.dtype)).masked_select(mask)
+    seq_lens = prefix + num_sampled.to(dtype=prefix.dtype)
+
+    bufs = runner.input_buffers
+    old_qsl = bufs.query_start_loc[: orig_reqs + 1].clone()
+    old_n = int(old_qsl[-1].item())  # D2H
+    old_n = max(old_n, n)
+    old_ids = bufs.input_ids[:old_n].clone()
+    old_pos = bufs.positions[:old_n].clone()
+    old_seq = bufs.seq_lens[:orig_reqs].clone()
+    old_seq_np = bufs.seq_lens_np[:orig_reqs].copy()
+    old_pad = bufs.is_padding[:old_n].clone()
+
+    idx_np = safe_idx.cpu().numpy()  # D2H
+    qsl_np = qsl.cpu().numpy()  # D2H
+    seq_np = seq_lens.cpu().numpy().astype(np.int32, copy=False)  # D2H
+    scheduled_np = num_sampled.cpu().numpy().astype(np.int32, copy=False)  # D2H
+    computed_np = prefix.cpu().numpy().astype(np.int32, copy=False)  # D2H
+
+    bufs.input_ids[:n].copy_(ids.to(dtype=bufs.input_ids.dtype))
+    bufs.positions[:n].copy_(pos.to(dtype=bufs.positions.dtype))
+    bufs.query_start_loc[: num_reqs + 1].copy_(qsl)
+    bufs.seq_lens[:num_reqs].copy_(seq_lens.to(dtype=bufs.seq_lens.dtype))
+    bufs.seq_lens_np[:num_reqs] = seq_np
+    bufs.is_padding[:n].fill_(False)
+    update_cos_sin(bufs.positions[:n])
+
+    prefill_np = runner.req_states.prefill_len.np[idx_np]
+    input_batch = AscendInputBatch(
+        req_ids=[""] * num_reqs,
+        num_reqs=num_reqs,
+        num_reqs_after_padding=num_reqs,
+        idx_mapping=idx,
+        idx_mapping_np=idx_np,
+        expanded_idx_mapping=idx,
+        expanded_local_pos=torch.zeros(
+            num_reqs, dtype=torch.int32, device=device
+        ),
+        num_scheduled_tokens=scheduled_np,
+        num_tokens=n,
+        num_tokens_after_padding=n,
+        num_draft_tokens=0,
+        num_draft_tokens_per_req=None,
+        query_start_loc=bufs.query_start_loc[: num_reqs + 1],
+        query_start_loc_np=qsl_np,
+        seq_lens=bufs.seq_lens[:num_reqs],
+        seq_lens_cpu_upper_bound=torch.from_numpy(np.array(seq_np, copy=True)),
+        dcp_local_seq_lens=None,
+        num_computed_tokens_np=computed_np,
+        prefill_len_np=prefill_np,
+        num_computed_prefill_tokens_np=runner.req_states.num_computed_prefill_tokens[
+            idx_np
+        ],
+        is_prefilling_np=np.zeros(num_reqs, dtype=bool),
+        has_prefill=False,
+        input_ids=bufs.input_ids[:n],
+        positions=bufs.positions[:n],
+        is_padding=bufs.is_padding[:n],
+        logits_indices=bufs.query_start_loc[1 : num_reqs + 1] - 1,
+        cu_num_logits=bufs.query_start_loc[: num_reqs + 1],
+        cu_num_logits_np=qsl_np,
+        has_structured_output_reqs=False,
+        prompt_lens=None,
+        max_query_len=int(scheduled_np.max()) if scheduled_np.size else 0,
+        seq_lens_np=bufs.seq_lens_np[:num_reqs],
+        attn_state=AscendAttentionState.ChunkedPrefill,
+        tree_visibility=None,
+        slot_positions=None,
+    )
+
+    out = None
+    try:
+        out = run_short_causal_forward(runner, input_batch)
+    finally:
+        bufs.input_ids[:old_n].copy_(old_ids)
+        bufs.positions[:old_n].copy_(old_pos)
+        bufs.query_start_loc[: orig_reqs + 1].copy_(old_qsl)
+        bufs.seq_lens[:orig_reqs].copy_(old_seq)
+        bufs.seq_lens_np[:orig_reqs] = old_seq_np
+        bufs.is_padding[:old_n].copy_(old_pad)
+        update_cos_sin(bufs.positions[:old_n])
+    if out is None:
+        return None
+    _, aux = _split_model_output(out)
+    return n, pos, qsl, aux
+
+
+def _split_model_output(output):
+    if isinstance(output, tuple):
+        hidden, rest = output[0], output[1]
+        if rest is None:
+            return hidden, None
+        if isinstance(rest, torch.Tensor):
+            return hidden, [rest]
+        return hidden, list(rest)
+    return output, None

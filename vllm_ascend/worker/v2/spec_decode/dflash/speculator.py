@@ -284,7 +284,8 @@ if vllm_version_is("0.28.0"):
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
         # tokens this step.
-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
+        draft_seq_len = tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len - 1)
+        tl.store(out_seq_lens_ptr + req_idx, draft_seq_len)
         # Copy sampling state (added upstream in vllm-project/vllm#50000).
         tl.store(
             out_temperature_ptr + req_state_idx,
@@ -447,7 +448,8 @@ else:
         # seq_lens is the absolute sequence length the draft attention
         # reads up to (context + query), not just the count of accepted
         # tokens this step.
-        tl.store(out_seq_lens_ptr + req_idx, last_valid_pos + 1 + num_query_per_req)
+        draft_seq_len = tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len - 1)
+        tl.store(out_seq_lens_ptr + req_idx, draft_seq_len)
         # Copy sampling state (added upstream in vllm-project/vllm#50000).
         tl.store(
             out_temperature_ptr + req_state_idx,

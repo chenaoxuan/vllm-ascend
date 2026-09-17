@@ -135,6 +135,9 @@ class TreeKvCompact:
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
         valid = (path >= 0) & (idx >= 0).unsqueeze(1)
         src_pos = torch.where(valid, src_pos, dst_pos)
+        max_pos = self.runner.max_model_len - 1
+        dst_pos = dst_pos.clamp(max=max_pos)
+        src_pos = src_pos.clamp(max=max_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
         for caches, block_table, block_size, gathers in self._groups:
             max_block = block_table.shape[1] - 1

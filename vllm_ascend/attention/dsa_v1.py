@@ -27,6 +27,7 @@ from vllm_ascend.attention.dsa_attn_kv_plan import (
 )
 from vllm_ascend.attention.tree_spec import (
     DsaTreeSpecAdapter,
+    align_up,
     is_target_tree_step,
     tree_decode_threshold,
     tree_query_len,
@@ -97,6 +98,17 @@ def reset_compressor_metadata_cache() -> None:
     forward_context.additional_kwargs.pop(_COMPRESSOR_METADATA_CACHE_KEY, None)
 
 
+def _compressor_layout(metadata: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Packed request layout for compressor_metadata."""
+    return (
+        metadata.query_start_loc,
+        metadata.start_pos,
+        metadata.block_table,
+        metadata.num_compressed_tokens,
+        metadata.num_actual_reqs,
+    )
+
+
 def get_or_compute_compressor_metadata(
     metadata: Any,
     compress_ratio: int,
@@ -125,9 +137,12 @@ def get_or_compute_compressor_metadata(
 
     assert metadata.full_compress_cos is not None
     assert metadata.full_compress_sin is not None
-    assert metadata.num_compressed_tokens is not None
-    assert metadata.start_pos is not None
-    assert metadata.num_actual_reqs is not None
+    query_start_loc, start_pos, block_table, num_compressed_tokens, num_actual_reqs = (
+        _compressor_layout(metadata)
+    )
+    assert num_compressed_tokens is not None
+    assert start_pos is not None
+    assert num_actual_reqs is not None
     full_compress_cos = metadata.full_compress_cos.view(
         metadata.full_compress_cos.shape[0],
         metadata.full_compress_cos.shape[-1],
@@ -139,14 +154,14 @@ def get_or_compute_compressor_metadata(
     computed_metadata = torch.ops._C_ascend.compressor_metadata(
         full_compress_cos,
         full_compress_sin,
-        metadata.query_start_loc,
-        metadata.start_pos,
-        metadata.block_table,
+        query_start_loc,
+        start_pos,
+        block_table,
         metadata.storage_block_size,
         get_dsa_attn_kv_plan(vllm_config).get_dsa_compressor_slot_mapping_format(),
         compress_ratio,
-        metadata.num_compressed_tokens,
-        metadata.num_actual_reqs,
+        num_compressed_tokens,
+        num_actual_reqs,
     )
     cache[cache_group_key] = computed_metadata
     return computed_metadata
@@ -160,8 +175,11 @@ def build_compressor_metadata_out(
 ) -> None:
     assert metadata.full_compress_cos is not None
     assert metadata.full_compress_sin is not None
-    assert metadata.start_pos is not None
-    assert metadata.num_actual_reqs is not None
+    query_start_loc, start_pos, block_table, _, num_actual_reqs = _compressor_layout(
+        metadata
+    )
+    assert start_pos is not None
+    assert num_actual_reqs is not None
     full_compress_cos = metadata.full_compress_cos.view(
         metadata.full_compress_cos.shape[0],
         metadata.full_compress_cos.shape[-1],
@@ -173,13 +191,13 @@ def build_compressor_metadata_out(
     torch.ops._C_ascend.compressor_metadata_out(
         full_compress_cos,
         full_compress_sin,
-        metadata.query_start_loc,
-        metadata.start_pos,
-        metadata.block_table,
+        query_start_loc,
+        start_pos,
+        block_table,
         metadata.storage_block_size,
         get_dsa_attn_kv_plan(vllm_config).get_dsa_compressor_slot_mapping_format(),
         compress_ratio,
-        metadata.num_actual_reqs,
+        num_actual_reqs,
         *outputs,
     )
 
@@ -367,8 +385,9 @@ class AscendDSAReqMetadata:
     dspark_swa_indices: torch.Tensor | None = None
     vision_swa_indices: torch.Tensor | None = None
     tree_ori_indices: torch.Tensor | None = None
-    # Packed sibling TND skips C4/state writes. Isolated serial writes then
-    # the verifier restores native circular/state blocks.
+    # Packed tree verify: skip C4/indexer/state. ``tree_path_kv_isolated``
+    # keeps ori scatter on while ``skip_compressed_cache_write`` gates
+    # ``write_cmp`` (read from the SWA req metadata).
     skip_compressed_cache_write: bool = False
     tree_path_kv_isolated: bool = False
 
@@ -1027,19 +1046,29 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_cmp_kv: torch.Tensor | None,
         ori_win_left: int,
         ori_win_right: int = 0,
+        ori_topk: int = 0,
+        has_cmp_kv: bool | None = None,
     ) -> torch.Tensor:
         sas_metadata = metadata_cache.get(layer_name)
         if sas_metadata is None:
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
-            cmp_ratio = (
-                _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
-                if self.compressor_ratio <= 1
-                else 4
-                if self.compressor_ratio == 4
-                else 128
-            )
+            if has_cmp_kv is None:
+                has_cmp_kv = self.compressor_ratio > 1
+            # A3 SCFA (has_cmp_kv) ignores ori_sparse_indices. Packed tree
+            # therefore runs the SWA template on C4 layers so tree slots apply.
+            if has_cmp_kv:
+                sas_ori_topk = 0
+                cmp_ratio = 4 if self.compressor_ratio == 4 else 128
+            elif self.compressor_ratio <= 1:
+                sas_ori_topk = ori_topk
+                cmp_ratio = _dsa_swa_only_cmp_ratio(
+                    self.compressor_ratio, self.vllm_config
+                )
+            else:
+                sas_ori_topk = ori_topk
+                cmp_ratio = 1
             kv_plan = get_dsa_attn_kv_plan(self.vllm_config)
             metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
             metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
@@ -1050,13 +1079,14 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 head_dim=self.model_config.get_head_size(),
                 cu_seqlens_q=query_start_loc,
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv if has_cmp_kv else None,
                 seqused_q=self.seqused_q,
                 seqused_kv=seq_lens,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=len(seq_lens),
-                cmp_topk=index_topk if self.compressor_ratio == 4 else 0,
+                ori_topk=sas_ori_topk,
+                cmp_topk=index_topk if has_cmp_kv and self.compressor_ratio == 4 else 0,
                 cmp_ratio=cmp_ratio,
                 ori_mask_mode=4,  # 4:sliding window
                 cmp_mask_mode=3,  # 3:causal
@@ -1069,7 +1099,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,
-                has_cmp_kv=self.compressor_ratio > 1,
+                has_cmp_kv=has_cmp_kv,
             )
             metadata_cache[layer_name] = sas_metadata
 
@@ -1257,23 +1287,38 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             )
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
         tree_ori_indices = None
-        if (
+        # tree_visibility is allocated on every target batch, including prompt
+        # prefill; only the decode-shaped packed window is tree verify.
+        tree_step = (
             path_qsl is None
+            and not has_prefill
             and self.tree_adapter is not None
-            and self.compressor_ratio <= 1
-        ):
-            tree_ori_indices = self.common_ratio_to_sas_metadata.get("tree_ori_indices")
-            if tree_ori_indices is None:
+            and (get_ascend_config().tree_spec_config.topk or 0) > 1
+            and is_target_tree_step(common_attn_metadata)
+        )
+        packed_tree = tree_step
+        idx_src = "none"
+        if tree_step:
+            window = int(self.model_config.hf_config.sliding_window)
+            budget = (tree_query_len() or 1) - 1
+            ori_win_left, ori_win_right = window + budget - 1, 0
+            idx_key = f"tree_ori_indices:{self.cache_group_key}"
+            tree_ori_indices = self.common_ratio_to_sas_metadata.get(idx_key)
+            gkey = self.cache_group_key or ""
+            if tree_ori_indices is not None:
+                idx_src = "reuse"
+            elif self.compressor_ratio <= 1 and "state_cache" not in gkey:
                 tree_ori_indices = self.tree_adapter.build_target_inputs(
                     self,
                     common_attn_metadata,
                     num_decodes=self.num_decodes,
                 )
-                self.common_ratio_to_sas_metadata["tree_ori_indices"] = tree_ori_indices
-            if tree_ori_indices is not None:
-                window = int(self.model_config.hf_config.sliding_window)
-                budget = (tree_query_len() or 1) - 1
-                ori_win_left, ori_win_right = window + budget - 1, 0
+                self.common_ratio_to_sas_metadata[idx_key] = tree_ori_indices
+                idx_src = "built" if tree_ori_indices is not None else "build_none"
+            elif "state_cache" in gkey:
+                idx_src = "skip_state"
+            else:
+                idx_src = "c4_no_build"
         # Text-only requests and lightweight metadata fixtures do not carry
         # multimodal document ranges. Treat those as having no vision spans.
         mm_ranges = getattr(common_attn_metadata, "mm_req_doc_ranges", None)
@@ -1316,6 +1361,32 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         elif has_prefill:
             cu_seqlens_ori_kv = query_start_loc
 
+        tree_ori_topk = tree_ori_indices.shape[-1] if tree_ori_indices is not None else 0
+        topk_src = "tensor" if tree_ori_indices is not None else "zero"
+        if packed_tree and tree_ori_topk == 0:
+            window = int(self.model_config.hf_config.sliding_window)
+            budget = (tree_query_len() or 1) - 1
+            tree_ori_topk = align_up(window + budget, 128)
+            topk_src = "fallback"
+        if packed_tree:
+            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                log_tree_idx_bind,
+                tree_idx_probe,
+            )
+
+            idx_head, q0_last, q1_last, _ = tree_idx_probe(tree_ori_indices)
+            log_tree_idx_bind(
+                gkey=self.cache_group_key or "",
+                ratio=int(self.compressor_ratio),
+                src=idx_src,
+                has_idx=tree_ori_indices is not None,
+                ori_topk=int(tree_ori_topk),
+                topk_src=topk_src,
+                idx_head=idx_head,
+                q0_last=q0_last,
+                q1_last=q1_last,
+            )
+        sas_has_cmp = self.compressor_ratio > 1 and not packed_tree
         if self._device_metadata_enabled:
 
             def build_sas_metadata() -> None:
@@ -1330,6 +1401,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
                     ori_win_left=ori_win_left,
                     ori_win_right=ori_win_right,
+                    ori_topk=tree_ori_topk,
+                    has_cmp_kv=sas_has_cmp,
                 )
 
             def build_qli_metadata() -> None:
@@ -1341,7 +1414,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     max_seqlen_kv=max_seqlen_kv,
                 )
 
-            if self.compressor_ratio == 4:
+            if self.compressor_ratio == 4 and sas_has_cmp:
                 self._device_metadata_tasks = (
                     DeviceMetadataTask(DeviceMetadataStage.INDEXER, build_qli_metadata, id(self.qli_metadata_buffer)),
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
@@ -1351,7 +1424,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
                 )
             sas_metadata = self.sas_metadata_buffer
-            qli_metadata = self.qli_metadata_buffer if self.compressor_ratio == 4 else None
+            qli_metadata = (
+                self.qli_metadata_buffer
+                if self.compressor_ratio == 4 and sas_has_cmp
+                else None
+            )
         else:
             self._device_metadata_tasks = ()
             sas_metadata = self._build_sas_metadata(
@@ -1365,13 +1442,19 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
                 ori_win_left=ori_win_left,
                 ori_win_right=ori_win_right,
+                ori_topk=tree_ori_topk,
+                has_cmp_kv=sas_has_cmp,
             )
-            qli_metadata = self._build_qli_metadata(
-                metadata_cache=metadata_cache,
-                query_start_loc=query_start_loc,
-                seq_lens=seq_lens,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
+            qli_metadata = (
+                self._build_qli_metadata(
+                    metadata_cache=metadata_cache,
+                    query_start_loc=query_start_loc,
+                    seq_lens=seq_lens,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_kv,
+                )
+                if self.compressor_ratio == 4 and sas_has_cmp
+                else None
             )
 
         full_compress_cos, full_compress_sin = None, None
@@ -1425,38 +1508,41 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dspark_swa_indices=dspark_swa_indices,
             vision_swa_indices=vision_swa_indices,
             tree_ori_indices=tree_ori_indices,
-            skip_compressed_cache_write=(
-                not bool(
-                    getattr(common_attn_metadata, "tree_path_kv_isolated", False)
-                )
-                and (
-                    path_qsl is not None
-                    or (
-                        self.tree_spec_enabled
-                        and (get_ascend_config().tree_spec_config.topk or 0) > 1
-                        and is_target_tree_step(common_attn_metadata)
-                        and tree_query_len() is not None
-                        and int(max_seqlen_q) == tree_query_len()
-                    )
-                )
-            ),
-            tree_path_kv_isolated=bool(
-                getattr(common_attn_metadata, "tree_path_kv_isolated", False)
+            skip_compressed_cache_write=packed_tree,
+            tree_path_kv_isolated=(
+                packed_tree or common_attn_metadata.tree_path_kv_isolated
             ),
         )
         from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+            host_i0,
             note_dsa_skip_write,
         )
 
+        seq0 = host_i0(seq_lens)
+        q0 = host_i0(seq_lens_q)
         note_dsa_skip_write(
             skip_write=req_metadata.skip_compressed_cache_write,
-            isolated=bool(
-                getattr(common_attn_metadata, "tree_path_kv_isolated", False)
-            ),
-            has_path_qsl=path_qsl is not None,
+            isolated=req_metadata.tree_path_kv_isolated,
             num_tokens=int(self.num_actual_tokens),
+            packed_iso=packed_tree,
+            ori_idx=tree_ori_indices is not None or tree_step,
+            gkey=self.cache_group_key or "",
+            ratio=int(self.compressor_ratio),
+            has_prefill=int(has_prefill),
+            num_prefills=int(self.num_prefills),
+            num_decodes=int(self.num_decodes),
+            sas_has_cmp=int(sas_has_cmp),
+            ori_topk=int(tree_ori_topk),
+            ori_win=int(ori_win_left),
+            seq0=seq0,
+            q0=q0,
+            start0=seq0 - q0 if seq0 >= 0 and q0 >= 0 else -1,
         )
-        if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
+        if (
+            self._device_metadata_enabled
+            and self.compressor_metadata_buffers is not None
+            and not packed_tree
+        ):
             assert num_compressed_tokens is not None
             buffers = self.compressor_metadata_buffers
             outputs = (
@@ -2391,10 +2477,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
 
-        skip_cmp_write = bool(
-            getattr(swa_req_metadata, "skip_compressed_cache_write", False)
-        )
-        isolated = bool(getattr(swa_req_metadata, "tree_path_kv_isolated", False))
+        skip_cmp_write = swa_req_metadata.skip_compressed_cache_write
+        isolated = swa_req_metadata.tree_path_kv_isolated
         write_swa_cache = not cache_is_prepared and (isolated or not skip_cmp_write)
         write_cmp = not cache_is_prepared and not skip_cmp_write
         compressor_tail_fn = None
@@ -2438,7 +2522,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         compress_topk_idxs = None
         compressor_metadata = None
-        if self.compress_ratio > 1:
+        if self.compress_ratio > 1 and not skip_cmp_write:
             compressor_metadata = layer_metadata.compressor
             assert compressor_metadata is not None
             compress_topk_idxs = self._maybe_update_compressed_caches_and_select_topk(
@@ -2462,7 +2546,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_ori_kv=actual_seq_lengths_query)
-        if self.compress_ratio > 1:
+        if self.compress_ratio > 1 and not skip_cmp_write:
             kv_plan.add_dsa_sparse_attn_extra_kwargs(attn_kwargs, cu_seqlens_cmp_kv=common_metadata.cu_cmp_seqlen_list)
 
         attn_kwargs.update(
@@ -2473,7 +2557,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             sinks=self.attn_sink,
             metadata=common_metadata.sas_metadata,
             softmax_scale=self.softmax_scale,
-            cmp_ratio=_dsa_swa_only_cmp_ratio(self.compress_ratio, self.vllm_config),
+            cmp_ratio=(
+                1
+                if skip_cmp_write
+                else _dsa_swa_only_cmp_ratio(self.compress_ratio, self.vllm_config)
+            ),
             ori_mask_mode=4,
             ori_win_left=ori_win_left,
             ori_win_right=ori_win_right,
@@ -2490,7 +2578,56 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if ori_sparse_indices is not None:
             attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
 
-        if self.compress_ratio > 1:
+        if skip_cmp_write or swa_req_metadata.tree_ori_indices is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                host_i0,
+                host_linear_slots,
+                log_target_attn,
+                tree_idx_probe,
+            )
+
+            sm = swa_req_metadata.slot_mapping
+            writes = host_linear_slots(
+                sm,
+                int(swa_req_metadata.storage_block_size),
+                4,
+            )
+            slot0 = writes[0] if writes else -1
+            ori_src = "none"
+            if swa_req_metadata.tree_ori_indices is not None:
+                ori_src = "tree"
+            elif swa_req_metadata.vision_swa_indices is not None:
+                ori_src = "vision"
+            elif self.compress_ratio <= 1 and swa_req_metadata.dspark_swa_indices is not None:
+                ori_src = "dspark"
+            idx_head, q0_last, q1_last, q0_nvalid = tree_idx_probe(
+                swa_req_metadata.tree_ori_indices
+            )
+            log_target_attn(
+                layer_name=layer_name,
+                ratio=int(self.compress_ratio),
+                skip_c4=skip_cmp_write,
+                write_ori=write_swa_cache,
+                write_cmp=write_cmp,
+                pass_ori=ori_sparse_indices is not None,
+                pass_cmp=self.compress_ratio > 1 and not skip_cmp_write,
+                cmp_ratio=int(attn_kwargs["cmp_ratio"]),
+                has_prefill=has_prefill,
+                n_tok=num_tokens,
+                ori_win=int(ori_win_left),
+                slot0=slot0,
+                seq0=host_i0(actual_seq_lengths_key),
+                tree_idx=swa_req_metadata.tree_ori_indices is not None,
+                swa_gkey=swa_req_metadata.cache_group_key or "",
+                write_slots=writes,
+                idx_head=idx_head,
+                q0_last=q0_last,
+                q1_last=q1_last,
+                q0_nvalid=q0_nvalid,
+                ori_src=ori_src,
+            )
+
+        if self.compress_ratio > 1 and not skip_cmp_write:
             assert compressor_metadata is not None
             attn_kwargs.update(
                 cmp_kv=compress_kv_cache,

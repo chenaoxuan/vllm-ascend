@@ -52,9 +52,8 @@ def _spine_first_pool_indices(
 ) -> torch.Tensor:
     """Permute pool slots so the best path is packed as a causal prefix.
 
-    DSA tree verify is packed-causal SWA (ori_sparse_indices is a no-op).
-    BFS order puts all depth-1 siblings before any depth-2 node, so a
-    depth-2 query attends to every sibling instead of its parent.
+    Packed-causal DSA still benefits from a spine-first layout. Tree verify
+    additionally passes ancestor slots via ori_sparse_indices.
     """
     num_reqs, num_pool = pool_parents.shape
     device = pool_parents.device

@@ -250,6 +250,11 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         self._restore_replicated_draft_target_states()
+        from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+            snapshot_dsv4_tree_aux,
+        )
+
+        snapshot_dsv4_tree_aux(self)
         output = super().sample_tokens(grammar_output)
         if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -310,9 +315,7 @@ class NPUModelRunner(GPUModelRunner):
             ensure_dsv4_path_verifier,
         )
 
-        verifier = ensure_dsv4_path_verifier(self)
-        if verifier is not None:
-            verifier.install_scratch()
+        ensure_dsv4_path_verifier(self)
 
     @torch.inference_mode()
     def execute_model(
@@ -653,17 +656,10 @@ class NPUModelRunner(GPUModelRunner):
                 ]
 
         from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-            dsv4_path_isolation_needed,
+            ensure_dsv4_path_verifier,
         )
 
-        if dsv4_path_isolation_needed(self) or getattr(
-            self.speculator, "_dsv4_dspark_draft", False
-        ):
-            from vllm_ascend.worker.v2.spec_decode.tree.path_pack import (
-                apply_dsv4_path_pack,
-            )
-
-            apply_dsv4_path_pack(self, input_batch)
+        ensure_dsv4_path_verifier(self)
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
@@ -843,6 +839,7 @@ class NPUModelRunner(GPUModelRunner):
         path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
         if path_node_ids is not None and self.tree_kv_compact is not None:
             from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+                commit_dsv4_accepted_chain,
                 needs_causal_kv_repair,
                 repair_tree_kv_causal,
             )
@@ -851,40 +848,19 @@ class NPUModelRunner(GPUModelRunner):
             with tree_time("compact_kv_path"):
                 from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
                     dsv4_path_isolation_needed,
+                    path_log,
                 )
 
+                acc = 0
+                if num_sampled is not None and num_sampled.numel() > 0:
+                    acc = int(num_sampled.reshape(-1)[0].item())  # D2H
                 if dsv4_path_isolation_needed(self):
-                    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                        path_log,
-                    )
-                    from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
-                        commit_dsv4_accepted_chain,
-                    )
-
-                    verifier = getattr(self, "dsv4_path_verifier", None)
-                    if verifier is not None and getattr(verifier, "_expect_verify", False) and not getattr(verifier, "_wrap_hit", False):
-                        path_log(
-                            "wrap intercept=0 reason=wrap_not_called graph=%s",
-                            getattr(self.compilation_config, "cudagraph_mode", None),
-                        )
-                    if verifier is not None:
-                        verifier._expect_verify = False
-                        saved_qsl = getattr(verifier, "_post_query_start_loc", None)
-                        if saved_qsl is not None:
-                            query_start_loc = saved_qsl
-                        verifier._post_query_start_loc = None
+                    path_log("commit acc=%s", acc)
                     commit_dsv4_accepted_chain(
                         self, idx_mapping, sampled_tokens, num_sampled
                     )
                 elif needs_causal_kv_repair(self):
-                    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                        path_log,
-                    )
-
-                    acc = 0
-                    if num_sampled is not None and num_sampled.numel() > 0:
-                        acc = int(num_sampled.reshape(-1)[0].item())  # D2H
-                    path_log("postprocess path=repair accepted_len=%s", acc)
+                    path_log("repair acc=%s", acc)
                     repair_tree_kv_causal(
                         self, idx_mapping, sampled_tokens, num_sampled
                     )

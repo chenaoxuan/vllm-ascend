@@ -57,7 +57,7 @@ def _group_is_linear_token_cache(group) -> bool:
 
 
 def needs_causal_kv_repair(runner) -> bool:
-    """DSV4 C4/state cannot be compacted as token slots after packed tree verify."""
+    """True when a KV group cannot be compacted by paged slot after tree verify."""
     groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None)
     if not groups:
         return False
@@ -67,8 +67,11 @@ def needs_causal_kv_repair(runner) -> bool:
 class TreeKvCompact:
     """Move accepted-path target KV from tree slots onto the linear prefix.
 
-    Verify already wrote KV at ``prefix+node``. Packed RoPE at depth ``d``
-    matches the linear dest ``prefix+d``, so a slot move is enough.
+    Verify wrote ori KV at packed ``prefix+node``. GQA keeps the root at
+    ``prefix`` and lands drafts at ``prefix+1..``. DSV4 packed verify
+    recomputes the root at ``prefix``; official sampled tokens start there,
+    so drafts land at ``prefix+0..`` (``dst_from_zero``). C4/indexer/state
+    are not compacted.
 
     Single-stream: ``run`` after target+reject and before
     ``num_computed`` increments. One ACLGraph per ``num_reqs`` so the
@@ -86,6 +89,7 @@ class TreeKvCompact:
         self.max_num_reqs = runner.max_num_reqs
         self._graphs: dict[int, object] = {}
         self._groups = None
+        self._held = None
         self._idx = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._path = torch.full(
             (self.max_num_reqs, self.spec_len),
@@ -96,6 +100,8 @@ class TreeKvCompact:
         self._depth = (
             torch.arange(self.spec_len, device=self.device, dtype=torch.int32) + 1
         )
+        self._depth0 = torch.arange(self.spec_len, device=self.device, dtype=torch.int32)
+        self._dst_off = self._depth
 
     def capture(self, sizes: list[int]) -> None:
         if not sizes or self.runner.model_config.enforce_eager:
@@ -127,16 +133,32 @@ class TreeKvCompact:
                     exc,
                 )
 
-    def run(self, idx_mapping: torch.Tensor, path_node_ids: torch.Tensor) -> None:
+    def run(
+        self,
+        idx_mapping: torch.Tensor,
+        path_node_ids: torch.Tensor,
+        *,
+        dst_from_zero: bool = False,
+    ) -> None:
         num_reqs = path_node_ids.shape[0]
         self._idx[:num_reqs].copy_(idx_mapping[:num_reqs])
         self._path[:num_reqs].copy_(path_node_ids[:num_reqs])
+        self._dst_off = self._depth0 if dst_from_zero else self._depth
         graph = self._graphs.get(num_reqs)
-        if graph is not None:
+        if graph is not None and not dst_from_zero:
             graph.replay()
             return
         self._bind_groups()
         self._compact(num_reqs)
+
+    def scatter_held(self) -> None:
+        """Re-apply the last gather onto dest slots (after a later overwrite)."""
+        if not self._held:
+            return
+        for cache, scratch, dst_flat in self._held:
+            tail = cache.shape[2:]
+            flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
+            flat.index_copy_(0, dst_flat, scratch)
 
     def _bind_groups(self) -> None:
         if self._groups is not None:
@@ -182,13 +204,16 @@ class TreeKvCompact:
         self._groups = groups
 
     def _compact(self, num_reqs: int) -> None:
+        if not self._groups:
+            self._held = None
+            return
         idx = self._idx[:num_reqs]
         path = self._path[:num_reqs]
         num_computed = self.runner.req_states.num_computed_tokens.gpu
         nslot = num_reqs * self.spec_len
         safe_idx = idx.clamp(min=0)
         prefix = num_computed[safe_idx]
-        dst_pos = prefix.unsqueeze(1) + self._depth
+        dst_pos = prefix.unsqueeze(1) + self._dst_off
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
         valid = (path >= 0) & (idx >= 0).unsqueeze(1)
         src_pos = torch.where(valid, src_pos, dst_pos)
@@ -196,6 +221,7 @@ class TreeKvCompact:
         dst_pos = dst_pos.clamp(max=max_pos)
         src_pos = src_pos.clamp(max=max_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
+        held = []
         for caches, block_table, block_size, gathers in self._groups:
             max_block = block_table.shape[1] - 1
             src_bi = torch.div(src_pos, block_size, rounding_mode="floor").clamp(
@@ -212,12 +238,15 @@ class TreeKvCompact:
             dst_flat = (dst_block * block_size + dst_pos % block_size).to(
                 dtype=torch.long
             ).reshape(-1)
+            dst_keep = dst_flat.clone()
             for cache, gather in zip(caches, gathers):
                 tail = cache.shape[2:]
                 flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
                 scratch = gather[:nslot]
                 torch.index_select(flat, 0, src_flat, out=scratch)
                 flat.index_copy_(0, dst_flat, scratch)
+                held.append((cache, scratch, dst_keep))
+        self._held = held
 
 
 def run_short_causal_forward(
@@ -303,36 +332,99 @@ def run_short_causal_forward(
         return fwd_model(**inputs)
 
 
+def snapshot_dsv4_tree_aux(runner) -> None:
+    """Clone packed-verify aux before parent ``sample_tokens`` drops it.
+
+    ``GPUModelRunner.sample_tokens`` sets ``execute_model_state = None``
+    then later ``repair_tree_kv_causal`` overwrites the live aux buffers.
+    Commit splices draft context from this clone, not from the repair aux.
+    """
+    spec = getattr(runner, "speculator", None)
+    if spec is None:
+        return
+    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+        dsv4_path_isolation_needed,
+    )
+
+    if not dsv4_path_isolation_needed(runner):
+        return
+    state = getattr(runner, "execute_model_state", None)
+    aux = None if state is None else getattr(state, "aux_hidden_states", None)
+    spec._dsv4_tree_aux = None if not aux else [a.clone() for a in aux]
+
+
+def _split_tree_aux_like(tree_aux, commit_aux):
+    """Match snapshot aux layout to the repair aux list (split cat last-dim)."""
+    if not tree_aux or not commit_aux:
+        return tree_aux
+    if len(tree_aux) == len(commit_aux):
+        return tree_aux
+    if len(tree_aux) != 1:
+        return tree_aux
+    cat = tree_aux[0]
+    widths = [a.shape[-1] for a in commit_aux]
+    if cat.shape[-1] != sum(widths):
+        return tree_aux
+    return list(cat.split(widths, dim=-1))
+
+
 def commit_dsv4_accepted_chain(
     runner,
     idx_mapping: torch.Tensor,
     sampled_tokens: torch.Tensor,
     num_sampled: torch.Tensor,
 ) -> None:
-    """Write the accepted chain onto official prefix KV after isolated verify.
+    """Write the accepted chain onto official prefix KV after packed verify.
 
-    Serial leaves must restore SWA suffix *and* circular C4/state before this
-    runs, so the compressor ring still holds the pre-verify residual. The
-    re-forward is a normal decode of the K accepted tokens: SWA/C4 pages use
-    prefix+offset slots, circular state uses the allocated 1–2 ring blocks
-    with ``pos % capacity``. That is the write the next step should read.
+    Packed tree verify skips C4/indexer/state and writes ori with SWA-C4
+    hidden. A later causal re-forward repairs C4/state and the bonus ori
+    slot; accepted ori slots are restored from the tree-verify gather so
+    the next SWA-C4 verify does not mix true-C4 keys with SWA-C4 queries.
+    Draft hidden/aux use compacted tree-verify rows plus the repaired bonus.
     """
     from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
         path_log,
         pos_span,
         tensor_rms,
     )
+    from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+        compact_tree_query_along_path,
+    )
 
     acc = 0
     if num_sampled.numel() > 0:
         acc = int(num_sampled.reshape(-1)[0].item())  # D2H
+    sampler = getattr(runner, "rejection_sampler", None)
+    path = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+    compact = getattr(runner, "tree_kv_compact", None)
+    getter = getattr(runner.model, "get_mtp_target_hidden_states", None)
+    bufs = runner.input_buffers
+    orig_reqs = sampled_tokens.shape[0]
+    qsl_tree = bufs.query_start_loc[: orig_reqs + 1].clone()
+    n_tree = int(qsl_tree[-1].item()) if orig_reqs > 0 else 0  # D2H
+    raw_mtp = getter() if callable(getter) else None
+    tree_mtp = raw_mtp[:n_tree].clone() if raw_mtp is not None and n_tree > 0 else None
+    spec = getattr(runner, "speculator", None)
+    raw_aux = getattr(spec, "_dsv4_tree_aux", None) if spec is not None else None
+    n_tree_aux = 0 if not raw_aux else len(raw_aux)
+    tree_aux = [a[:n_tree] for a in raw_aux] if n_tree > 0 and raw_aux else None
+    if spec is not None:
+        spec._dsv4_tree_aux = None
+    compacted_ori = False
+    if compact is not None and path is not None:
+        compact.run(idx_mapping, path, dst_from_zero=True)
+        compacted_ori = True
     path_log(
         "postprocess path=commit_dsv4_accepted_chain accepted_len=%s "
-        "suffix_kv=official_prefix circular=decode_write",
+        "suffix_kv=official_prefix circular=decode_write compact_ori=%s "
+        "n_tree_aux=%s",
         acc,
+        int(compacted_ori),
+        n_tree_aux,
     )
     meta = repair_tree_kv_causal(runner, idx_mapping, sampled_tokens, num_sampled)
-    spec = getattr(runner, "speculator", None)
+    if compacted_ori:
+        compact.scatter_held()
     if meta is None or spec is None:
         return
     n, pos, qsl, aux = meta
@@ -341,20 +433,56 @@ def commit_dsv4_accepted_chain(
     spec._dsv4_commit_qsl = qsl
     spec._dsv4_commit_aux = [a.clone() for a in aux] if aux else None
     mtp = None
-    getter = getattr(runner.model, "get_mtp_target_hidden_states", None)
     if callable(getter):
         mtp = getter()
     spec._dsv4_commit_hidden = mtp[:n].clone() if mtp is not None else None
+    tree_aux = _split_tree_aux_like(tree_aux, spec._dsv4_commit_aux)
+    hidden_src = "repair"
+    aux_splice = 0
+    if path is not None and n_tree > 0 and n > 1 and (
+        tree_mtp is not None or tree_aux
+    ):
+        tensors = []
+        if tree_mtp is not None:
+            tensors.append(tree_mtp)
+        if tree_aux:
+            tensors.extend(tree_aux)
+        dummy_pos = torch.arange(
+            n_tree, device=tensors[0].device, dtype=torch.int32
+        )
+        compact_tree_query_along_path(
+            tensors,
+            qsl_tree,
+            path[:orig_reqs],
+            linearize_positions=dummy_pos,
+        )
+        cursor = 0
+        if tree_mtp is not None and spec._dsv4_commit_hidden is not None:
+            spec._dsv4_commit_hidden[: n - 1].copy_(tensors[cursor][1:n])
+            cursor += 1
+        if tree_aux and spec._dsv4_commit_aux:
+            for dst, src in zip(spec._dsv4_commit_aux, tensors[cursor:]):
+                dst[: n - 1].copy_(src[1:n])
+            aux_splice = 1
+        hidden_src = "tree_path+bonus"
     pmin, pmax = pos_span(pos, n)
-    aux_rms = [tensor_rms(a[:n] if a.shape[0] >= n else a) for a in aux] if aux else []
+    commit_aux = spec._dsv4_commit_aux
+    aux_rms = (
+        [tensor_rms(a[:n] if a.shape[0] >= n else a) for a in commit_aux]
+        if commit_aux
+        else []
+    )
     path_log(
         "commit hidden=prefix n_tok=%s pos=%s..%s aux_layers=%s "
-        "skip_path_scatter=1 hidden_src=%s hidden_rms=%s aux_rms=%s",
+        "skip_path_scatter=1 hidden_src=%s aux_splice=%s n_tree_aux=%s "
+        "hidden_rms=%s aux_rms=%s",
         n,
         pmin,
         pmax,
-        0 if not aux else len(aux),
-        "mtp" if mtp is not None else "none",
+        0 if not commit_aux else len(commit_aux),
+        hidden_src,
+        aux_splice,
+        n_tree_aux,
         tensor_rms(spec._dsv4_commit_hidden),
         aux_rms,
     )

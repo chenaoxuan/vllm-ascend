@@ -187,9 +187,6 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
         from vllm_ascend.ascend_config import get_ascend_config
 
         # topk=1 is a chain. DSA SWA/causal already matches chain spec decode.
-        # npu_sparse_attn_sharedkv and kv_quant treat ori_sparse_indices as
-        # reserved/no-op; passing a non-512-wide index tensor can still
-        # perturb those kernels and collapse root logits.
         if get_ascend_config().tree_spec_config.topk <= 1:
             return None
         if num_decodes <= 0 or not is_target_tree_step(common_attn_metadata):
@@ -216,6 +213,7 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
             window_size=window,
             storage_block_size=int(builder.storage_block_size),
             buffer=builder.tree_ori_indices_buffer,
+            gkey=getattr(builder, "cache_group_key", "") or "",
         )
 
 
@@ -245,12 +243,14 @@ def build_tree_ori_sparse_indices(
     window_size: int,
     storage_block_size: int,
     buffer: torch.Tensor,
+    gkey: str = "",
 ) -> torch.Tensor:
     """Per-token ori slots for tree target verify (and mixed-batch prefills).
 
     Decode queries see the trailing SWA window of the committed prefix
     (including the root slot) plus draft slots allowed by ``tree_visibility``.
     Prefill tokens in a mixed batch keep a causal sliding window.
+    Valid slots are left-packed: the A3 SWA kernel stops at the first -1.
     Returned view is a leading slice of ``buffer`` so ACLGraph keeps a stable
     pointer.
     """
@@ -305,6 +305,14 @@ def build_tree_ori_sparse_indices(
     draft_slots = draft_slots.where(draft_valid, draft_slots.new_full((), -1))
 
     packed = torch.cat([prefix_slots, draft_slots], dim=-1)
+    # A3 SWA GetOriSparseActualSeqLen stops at the first -1, so valid prefix
+    # and ancestor draft slots must be left-packed. A hole in the SWA window
+    # would drop every later draft slot and collapse pos1+ logits.
+    valid = packed >= 0
+    ncol = packed.shape[-1]
+    order = torch.arange(ncol, device=device, dtype=torch.float32)
+    key = order + (~valid).to(order.dtype) * float(ncol)
+    packed = packed.gather(1, key.argsort(dim=-1))
     index_width = buffer.shape[-1]
     if packed.shape[-1] < index_width:
         pad = packed.new_full((num_tokens, index_width - packed.shape[-1]), -1)
@@ -315,4 +323,20 @@ def build_tree_ori_sparse_indices(
     buffer[:num_tokens].copy_(packed)
     if buffer.shape[0] > num_tokens:
         buffer[num_tokens:].fill_(-1)
+    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+        host_i0,
+        log_tree_ori_indices,
+    )
+
+    log_tree_ori_indices(
+        buffer[:num_tokens],
+        window_size=window_size,
+        budget=budget,
+        prefix0=host_i0(prefix_lens),
+        seq0=host_i0(seq_lens),
+        q0=host_i0(query_lens),
+        bt0=host_i0(block_table.reshape(-1)),
+        block_size=storage_block_size,
+        gkey=gkey,
+    )
     return buffer[:num_tokens]

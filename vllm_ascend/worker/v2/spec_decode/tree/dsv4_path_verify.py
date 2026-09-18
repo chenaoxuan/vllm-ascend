@@ -18,8 +18,8 @@ from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
 
 logger = init_logger("vllm." + __name__)
 
-# First 1–2 tree-verify windows: enough to reconstruct serial vs packed.
-_DIAG_WINDOWS = 2
+# Cover a full short-benchmark generation (≈6 draft/verify steps).
+_DIAG_WINDOWS = 8
 _step_serial = False
 _step_packed = False
 _step_dsa_skip = False
@@ -29,6 +29,9 @@ _pack_skip_seen: set[str] = set()
 # Host bool. None until TP is up so install can still log once per process.
 _path_log_rank0: bool | None = None
 _swa_idx_parts: list[tuple] = []
+_target_attn_logged: set[str] = set()
+_tree_idx_logs = 0
+_target_sas_logs = 0
 
 
 def _path_log_enabled() -> bool:
@@ -100,33 +103,262 @@ def _isolation_skip_reason(runner) -> str:
     return "not_dsv4"
 
 
+_packed_iso_logs = 0
+
+
+_tree_bind_logs = 0
+
+
+def host_linear_slots(
+    slot_mapping: torch.Tensor | None,
+    block_size: int,
+    n: int,
+) -> list[int]:
+    """First ``n`` paged slots. A3 BLOCK_OFFSET is ``[block, offset]``. Diag D2H."""
+    if not _path_log_enabled() or slot_mapping is None or slot_mapping.numel() == 0 or n <= 0:
+        return []
+    sm = slot_mapping
+    if sm.ndim == 2 and sm.shape[-1] == 2:
+        k = min(n, int(sm.shape[0]))
+        blocks = [int(x) for x in sm[:k, 0].tolist()]  # D2H
+        offs = [int(x) for x in sm[:k, 1].tolist()]  # D2H
+        return [b * block_size + o if b >= 0 and o >= 0 else -1 for b, o in zip(blocks, offs)]
+    return host_slot_head(sm, n)
+
+
+def tree_idx_probe(indices: torch.Tensor | None) -> tuple[list[int], int, int, int]:
+    """q0 head, q0 last valid, q1 last valid, q0 nvalid. Diag D2H."""
+    if not _path_log_enabled() or indices is None or indices.numel() == 0:
+        return [], -1, -1, 0
+    rows = indices.reshape(indices.shape[0], -1)
+    q0 = [int(x) for x in rows[0].tolist()]  # D2H
+    nvalid, _, _, head, tail = _row_sparse_stats(q0)
+    q0_last = tail[-1] if tail else -1
+    q1_last = -1
+    if rows.shape[0] > 1:
+        q1 = [int(x) for x in rows[1].tolist()]  # D2H
+        _, _, _, _, tail1 = _row_sparse_stats(q1)
+        q1_last = tail1[-1] if tail1 else -1
+    return head, q0_last, q1_last, nvalid
+
+
+def log_tree_idx_bind(
+    *,
+    gkey: str,
+    ratio: int,
+    src: str,
+    has_idx: bool,
+    ori_topk: int,
+    topk_src: str,
+    idx_head: list[int],
+    q0_last: int,
+    q1_last: int,
+) -> None:
+    """Per-group index bind: built / reuse / none. Host scalars."""
+    global _tree_bind_logs
+    if not _path_log_enabled():
+        return
+    if _tree_bind_logs >= _DIAG_WINDOWS * 8:
+        return
+    _tree_bind_logs += 1
+    path_log(
+        "tree_bind gkey=%s ratio=%s src=%s has_idx=%s ori_topk=%s topk_src=%s "
+        "idx_head=%s q0_last=%s q1_last=%s",
+        gkey,
+        ratio,
+        src,
+        int(has_idx),
+        ori_topk,
+        topk_src,
+        idx_head,
+        q0_last,
+        q1_last,
+    )
+
+
 def note_dsa_skip_write(
     *,
     skip_write: bool,
     isolated: bool,
-    has_path_qsl: bool,
     num_tokens: int,
+    packed_iso: bool = False,
+    ori_idx: bool = False,
+    gkey: str = "",
+    ratio: int = -1,
+    has_prefill: int = -1,
+    num_prefills: int = -1,
+    num_decodes: int = -1,
+    sas_has_cmp: int = -1,
+    ori_topk: int = -1,
+    ori_win: int = -1,
+    seq0: int = -1,
+    q0: int = -1,
+    start0: int = -1,
 ) -> None:
-    """Log DSA skip-write vs serial intercept. BUG if both serial and packed ran."""
-    global _step_dsa_skip, _step_dsa_logged
+    """DSA isolation + SAS shape. Host scalars; first ``_DIAG_WINDOWS`` groups."""
+    global _step_dsa_skip, _step_dsa_logged, _packed_iso_logs
     _step_dsa_skip = skip_write
-    both = _step_serial and _step_packed
-    if not _step_diag and not both:
+    if not packed_iso or _packed_iso_logs >= _DIAG_WINDOWS * 8:
         return
-    if _step_dsa_logged and not both:
-        return
+    _packed_iso_logs += 1
     path_log(
-        "dsa skip_write=%s isolated=%s path_qsl=%s num_tokens=%s "
-        "serial_ran=%s packed_ran=%s%s",
+        "iso skip_c4=%s write_ori=%s ori_idx=%s n=%s gkey=%s ratio=%s "
+        "has_prefill=%s npref=%s ndec=%s sas_cmp=%s ori_topk=%s ori_win=%s "
+        "seq0=%s q0=%s start0=%s",
         int(skip_write),
-        int(isolated),
-        int(has_path_qsl),
+        int(isolated or not skip_write),
+        int(ori_idx),
         num_tokens,
-        int(_step_serial),
-        int(_step_packed),
-        " BUG_packed_and_serial" if both else "",
+        gkey,
+        ratio,
+        has_prefill,
+        num_prefills,
+        num_decodes,
+        sas_has_cmp,
+        ori_topk,
+        ori_win,
+        seq0,
+        q0,
+        start0,
     )
     _step_dsa_logged = True
+
+
+def _row_sparse_stats(row: list[int]) -> tuple[int, int, int, list[int], list[int]]:
+    """nvalid, first_neg, holes_after_neg, head valids, tail valids."""
+    nvalid = 0
+    first_neg = -1
+    hole = 0
+    valid: list[int] = []
+    for i, x in enumerate(row):
+        if x >= 0:
+            nvalid += 1
+            valid.append(x)
+            if first_neg >= 0:
+                hole += 1
+        elif first_neg < 0:
+            first_neg = i
+    if first_neg < 0:
+        first_neg = len(row)
+    return nvalid, first_neg, hole, valid[:8], valid[-4:] if valid else []
+
+
+def log_tree_ori_indices(
+    indices: torch.Tensor | None,
+    *,
+    window_size: int = -1,
+    budget: int = -1,
+    prefix0: int = -1,
+    seq0: int = -1,
+    q0: int = -1,
+    bt0: int = -1,
+    block_size: int = -1,
+    gkey: str = "",
+) -> None:
+    """Compacted tree ori rows for root / first draft / last query. Diag D2H."""
+    global _tree_idx_logs, _target_attn_logged
+    if not _path_log_enabled() or indices is None or indices.numel() == 0:
+        return
+    if _tree_idx_logs >= _DIAG_WINDOWS * 4:
+        return
+    _tree_idx_logs += 1
+    _target_attn_logged.clear()
+    rows = indices.reshape(indices.shape[0], -1)
+    nq = int(rows.shape[0])
+    picks = [0]
+    if nq > 1:
+        picks.append(1)
+    if nq > 2:
+        picks.append(nq - 1)
+    parts = []
+    for qi in picks:
+        vals = [int(x) for x in rows[qi].tolist()]  # D2H
+        nvalid, first_neg, hole, head, tail = _row_sparse_stats(vals)
+        parts.append(
+            f"q{qi} nvalid={nvalid} first_neg={first_neg} hole={hole} "
+            f"head={head} tail={tail}"
+        )
+    path_log(
+        "tree_idx gkey=%s nq=%s win=%s budget=%s prefix0=%s seq0=%s q0=%s "
+        "bt0=%s bs=%s %s",
+        gkey,
+        nq,
+        window_size,
+        budget,
+        prefix0,
+        seq0,
+        q0,
+        bt0,
+        block_size,
+        " | ".join(parts),
+    )
+
+
+def log_target_attn(
+    *,
+    layer_name: str,
+    ratio: int,
+    skip_c4: bool,
+    write_ori: bool,
+    write_cmp: bool,
+    pass_ori: bool,
+    pass_cmp: bool,
+    cmp_ratio: int,
+    has_prefill: bool,
+    n_tok: int,
+    ori_win: int,
+    slot0: int,
+    seq0: int,
+    tree_idx: bool,
+    swa_gkey: str = "",
+    write_slots: list[int] | None = None,
+    idx_head: list[int] | None = None,
+    q0_last: int = -1,
+    q1_last: int = -1,
+    q0_nvalid: int = -1,
+    ori_src: str = "",
+) -> None:
+    """SWA / C4 / C128 lines per tree-verify window. Host scalars."""
+    global _target_attn_logged
+    if not _path_log_enabled():
+        return
+    tag = "c4" if ratio > 1 else "swa"
+    if layer_name in _target_attn_logged or len(_target_attn_logged) >= 4:
+        return
+    if _tree_idx_logs <= 0 and _tree_bind_logs <= 0:
+        return
+    _target_attn_logged.add(layer_name)
+    writes = write_slots or []
+    match_q0 = int(bool(writes) and writes[0] == q0_last and q0_last >= 0)
+    path_log(
+        "target_attn kind=%s layer=%s ratio=%s skip_c4=%s write_ori=%s "
+        "write_cmp=%s pass_ori=%s pass_cmp=%s cmp_ratio=%s has_prefill=%s "
+        "ntok=%s ori_win=%s slot0=%s write=%s seq0=%s tree_idx=%s swa_gkey=%s "
+        "ori_src=%s idx_head=%s q0_nvalid=%s q0_last=%s q1_last=%s match_q0=%s",
+        tag,
+        layer_name,
+        ratio,
+        int(skip_c4),
+        int(write_ori),
+        int(write_cmp),
+        int(pass_ori),
+        int(pass_cmp),
+        cmp_ratio,
+        int(has_prefill),
+        n_tok,
+        ori_win,
+        slot0,
+        writes[:4],
+        seq0,
+        int(tree_idx),
+        swa_gkey,
+        ori_src,
+        idx_head or [],
+        q0_nvalid,
+        q0_last,
+        q1_last,
+        match_q0,
+    )
 
 
 def is_dsv4_path_verify_proxy(model) -> bool:
@@ -153,7 +385,12 @@ def _model_is_isolated(model) -> bool:
 
 
 def dsv4_path_isolation_needed(runner) -> bool:
-    """True when DSV4 tree target verify must isolate leaf-path KV."""
+    """True when DSV4 tree target verify uses packed ori + skip-C4.
+
+    Ori stays Qwen3 packed with ``ori_sparse_indices``. Indexer/compressor
+    and circular state are not written during verify; accept rewrites them
+    with a causal forward of the accepted chain.
+    """
     from vllm_ascend.worker.v2.spec_decode import (
         dflash_tree_spec_enabled,
         dsv4_dspark_draft,
@@ -173,32 +410,20 @@ def dsv4_path_isolation_needed(runner) -> bool:
 
 
 def ensure_dsv4_path_verifier(runner):
-    """Create the verifier and wrap ``runner.model`` when isolation is needed.
-
-    Called from both ``load_model`` and ``initialize_kv_cache`` so a missed
-    load_model gate cannot leave packed TND without serial/CoW intercept.
-    """
+    """Log the packed isolation path. Serial wrap/scratch are no longer used."""
     if not dsv4_path_isolation_needed(runner):
         if not getattr(runner, "_dsv4_path_skip_logged", False):
             runner._dsv4_path_skip_logged = True
             path_log(
-                "wrap/install skip reason=%s graph=%s",
+                "iso=0 reason=%s graph=%s",
                 _isolation_skip_reason(runner),
                 _graph_mode_str(runner),
             )
-        return getattr(runner, "dsv4_path_verifier", None)
-    if getattr(runner, "dsv4_path_verifier", None) is None:
-        runner.dsv4_path_verifier = Dsv4PathVerifier(runner)
-        path_log("wrap/install verifier=created graph=%s", _graph_mode_str(runner))
-    model = getattr(runner, "model", None)
-    if model is not None and not _model_is_isolated(model):
-        runner.model = wrap_model_for_dsv4_path_verify(runner, model)
-        path_log(
-            "wrap/install intercept_ready=1 bare_model=%s graph=%s",
-            type(model).__name__,
-            _graph_mode_str(runner),
-        )
-    return runner.dsv4_path_verifier
+        return None
+    if not getattr(runner, "_dsv4_packed_iso_logged", False):
+        runner._dsv4_packed_iso_logged = True
+        path_log("iso=1 graph=%s", _graph_mode_str(runner))
+    return None
 
 
 def wrap_model_for_dsv4_path_verify(runner, model):

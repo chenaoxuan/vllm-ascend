@@ -134,6 +134,7 @@ class AscendModelState(DefaultModelState):
             pcp_context=pcp_context,
             for_cudagraph_capture=for_capture,
             tree_visibility=tree_visibility,
+            slot_positions=getattr(input_batch, "slot_positions", None),
             tree_path_query_start_loc=getattr(
                 input_batch, "tree_path_query_start_loc", None
             ),

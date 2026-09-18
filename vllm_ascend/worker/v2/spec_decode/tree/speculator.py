@@ -178,6 +178,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._dsv4_commit_qsl = None
         self._dsv4_commit_aux = None
         self._dsv4_commit_hidden = None
+        self._dsv4_tree_aux = None
         self._dsv4_chunk_prefix_len = None
         self._dsv4_chunk_bonus = -1
         self._dsv4_buf_seq0_pre = -1
@@ -1181,6 +1182,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                                     path_node_ids,
                                     linearize_positions=input_batch.positions,
                                 )
+                            if self._dsv4_dspark_draft:
+                                from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
+                                    path_log,
+                                )
+
+                                path_log("propose n=%s", last_hidden_states.shape[0])
             self._tree_finalized = False
             if self.draft_backend == "dspark":
                 copy_w = (

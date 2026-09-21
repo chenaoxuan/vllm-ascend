@@ -262,29 +262,13 @@ class TreeRejectionSampler(RejectionSampler):
         num_reqs = input_batch.num_reqs
         node_dim = tree.tokens.shape[1] + 1
         self._ensure_bufs(num_reqs, node_dim, logits.shape[-1])
-        path_token_node = getattr(input_batch, "tree_path_node_ids", None)
-        path_token_req = getattr(input_batch, "tree_path_token_req", None)
-        if path_token_node is not None and path_token_req is not None:
-            from vllm_ascend.worker.v2.spec_decode.tree.path_pack import (
-                scatter_path_logits,
-            )
-
-            target_logits = scatter_path_logits(
-                logits,
-                path_token_req,
-                path_token_node,
-                num_reqs,
-                node_dim,
-                out=self._packed_logits_buf,
-            )
-        else:
-            target_logits = _pack_tree_target_logits(
-                logits,
-                input_batch.cu_num_logits_np,
-                num_reqs,
-                node_dim,
-                out=self._packed_logits_buf,
-            )
+        target_logits = _pack_tree_target_logits(
+            logits,
+            input_batch.cu_num_logits_np,
+            num_reqs,
+            node_dim,
+            out=self._packed_logits_buf,
+        )
         path_node_ids = self._path_node_ids_buf[:num_reqs]
         path_node_ids.fill_(-1)
         sampled_buf = self._sampled_buf[:num_reqs]
@@ -293,7 +277,7 @@ class TreeRejectionSampler(RejectionSampler):
 
         with tree_time("rejection_sample"):
             if method == "magicmtp":
-                proposal = getattr(input_batch, "tree_proposal_logits", None)
+                proposal = input_batch.tree_proposal_logits
                 if proposal is None:
                     proposal = draft_logits
                 sampled = block_tree_reject(
@@ -313,11 +297,8 @@ class TreeRejectionSampler(RejectionSampler):
                     sampled_token_ids=sampled_buf,
                 )
         num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
-        if path_token_node is not None:
-            num_logits = num_sampled.new_full((num_reqs,), node_dim)
-        else:
-            cu = input_batch.cu_num_logits[: num_reqs + 1]
-            num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
+        cu = input_batch.cu_num_logits[: num_reqs + 1]
+        num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
         is_chunked = (
             input_batch.seq_lens[:num_reqs]
             < self.sampler.req_states.prefill_len.gpu[input_batch.idx_mapping[:num_reqs]]
@@ -332,18 +313,6 @@ class TreeRejectionSampler(RejectionSampler):
         )
         self.path_node_ids = path_node_ids
         input_batch.path_node_ids = path_node_ids
-        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-            log_tree_accept,
-        )
-
-        log_tree_accept(
-            tree.tokens,
-            tree.depths,
-            path_node_ids,
-            sampled,
-            num_sampled,
-            self.num_speculative_steps,
-        )
         return SamplerOutput(
             sampled_token_ids=sampled,
             logprobs_tensors=None,

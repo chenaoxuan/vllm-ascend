@@ -1,12 +1,7 @@
 import numpy as np
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import (
-    BatchDescriptor,
-    get_forward_context,
-    is_forward_context_available,
-    set_forward_context,
-)
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
@@ -90,6 +85,7 @@ class TreeKvCompact:
         self._graphs: dict[int, object] = {}
         self._groups = None
         self._held = None
+        self._hold = False
         self._idx = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._path = torch.full(
             (self.max_num_reqs, self.spec_len),
@@ -114,6 +110,7 @@ class TreeKvCompact:
         self._bind_groups()
         self._idx.fill_(0)
         self._path.fill_(-1)
+        self._hold = False
         pool = current_platform.get_global_graph_pool()
         for num_reqs in sizes:
             try:
@@ -144,6 +141,7 @@ class TreeKvCompact:
         self._idx[:num_reqs].copy_(idx_mapping[:num_reqs])
         self._path[:num_reqs].copy_(path_node_ids[:num_reqs])
         self._dst_off = self._depth0 if dst_from_zero else self._depth
+        self._hold = dst_from_zero
         graph = self._graphs.get(num_reqs)
         if graph is not None and not dst_from_zero:
             graph.replay()
@@ -221,6 +219,7 @@ class TreeKvCompact:
         dst_pos = dst_pos.clamp(max=max_pos)
         src_pos = src_pos.clamp(max=max_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
+        hold = self._hold
         held = []
         for caches, block_table, block_size, gathers in self._groups:
             max_block = block_table.shape[1] - 1
@@ -238,15 +237,16 @@ class TreeKvCompact:
             dst_flat = (dst_block * block_size + dst_pos % block_size).to(
                 dtype=torch.long
             ).reshape(-1)
-            dst_keep = dst_flat.clone()
+            dst_keep = dst_flat.clone() if hold else None
             for cache, gather in zip(caches, gathers):
                 tail = cache.shape[2:]
                 flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
                 scratch = gather[:nslot]
                 torch.index_select(flat, 0, src_flat, out=scratch)
                 flat.index_copy_(0, dst_flat, scratch)
-                held.append((cache, scratch, dst_keep))
-        self._held = held
+                if hold:
+                    held.append((cache, scratch, dst_keep))
+        self._held = held if hold else None
 
 
 def run_short_causal_forward(
@@ -256,23 +256,10 @@ def run_short_causal_forward(
     model=None,
     model_kwargs: dict | None = None,
 ):
-    """Eager causal target forward. Caller owns input-buffer save/restore.
-
-    ``model`` should be the bare module when DSV4 path verify wraps
-    ``runner.model``. All tensors except metadata copies marked ``# D2H``
-    stay on device.
-    """
+    """Eager causal target forward. Caller owns input-buffer save/restore."""
     n = input_batch.num_tokens
-    eplb = getattr(runner, "eplb", None)
-    isolated = bool(
-        getattr(
-            getattr(runner, "dsv4_path_verifier", None),
-            "_in_isolated_forward",
-            False,
-        )
-    )
-    eplb_prepare = eplb is not None
-    if eplb_prepare:
+    eplb = runner.eplb
+    if eplb is not None:
         eplb.prepare_forward(runner.model_config, n)
     block_tables, slot_mappings = runner.prepare_attn(input_batch)
     attn_metadata = runner.model_state.prepare_attn(
@@ -286,9 +273,7 @@ def run_short_causal_forward(
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, runner.kv_cache_config
     )
-    fwd_model = model if model is not None else getattr(
-        runner, "_dsv4_bare_model", runner.model
-    )
+    fwd_model = model if model is not None else runner.model
     inputs = {
         "input_ids": input_batch.input_ids,
         "positions": input_batch.positions,
@@ -301,22 +286,6 @@ def run_short_causal_forward(
         inputs["input_ids"] = input_batch.input_ids
         inputs["positions"] = input_batch.positions
     batch_descriptor = BatchDescriptor(num_tokens=n)
-    parent_ctx = get_forward_context() if is_forward_context_available() else None
-    nested = parent_ctx is not None
-    verifier = getattr(runner, "dsv4_path_verifier", None)
-    if verifier is not None and getattr(verifier, "_diag_left", 0) > 0:
-        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import path_log
-
-        path_log(
-            "serial_fwd leaves=%s n_tok=%s nested_ctx=%s attn_num_tokens=%s "
-            "eplb_prepare=%s isolated=%s moe_comm_copy=0",
-            getattr(verifier, "_cur_leaves", None),
-            n,
-            int(nested),
-            n,
-            int(eplb_prepare),
-            int(isolated),
-        )
     with set_forward_context(
         attn_metadata,
         runner.vllm_config,
@@ -326,46 +295,7 @@ def run_short_causal_forward(
         slot_mapping=slot_mappings_by_layer,
         is_padding=input_batch.is_padding,
     ):
-        # Nested under packed execute_model (~72 tokens, flashinfer_all2allv).
-        # Serial waves are ~9 tokens: do NOT copy parent moe_comm_* or the
-        # all-to-all splits stay sized for the outer batch and poison logits.
         return fwd_model(**inputs)
-
-
-def snapshot_dsv4_tree_aux(runner) -> None:
-    """Clone packed-verify aux before parent ``sample_tokens`` drops it.
-
-    ``GPUModelRunner.sample_tokens`` sets ``execute_model_state = None``
-    then later ``repair_tree_kv_causal`` overwrites the live aux buffers.
-    Commit splices draft context from this clone, not from the repair aux.
-    """
-    spec = getattr(runner, "speculator", None)
-    if spec is None:
-        return
-    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-        dsv4_path_isolation_needed,
-    )
-
-    if not dsv4_path_isolation_needed(runner):
-        return
-    state = getattr(runner, "execute_model_state", None)
-    aux = None if state is None else getattr(state, "aux_hidden_states", None)
-    spec._dsv4_tree_aux = None if not aux else [a.clone() for a in aux]
-
-
-def _split_tree_aux_like(tree_aux, commit_aux):
-    """Match snapshot aux layout to the repair aux list (split cat last-dim)."""
-    if not tree_aux or not commit_aux:
-        return tree_aux
-    if len(tree_aux) == len(commit_aux):
-        return tree_aux
-    if len(tree_aux) != 1:
-        return tree_aux
-    cat = tree_aux[0]
-    widths = [a.shape[-1] for a in commit_aux]
-    if cat.shape[-1] != sum(widths):
-        return tree_aux
-    return list(cat.split(widths, dim=-1))
 
 
 def commit_dsv4_accepted_chain(
@@ -380,50 +310,17 @@ def commit_dsv4_accepted_chain(
     hidden. A later causal re-forward repairs C4/state and the bonus ori
     slot; accepted ori slots are restored from the tree-verify gather so
     the next SWA-C4 verify does not mix true-C4 keys with SWA-C4 queries.
-    Draft hidden/aux use compacted tree-verify rows plus the repaired bonus.
+    Draft hidden/aux use the repaired MTP rows.
     """
-    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-        path_log,
-        pos_span,
-        tensor_rms,
-    )
-    from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
-        compact_tree_query_along_path,
-    )
-
-    acc = 0
-    if num_sampled.numel() > 0:
-        acc = int(num_sampled.reshape(-1)[0].item())  # D2H
-    sampler = getattr(runner, "rejection_sampler", None)
-    path = getattr(sampler, "path_node_ids", None) if sampler is not None else None
-    compact = getattr(runner, "tree_kv_compact", None)
+    sampler = runner.rejection_sampler
+    path = sampler.path_node_ids
+    compact = runner.tree_kv_compact
     getter = getattr(runner.model, "get_mtp_target_hidden_states", None)
-    bufs = runner.input_buffers
-    orig_reqs = sampled_tokens.shape[0]
-    qsl_tree = bufs.query_start_loc[: orig_reqs + 1].clone()
-    n_tree = int(qsl_tree[-1].item()) if orig_reqs > 0 else 0  # D2H
-    raw_mtp = getter() if callable(getter) else None
-    tree_mtp = raw_mtp[:n_tree].clone() if raw_mtp is not None and n_tree > 0 else None
-    spec = getattr(runner, "speculator", None)
-    raw_aux = getattr(spec, "_dsv4_tree_aux", None) if spec is not None else None
-    n_tree_aux = 0 if not raw_aux else len(raw_aux)
-    tree_aux = [a[:n_tree] for a in raw_aux] if n_tree > 0 and raw_aux else None
-    if spec is not None:
-        spec._dsv4_tree_aux = None
-    compacted_ori = False
     if compact is not None and path is not None:
         compact.run(idx_mapping, path, dst_from_zero=True)
-        compacted_ori = True
-    path_log(
-        "postprocess path=commit_dsv4_accepted_chain accepted_len=%s "
-        "suffix_kv=official_prefix circular=decode_write compact_ori=%s "
-        "n_tree_aux=%s",
-        acc,
-        int(compacted_ori),
-        n_tree_aux,
-    )
+    spec = runner.speculator
     meta = repair_tree_kv_causal(runner, idx_mapping, sampled_tokens, num_sampled)
-    if compacted_ori:
+    if compact is not None and path is not None:
         compact.scatter_held()
     if meta is None or spec is None:
         return
@@ -432,33 +329,8 @@ def commit_dsv4_accepted_chain(
     spec._dsv4_commit_pos = pos
     spec._dsv4_commit_qsl = qsl
     spec._dsv4_commit_aux = [a.clone() for a in aux] if aux else None
-    mtp = None
-    if callable(getter):
-        mtp = getter()
+    mtp = getter() if callable(getter) else None
     spec._dsv4_commit_hidden = mtp[:n].clone() if mtp is not None else None
-    hidden_src = "mtp" if spec._dsv4_commit_hidden is not None else "none"
-    aux_splice = 0
-    pmin, pmax = pos_span(pos, n)
-    commit_aux = spec._dsv4_commit_aux
-    aux_rms = (
-        [tensor_rms(a[:n] if a.shape[0] >= n else a) for a in commit_aux]
-        if commit_aux
-        else []
-    )
-    path_log(
-        "commit hidden=prefix n_tok=%s pos=%s..%s aux_layers=%s "
-        "skip_path_scatter=1 hidden_src=%s aux_splice=%s n_tree_aux=%s "
-        "hidden_rms=%s aux_rms=%s",
-        n,
-        pmin,
-        pmax,
-        0 if not commit_aux else len(commit_aux),
-        hidden_src,
-        aux_splice,
-        n_tree_aux,
-        tensor_rms(spec._dsv4_commit_hidden),
-        aux_rms,
-    )
 
 
 def repair_tree_kv_causal(
@@ -469,12 +341,11 @@ def repair_tree_kv_causal(
 ):
     """Causal re-forward of accepted tokens onto official linear KV.
 
-    Used as the DSV4 tree commit after leaf-isolated verify (scratch / serial
-    suffix is not the prefix layout). All tensors except the metadata copies
-    marked ``# D2H`` stay on device.
+    Packed tree verify skipped C4/indexer/state; this writes them on the
+    accepted chain. Caller saves/restores shared input buffers.
 
-    Returns ``(n, positions, query_start_loc, aux)`` for the accepted prefix
-    when the forward runs, else ``None``. ``n`` is a host int.
+    Returns ``(n, positions, query_start_loc, aux)`` or ``None``. ``n`` is
+    a host int.
     """
     orig_reqs = sampled_tokens.shape[0]
     if orig_reqs <= 0:

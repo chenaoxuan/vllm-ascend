@@ -133,7 +133,6 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.tree_kv_compact = None
-        self.dsv4_path_verifier = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -250,11 +249,6 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         self._restore_replicated_draft_target_states()
-        from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
-            snapshot_dsv4_tree_aux,
-        )
-
-        snapshot_dsv4_tree_aux(self)
         output = super().sample_tokens(grammar_output)
         if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
@@ -270,9 +264,7 @@ class NPUModelRunner(GPUModelRunner):
             self.req_states.tree_first_child[idx] = tree.first_child
             self.req_states.tree_next_sibling[idx] = tree.next_sibling
             proposal = self.speculator.tree_proposal_logits
-            if proposal is not None and getattr(
-                self.req_states, "tree_proposal_logits", None
-            ) is not None:
+            if proposal is not None and self.req_states.tree_proposal_logits is not None:
                 self.req_states.tree_proposal_logits[idx] = proposal[
                     : input_batch.num_reqs
                 ]
@@ -287,11 +279,6 @@ class NPUModelRunner(GPUModelRunner):
 
             self.tree_kv_compact = TreeKvCompact(self)
             self.speculator.tree_kv_compact = self.tree_kv_compact
-        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-            ensure_dsv4_path_verifier,
-        )
-
-        ensure_dsv4_path_verifier(self)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -311,11 +298,6 @@ class NPUModelRunner(GPUModelRunner):
             static_forward_context=self.compilation_config.static_forward_context,
         )
         self.model_state.kvpp_runtime = self.kvpp
-        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-            ensure_dsv4_path_verifier,
-        )
-
-        ensure_dsv4_path_verifier(self)
 
     @torch.inference_mode()
     def execute_model(
@@ -467,35 +449,6 @@ class NPUModelRunner(GPUModelRunner):
         async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
         if draft_tokens:
-            n_neg = 0
-            first = -1
-            n_tot = 0
-            for toks in draft_tokens.values():
-                n_tot += len(toks)
-                for i, t in enumerate(toks):
-                    if t < 0:
-                        if first < 0:
-                            first = i
-                        n_neg += 1
-            if n_neg:
-                from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                    path_log,
-                    tree_token_stats,
-                )
-
-                tmin, tmax, nneg_tree = tree_token_stats(
-                    self.req_states.draft_tokens[idx_mapping]
-                )
-                path_log(
-                    "spec_token_ids pad_neg1 count=%s first_idx=%s n=%s "
-                    "tree_tokens min=%s max=%s neg_count=%s",
-                    n_neg,
-                    first,
-                    n_tot,
-                    tmin,
-                    tmax,
-                    nneg_tree,
-                )
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
@@ -516,12 +469,16 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        tree_depths = getattr(self.req_states, "tree_depths", None)
+        tree_depths = (
+            self.req_states.tree_depths
+            if dflash_tree_spec_enabled(self.vllm_config)
+            else None
+        )
         use_tree_pos = (
             tree_depths is not None
             and self.ascend_config.tree_spec_config.topk is not None
             and self.ascend_config.tree_spec_config.topk > 1
-            and not getattr(self.speculator, "_dsv4_dspark_draft", False)
+            and not dsv4_dspark_draft(self.vllm_config)
         )
         if use_tree_pos:
             is_prefilling = async_copy_to_gpu(
@@ -647,19 +604,13 @@ class NPUModelRunner(GPUModelRunner):
             input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
             input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
             input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
-            proposal = getattr(self.req_states, "tree_proposal_logits", None)
+            proposal = self.req_states.tree_proposal_logits
             if proposal is not None:
                 input_batch.tree_proposal_logits = proposal[idx_mapping]
             if use_tree_pos:
                 input_batch.slot_positions = self.input_buffers.slot_positions[
                     :num_tokens_after_padding
                 ]
-
-        from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-            ensure_dsv4_path_verifier,
-        )
-
-        ensure_dsv4_path_verifier(self)
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
@@ -705,7 +656,7 @@ class NPUModelRunner(GPUModelRunner):
             input_batch.idx_mapping,
             num_reqs_padded=input_batch.num_reqs_after_padding,
         )
-        slot_pos = getattr(input_batch, "slot_positions", None)
+        slot_pos = input_batch.slot_positions
         positions = slot_pos if slot_pos is not None else input_batch.positions
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
@@ -713,13 +664,6 @@ class NPUModelRunner(GPUModelRunner):
             positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
         )
-        path_slots = getattr(input_batch, "tree_path_slot_mappings", None)
-        if path_slots is not None:
-            n = min(slot_mappings.shape[1], path_slots.shape[1])
-            g = min(slot_mappings.shape[0], path_slots.shape[0])
-            slot_mappings[:g, :n].copy_(path_slots[:g, :n].to(dtype=slot_mappings.dtype))
-            if slot_mappings.shape[1] > n:
-                slot_mappings[:, n:].fill_(-1)
         return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
@@ -835,38 +779,33 @@ class NPUModelRunner(GPUModelRunner):
         npu attention backends need seq_lens_cpu to work.
         so we need to copy num_computed_tokens back to cpu here.
         """
-        sampler = getattr(self, "rejection_sampler", None)
-        path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
-        if path_node_ids is not None and self.tree_kv_compact is not None:
-            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
-                commit_dsv4_accepted_chain,
-                needs_causal_kv_repair,
-                repair_tree_kv_causal,
-            )
-            from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
-
-            with tree_time("compact_kv_path"):
-                from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                    dsv4_path_isolation_needed,
-                    path_log,
+        if self.tree_kv_compact is not None:
+            sampler = self.rejection_sampler
+            path_node_ids = sampler.path_node_ids
+            if path_node_ids is not None:
+                from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+                    commit_dsv4_accepted_chain,
+                    needs_causal_kv_repair,
+                    repair_tree_kv_causal,
                 )
+                from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-                acc = 0
-                if num_sampled is not None and num_sampled.numel() > 0:
-                    acc = int(num_sampled.reshape(-1)[0].item())  # D2H
-                if dsv4_path_isolation_needed(self):
-                    path_log("commit acc=%s", acc)
-                    commit_dsv4_accepted_chain(
-                        self, idx_mapping, sampled_tokens, num_sampled
-                    )
-                elif needs_causal_kv_repair(self):
-                    path_log("repair acc=%s", acc)
-                    repair_tree_kv_causal(
-                        self, idx_mapping, sampled_tokens, num_sampled
-                    )
-                else:
-                    self.tree_kv_compact.run(idx_mapping, path_node_ids)
-            sampler.path_node_ids = None
+                with tree_time("compact_kv_path"):
+                    spec = self.speculator
+                    if (
+                        isinstance(spec, AscendTreeSpeculator)
+                        and spec.packed_dsv4_verify()
+                    ):
+                        commit_dsv4_accepted_chain(
+                            self, idx_mapping, sampled_tokens, num_sampled
+                        )
+                    elif needs_causal_kv_repair(self):
+                        repair_tree_kv_causal(
+                            self, idx_mapping, sampled_tokens, num_sampled
+                        )
+                    else:
+                        self.tree_kv_compact.run(idx_mapping, path_node_ids)
+                sampler.path_node_ids = None
 
         super().postprocess_sampled(
             idx_mapping,

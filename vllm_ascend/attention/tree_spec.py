@@ -131,7 +131,7 @@ def is_target_tree_step(common_attn_metadata) -> bool:
     """True when the current target forward should apply tree visibility."""
     if not tree_spec_enabled() or is_draft_forward():
         return False
-    if getattr(common_attn_metadata, "tree_visibility", None) is not None:
+    if common_attn_metadata.tree_visibility is not None:
         return True
     return need_dummy_tree_visibility_for_capture()
 
@@ -213,7 +213,6 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
             window_size=window,
             storage_block_size=int(builder.storage_block_size),
             buffer=builder.tree_ori_indices_buffer,
-            gkey=getattr(builder, "cache_group_key", "") or "",
         )
 
 
@@ -243,7 +242,6 @@ def build_tree_ori_sparse_indices(
     window_size: int,
     storage_block_size: int,
     buffer: torch.Tensor,
-    gkey: str = "",
 ) -> torch.Tensor:
     """Per-token ori slots for tree target verify (and mixed-batch prefills).
 
@@ -323,20 +321,4 @@ def build_tree_ori_sparse_indices(
     buffer[:num_tokens].copy_(packed)
     if buffer.shape[0] > num_tokens:
         buffer[num_tokens:].fill_(-1)
-    from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-        host_i0,
-        log_tree_ori_indices,
-    )
-
-    log_tree_ori_indices(
-        buffer[:num_tokens],
-        window_size=window_size,
-        budget=budget,
-        prefix0=host_i0(prefix_lens),
-        seq0=host_i0(seq_lens),
-        q0=host_i0(query_lens),
-        bt0=host_i0(block_table.reshape(-1)),
-        block_size=storage_block_size,
-        gkey=gkey,
-    )
     return buffer[:num_tokens]

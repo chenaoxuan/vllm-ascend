@@ -63,7 +63,7 @@ def init_speculator(
             draft = getattr(speculative_config, "draft_model_config", None)
             logger.warning(
                 "tree_spec_config.enabled but using plain DSpark speculator "
-                "(draft arches=%s model_type=%s); DSV4 path isolation will not run",
+                "(draft arches=%s model_type=%s)",
                 _config_arches(draft),
                 _config_model_type(draft),
             )
@@ -194,9 +194,9 @@ def dsv4_dspark_draft(
 def tree_target_query_len(vllm_config: VllmConfig | None = None) -> int | None:
     """Scheduler / MC2 / dummy-run query width per request.
 
-    Qwen3 packed tree and DSV4 ``topk>1`` are ``1+budget`` (path TND expands
-    later and must not inflate MC2 profile dummy past the 512-token cap).
-    DSV4 ``topk=1`` is a chain of ``1+spec``.
+    Qwen3 packed tree and DSV4 ``topk>1`` are ``1+budget`` (must not inflate
+    MC2 profile dummy past the 512-token cap). DSV4 ``topk=1`` is a chain of
+    ``1+spec``.
     """
     if not dflash_tree_spec_enabled(vllm_config):
         return None

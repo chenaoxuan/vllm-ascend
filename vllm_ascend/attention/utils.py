@@ -326,13 +326,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     token_to_req: torch.Tensor | None = None
     tree_visibility: torch.Tensor | None = None
     slot_positions: torch.Tensor | None = None
-    tree_path_query_start_loc: torch.Tensor | None = None
-    tree_path_query_start_loc_cpu: torch.Tensor | None = None
-    tree_path_seq_lens: torch.Tensor | None = None
-    tree_path_seq_lens_cpu: torch.Tensor | None = None
-    tree_path_req_idx: torch.Tensor | None = None
-    tree_path_block_table: torch.Tensor | None = None
-    tree_path_kv_isolated: bool = False
     for_cudagraph_capture: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
@@ -393,13 +386,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
             tree_visibility=_slice_reqs(self.tree_visibility),
             slot_positions=self.slot_positions,
-            tree_path_query_start_loc=self.tree_path_query_start_loc,
-            tree_path_query_start_loc_cpu=self.tree_path_query_start_loc_cpu,
-            tree_path_seq_lens=self.tree_path_seq_lens,
-            tree_path_seq_lens_cpu=self.tree_path_seq_lens_cpu,
-            tree_path_req_idx=self.tree_path_req_idx,
-            tree_path_block_table=self.tree_path_block_table,
-            tree_path_kv_isolated=self.tree_path_kv_isolated,
         )
 
 

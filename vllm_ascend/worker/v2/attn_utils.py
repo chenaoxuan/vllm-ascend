@@ -216,13 +216,6 @@ def build_attn_metadata(
     causal: bool | Mapping[int, bool] = True,
     tree_visibility: torch.Tensor | None = None,
     slot_positions: torch.Tensor | None = None,
-    tree_path_query_start_loc: torch.Tensor | None = None,
-    tree_path_query_start_loc_cpu: torch.Tensor | None = None,
-    tree_path_seq_lens: torch.Tensor | None = None,
-    tree_path_seq_lens_cpu: torch.Tensor | None = None,
-    tree_path_req_idx: torch.Tensor | None = None,
-    tree_path_block_tables: Sequence[torch.Tensor] | None = None,
-    tree_path_kv_isolated: bool = False,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -259,9 +252,6 @@ def build_attn_metadata(
         slot_mapping = slot_mappings[i]
         # Hybrid drafters can configure causality per KV cache group.
         group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
-        path_bt = None
-        if tree_path_block_tables is not None and i < len(tree_path_block_tables):
-            path_bt = tree_path_block_tables[i]
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
@@ -293,13 +283,6 @@ def build_attn_metadata(
             dcp_local_seq_lens=dcp_local_seq_lens,
             tree_visibility=tree_visibility,
             slot_positions=slot_positions,
-            tree_path_query_start_loc=tree_path_query_start_loc,
-            tree_path_query_start_loc_cpu=tree_path_query_start_loc_cpu,
-            tree_path_seq_lens=tree_path_seq_lens,
-            tree_path_seq_lens_cpu=tree_path_seq_lens_cpu,
-            tree_path_req_idx=tree_path_req_idx,
-            tree_path_block_table=path_bt,
-            tree_path_kv_isolated=tree_path_kv_isolated,
             for_cudagraph_capture=for_cudagraph_capture,
             **common_attn_metadata_extra_kwargs,
         )

@@ -106,17 +106,6 @@ class BeamTreeBuilder(TreeBuilder):
         num_reqs, spec_num, vocab = draft_logits.shape
         k = min(topk, vocab)
         device = draft_logits.device
-        markov_diag = False
-        if draft_model is not None:
-            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                path_log_enabled,
-            )
-
-            markov_diag = path_log_enabled()
-        base_top1: list[torch.Tensor] = []
-        corrected_top1: list[torch.Tensor] = []
-        spine_margins: list[torch.Tensor] = []
-
         frontier_tokens = root_token_ids.unsqueeze(1)
         frontier_scores = torch.zeros(num_reqs, 1, dtype=torch.float32, device=device)
         frontier_pools = torch.full((num_reqs, 1), -1, dtype=torch.long, device=device)
@@ -169,14 +158,6 @@ class BeamTreeBuilder(TreeBuilder):
             top_vals, top_ids = log_probs.topk(k, dim=-1)
             if draft_model is not None:
                 top_ids = draft_model.map_draft_to_target(top_ids)
-            if markov_diag and draft_model is not None:
-                base_ids = draft_logits[:, depth].argmax(dim=-1)
-                base_top1.append(draft_model.map_draft_to_target(base_ids))
-                corrected_top1.append(top_ids[:, 0, 0])
-                if k > 1:
-                    spine_margins.append(top_vals[:, 0, 0] - top_vals[:, 0, 1])
-                else:
-                    spine_margins.append(torch.zeros_like(top_vals[:, 0, 0]))
             candidate_scores = frontier_scores.unsqueeze(-1) + top_vals
             num_candidates = batch * k
             depths_left = spec_num - depth
@@ -239,28 +220,6 @@ class BeamTreeBuilder(TreeBuilder):
         tokens = torch.gather(pool_tokens, 1, packed)
         depths = (torch.gather(pool_depth, 1, packed) + 1).to(torch.int32)
         finalize_tree_layout(out, tokens, depths, parent_ids, num_nodes)
-        if markov_diag and base_top1:
-            from vllm_ascend.worker.v2.spec_decode.tree.dsv4_path_verify import (
-                log_markov_tree,
-                log_tree_plan,
-            )
-
-            num_depths = len(base_top1)
-            log_markov_tree(
-                root_token_ids,
-                torch.stack(base_top1, dim=1),
-                torch.stack(corrected_top1, dim=1),
-                tokens[:, :num_depths],
-                torch.stack(spine_margins, dim=1),
-            )
-            log_tree_plan(
-                out.tokens,
-                out.depths,
-                out.parents,
-                out.first_child,
-                out.num_nodes,
-                spec_num,
-            )
 
         if proposal_logits is not None and prop_temp is not None:
             proposal_logits.fill_(float("-inf"))

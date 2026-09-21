@@ -25,6 +25,25 @@ from vllm_ascend.utils import vllm_version_is
 logger = init_logger("vllm." + __name__)
 
 
+def _agent_dbg(location, message, data, hypothesis_id, limit=400):
+    try:
+        import importlib.util
+        import sys
+
+        mod = sys.modules.get("_agent_debug_trace")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(
+                "_agent_debug_trace",
+                "/home/specdec/spec260922/debug_trace.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_agent_debug_trace"] = mod
+            spec.loader.exec_module(mod)
+        mod.dbg(location, message, data, hypothesis_id, limit=limit)
+    except Exception:
+        pass
+
+
 def init_speculator(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -58,9 +77,35 @@ def init_speculator(
                 AscendTreeSpeculator,
             )
 
+            # #region agent log
+            _agent_dbg(
+                "spec_decode/__init__.py:init_speculator",
+                "choose_speculator",
+                {
+                    "cls": "AscendTreeSpeculator",
+                    "backend": "dspark",
+                    "method": speculative_config.method,
+                    "n_spec": speculative_config.num_speculative_tokens,
+                },
+                "H1",
+            )
+            # #endregion
             return AscendTreeSpeculator(vllm_config, device)
         if dflash_tree_spec_enabled(vllm_config):
             draft = getattr(speculative_config, "draft_model_config", None)
+            # #region agent log
+            _agent_dbg(
+                "spec_decode/__init__.py:init_speculator",
+                "choose_speculator",
+                {
+                    "cls": "AscendDSparkSpeculator",
+                    "reason": "tree_enabled_but_not_tree_dspark",
+                    "method": speculative_config.method,
+                    "arches": list(_config_arches(draft)),
+                },
+                "H1",
+            )
+            # #endregion
             logger.warning(
                 "tree_spec_config.enabled but using plain DSpark speculator "
                 "(draft arches=%s model_type=%s)",
@@ -78,6 +123,19 @@ def init_speculator(
                 AscendTreeSpeculator,
             )
 
+            # #region agent log
+            _agent_dbg(
+                "spec_decode/__init__.py:init_speculator",
+                "choose_speculator",
+                {
+                    "cls": "AscendTreeSpeculator",
+                    "backend": "dflash",
+                    "method": speculative_config.method,
+                    "n_spec": speculative_config.num_speculative_tokens,
+                },
+                "H1",
+            )
+            # #endregion
             return AscendTreeSpeculator(vllm_config, device)
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (

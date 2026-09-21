@@ -23,6 +23,71 @@ from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_t
 logger = init_logger("vllm." + __name__)
 
 
+def _agent_dbg(location, message, data, hypothesis_id, limit=400):
+    try:
+        import importlib.util
+        import sys
+
+        mod = sys.modules.get("_agent_debug_trace")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(
+                "_agent_debug_trace",
+                "/home/specdec/spec260922/debug_trace.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_agent_debug_trace"] = mod
+            spec.loader.exec_module(mod)
+        mod.dbg(location, message, data, hypothesis_id, limit=limit)
+    except Exception:
+        pass
+
+
+def _plain_row(value, n: int = 16):
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return value
+    tensor = value.detach()
+    if tensor.ndim == 0:
+        if tensor.dtype.is_floating_point:
+            return round(float(tensor.item()), 4)
+        return int(tensor.item())
+    if tensor.ndim > 1:
+        tensor = tensor[0]
+    tensor = tensor.reshape(-1)[:n]
+    if tensor.dtype.is_floating_point:
+        return [round(float(x), 4) for x in tensor.tolist()]
+    return [int(x) for x in tensor.tolist()]
+
+
+def _note_beam_life_ctx(spec, num_reqs, nqp, sample_hidden, root_token_ids) -> None:
+    """Draft query the beam is about to expand. Req 0 only."""
+    try:
+        from vllm_ascend.worker.v2.spec_decode.tree.beam import note_life_ctx
+
+        n_spec = spec.num_speculative_steps
+        buf = spec.input_buffers
+        batch = getattr(spec, "input_batch", None)
+        hidden = sample_hidden.view(num_reqs, n_spec, -1)
+        path = None if batch is None else getattr(batch, "path_node_ids", None)
+        seq = getattr(buf, "seq_lens", None)
+        ctx = {
+            "q_ids": _plain_row(buf.input_ids[:nqp], nqp),
+            "q_pos": _plain_row(buf.positions[:nqp], nqp),
+            "sample_idx": _plain_row(spec.sample_indices[:n_spec], n_spec),
+            "sample_pos": _plain_row(spec.sample_pos[:n_spec], n_spec),
+            "seq": _plain_row(None if seq is None else seq[:num_reqs], 4),
+            "root": _plain_row(root_token_ids, 1),
+            "path": _plain_row(path, 8),
+            "prefix_n": int(getattr(spec, "_dsv4_prefix_n", -1) or 0),
+            "h_mean": [round(float(x), 4) for x in hidden[0].abs().mean(-1).tolist()],
+        }
+        note_life_ctx(ctx)
+        _agent_dbg("tree/speculator.py:_finalize_tree", "life_ctx", ctx, "H6")
+    except Exception:
+        pass
+
+
 def _hf_dflash_config(hf_config) -> dict:
     raw = getattr(hf_config, "dflash_config", None)
     if raw is None:
@@ -403,6 +468,26 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             inner._draft_kv_slots_by_name = (
                 self._dspark_slots_by_swa_name(n) if bound else None
             )
+            # Draft KV is rewritten from the accepted-path hidden, one store
+            # for every SWA layer. Log the positions so this stays visible
+            # next to the target compress commit.
+            if n > 0 and context_positions is not None and context_positions.numel() > 0:
+                try:
+                    from debug_trace import cmp_log
+
+                    pos = context_positions[:n]
+                    cmp_log(
+                        {
+                            "draft_kv": 1,
+                            "n": n,
+                            "pos0": int(pos[0].item()),
+                            "pos_mid": int(pos[min(n - 1, 7)].item()),
+                            "posn": int(pos[n - 1].item()),
+                            "layers": len(inner._draft_kv_slots_by_name or {}),
+                        }
+                    )
+                except Exception:
+                    pass
             orig(context_states, context_positions, context_slot_mapping)
             inner._draft_kv_slots_by_name = None
 
@@ -452,16 +537,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             )
         self._update_draft_attn_metadata(attn_metadata, num_reqs_padded)
         return [attn_metadata]
-
-    def _build_draft_attn_metadata(self, *args, **kwargs):
-        """After prepare_dflash_inputs: keep DSA seq_lens on the official prefix."""
-        prefix = self._dsv4_chunk_prefix_len
-        num_reqs = kwargs.get("num_reqs")
-        if num_reqs is None and args:
-            num_reqs = args[0]
-        if prefix is not None and num_reqs:
-            self._dsv4_sync_draft_seq_lens(int(num_reqs), prefix)
-        return super()._build_draft_attn_metadata(*args, **kwargs)
 
     def _bind_correction_heads(self, target_model: nn.Module) -> None:
         """Resolve Domino heads (prefix) then construct the tree builder."""
@@ -591,7 +666,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         num_reqs: int,
         replace: bool,
     ) -> bool:
-        """Pack official-prefix rows. ``True`` when the buffer can be bound.
+        """Merge official-prefix rows by absolute position.
 
         ``num_reqs`` / chunk length are host ints from commit or ``qsl_np``.
         """
@@ -613,9 +688,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self._dsv4_prefix_n = chunk_n
             self._dsv4_prefix_num_reqs = num_reqs
             return True
-        new_n = self._dsv4_prefix_n + chunk_n
-        if new_n > cap:
-            return False
         if (
             self._dsv4_prefix_hidden is not None
             and (
@@ -625,41 +697,70 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         ):
             return False
         self._dsv4_ensure_prefix_bufs(hidden, aux, pos, allow_new_aux=False)
-        if num_reqs == 1:
-            off = self._dsv4_prefix_n
-            self._dsv4_copy_chunk_into_prefix(off, hidden, aux, pos, chunk_n)
-            new_end = self._dsv4_prefix_qsl[1] + qsl[1].to(
-                dtype=self._dsv4_prefix_qsl.dtype
-            )
-            self._dsv4_prefix_qsl[1].copy_(new_end)
-            self._dsv4_prefix_n = new_n
-            return True
         old_qsl = self._dsv4_prefix_qsl[: num_reqs + 1].cpu().numpy()  # D2H
         chunk_qsl = qsl[: num_reqs + 1].cpu().numpy()  # D2H
-        packed_h = hidden.new_empty((new_n, hidden.shape[-1]))
-        packed_p = pos.new_empty((new_n,))
-        packed_aux = (
-            [a.new_empty((new_n, a.shape[-1])) for a in aux] if aux else None
-        )
-        out_qsl = np.zeros(num_reqs + 1, dtype=np.int32)
-        dst = 0
+        old_pos = self._dsv4_prefix_pos[: self._dsv4_prefix_n].cpu().numpy()  # D2H
+        chunk_pos = pos[:chunk_n].cpu().numpy()  # D2H
+        out_lens = np.empty(num_reqs, dtype=np.int32)
+        old_keep: list[np.ndarray] = []
+        chunk_order: list[np.ndarray] = []
         for i in range(num_reqs):
             o0, o1 = int(old_qsl[i]), int(old_qsl[i + 1])
             c0, c1 = int(chunk_qsl[i]), int(chunk_qsl[i + 1])
-            ol = o1 - o0
-            cl = c1 - c0
-            packed_h[dst : dst + ol].copy_(self._dsv4_prefix_hidden[o0:o1])
-            packed_p[dst : dst + ol].copy_(self._dsv4_prefix_pos[o0:o1])
+            old_req_pos = old_pos[o0:o1]
+            chunk_req_pos = chunk_pos[c0:c1]
+            keep = np.flatnonzero(~np.isin(old_req_pos, chunk_req_pos)) + o0
+            merged_pos = np.concatenate((old_pos[keep], chunk_req_pos))
+            order = np.argsort(merged_pos, kind="stable")
+            old_keep.append(keep)
+            chunk_order.append(order)
+            out_lens[i] = order.size
+        out_qsl = np.zeros(num_reqs + 1, dtype=np.int32)
+        np.cumsum(out_lens, out=out_qsl[1:])
+        new_n = int(out_qsl[-1])
+        if new_n > cap:
+            return False
+        packed_h = hidden.new_empty((new_n, hidden.shape[-1]))
+        packed_p = pos.new_empty((new_n,))
+        packed_aux = (
+            [a.new_empty((new_n, a.shape[-1])) for a in aux]
+            if aux and self._dsv4_prefix_aux
+            else None
+        )
+        dst = 0
+        for i in range(num_reqs):
+            c0, c1 = int(chunk_qsl[i]), int(chunk_qsl[i + 1])
+            keep = old_keep[i]
+            keep_idx = torch.from_numpy(keep).to(
+                device=hidden.device, dtype=torch.long
+            )  # H2D
+            merged_h = torch.cat(
+                (
+                    self._dsv4_prefix_hidden.index_select(0, keep_idx),
+                    hidden[c0:c1],
+                )
+            )
+            merged_p = torch.cat(
+                (
+                    self._dsv4_prefix_pos.index_select(0, keep_idx),
+                    pos[c0:c1],
+                )
+            )
+            order = torch.from_numpy(chunk_order[i]).to(
+                device=hidden.device, dtype=torch.long
+            )  # H2D
+            length = int(out_lens[i])
+            packed_h[dst : dst + length].copy_(merged_h.index_select(0, order))
+            packed_p[dst : dst + length].copy_(merged_p.index_select(0, order))
             if packed_aux and self._dsv4_prefix_aux:
-                for d, s in zip(packed_aux, self._dsv4_prefix_aux):
-                    d[dst : dst + ol].copy_(s[o0:o1])
-            dst += ol
-            packed_h[dst : dst + cl].copy_(hidden[c0:c1])
-            packed_p[dst : dst + cl].copy_(pos[c0:c1])
-            if packed_aux and aux:
-                for d, s in zip(packed_aux, aux):
-                    d[dst : dst + cl].copy_(s[c0:c1])
-            dst += cl
+                for d, old, chunk in zip(
+                    packed_aux, self._dsv4_prefix_aux, aux
+                ):
+                    merged = torch.cat(
+                        (old.index_select(0, keep_idx), chunk[c0:c1])
+                    )
+                    d[dst : dst + length].copy_(merged.index_select(0, order))
+            dst += length
             out_qsl[i + 1] = dst
         self._dsv4_prefix_hidden[:new_n].copy_(packed_h)
         self._dsv4_prefix_pos[:new_n].copy_(packed_p)
@@ -690,7 +791,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         replace = self._dsv4_prefix_n == 0
         if computed is not None and computed.size >= num_reqs:
             replace = replace or bool((computed[:num_reqs] == 0).all())
-        self._dsv4_prefix_merge(
+        merged = self._dsv4_prefix_merge(
             hidden[:n],
             None if not aux else [a[:n] for a in aux],
             input_batch.positions[:n],
@@ -698,172 +799,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             num_reqs,
             replace,
         )
+        if not merged:
+            raise RuntimeError("Failed to merge the official DSV4 prefix")
 
-    def _dsv4_snapshot_batch(self, input_batch: InputBatch) -> dict[str, Any]:
-        """References plus seq-len values mutated by the commit-chunk bind."""
-        nreq = input_batch.num_reqs
-        sl = input_batch.seq_lens
-        ub = input_batch.seq_lens_cpu_upper_bound
-        np_sl = input_batch.seq_lens_np
-        cnp = getattr(input_batch, "num_computed_tokens_np", None)
-        ccpu = getattr(input_batch, "num_computed_tokens_cpu", None)
-        computed_cpu = None
-        if ccpu is not None and torch.is_tensor(ccpu):
-            computed_cpu = ccpu[:nreq].clone()
-        elif ccpu is not None:
-            computed_cpu = np.array(ccpu[:nreq], copy=True)
-        return {
-            "positions": input_batch.positions,
-            "qsl": input_batch.query_start_loc,
-            "qsl_np": input_batch.query_start_loc_np,
-            "num_tokens": input_batch.num_tokens,
-            "num_tokens_after_padding": input_batch.num_tokens_after_padding,
-            "num_scheduled_tokens": input_batch.num_scheduled_tokens,
-            "seq_lens": sl,
-            "seq_lens_data": None if sl is None else sl[:nreq].clone(),
-            "seq_lens_np": None if np_sl is None else np.array(np_sl[:nreq], copy=True),
-            "seq_ub": ub,
-            "seq_ub_data": None if ub is None else ub[:nreq].clone(),
-            "max_query_len": getattr(input_batch, "max_query_len", None),
-            "num_reqs": nreq,
-            "computed_np": None if cnp is None else np.array(cnp[:nreq], copy=True),
-            "computed_cpu": computed_cpu,
-            "computed_cpu_is_tensor": torch.is_tensor(ccpu) if ccpu is not None else False,
-        }
-
-    def _dsv4_restore_batch(self, input_batch: InputBatch, snap: dict[str, Any]) -> None:
-        nreq = snap["num_reqs"]
-        input_batch.positions = snap["positions"]
-        input_batch.query_start_loc = snap["qsl"]
-        input_batch.query_start_loc_np = snap["qsl_np"]
-        input_batch.num_tokens = snap["num_tokens"]
-        input_batch.num_tokens_after_padding = snap["num_tokens_after_padding"]
-        input_batch.num_scheduled_tokens = snap["num_scheduled_tokens"]
-        input_batch.seq_lens = snap["seq_lens"]
-        if snap["seq_lens_data"] is not None and input_batch.seq_lens is not None:
-            input_batch.seq_lens[:nreq].copy_(snap["seq_lens_data"])
-        if snap["seq_lens_np"] is not None and input_batch.seq_lens_np is not None:
-            input_batch.seq_lens_np[:nreq] = snap["seq_lens_np"]
-        input_batch.seq_lens_cpu_upper_bound = snap["seq_ub"]
-        if snap["seq_ub_data"] is not None and input_batch.seq_lens_cpu_upper_bound is not None:
-            input_batch.seq_lens_cpu_upper_bound[:nreq].copy_(snap["seq_ub_data"])
-        if snap["max_query_len"] is not None:
-            input_batch.max_query_len = snap["max_query_len"]
-        if snap["computed_np"] is not None:
-            cnp = getattr(input_batch, "num_computed_tokens_np", None)
-            if cnp is not None:
-                cnp[:nreq] = snap["computed_np"]
-        if snap["computed_cpu"] is not None:
-            ccpu = getattr(input_batch, "num_computed_tokens_cpu", None)
-            if ccpu is not None and snap["computed_cpu_is_tensor"]:
-                ccpu[:nreq].copy_(snap["computed_cpu"])
-            elif ccpu is not None:
-                ccpu[:nreq] = snap["computed_cpu"]
-
-    def _dsv4_fill_computed(self, input_batch: InputBatch, num_reqs: int, prefix_len: int) -> None:
-        """Bind host computed-token counts to the official prefix length."""
-        cnp = getattr(input_batch, "num_computed_tokens_np", None)
-        if cnp is not None and cnp.size >= num_reqs:
-            cnp[:num_reqs] = prefix_len
-        ccpu = getattr(input_batch, "num_computed_tokens_cpu", None)
-        if ccpu is None:
-            return
-        if torch.is_tensor(ccpu):
-            if ccpu.numel() >= num_reqs:
-                ccpu[:num_reqs].fill_(prefix_len)
-            return
-        if len(ccpu) >= num_reqs:
-            ccpu[:num_reqs] = prefix_len
-
-    def _dsv4_sync_draft_seq_lens(self, num_reqs: int, prefix_len: int) -> None:
-        """Write DSA seq_lens so ``prefix_lens = seq_lens - nqp = prefix_len``."""
-        nqp = int(self.num_query_per_req)
-        want = prefix_len + nqp
-        bufs = self.input_buffers
-        sl = getattr(bufs, "seq_lens", None)
-        if sl is not None and sl.numel() >= num_reqs:
-            sl[:num_reqs].fill_(want)
-        sl_np = getattr(bufs, "seq_lens_np", None)
-        if sl_np is not None and sl_np.size >= num_reqs:
-            sl_np[:num_reqs] = want
-        sl_cpu = getattr(bufs, "seq_lens_cpu", None)
-        if sl_cpu is not None and sl_cpu.numel() >= num_reqs:
-            sl_cpu[:num_reqs].fill_(want)
-
-    def _dsv4_bind_chunk_batch(
-        self,
-        input_batch: InputBatch,
-        pos: torch.Tensor,
-        qsl: torch.Tensor,
-        n: int,
-        prefix_len: int,
-    ) -> None:
-        """Commit suffix only. ``pos``/``qsl`` stay off speculator query buffers.
-
-        Draft attention still needs ``seq_lens = official prefix length`` so it
-        reads the already-written 0..prefix-1 KV instead of leftover tree slots.
-        ``num_computed_*`` is the leftover postprocess value (e.g. 85 after
-        accept-5); bind it to ``prefix_len``. DSA SWA reads speculator
-        ``input_buffers.seq_lens`` as total (prefix + query), not the batch
-        prefix length.
-        """
-        num_reqs = qsl.shape[0] - 1
-        input_batch.positions = pos[:n]
-        input_batch.query_start_loc = qsl
-        input_batch.query_start_loc_np = qsl.cpu().numpy()  # D2H
-        input_batch.num_tokens = n
-        input_batch.num_tokens_after_padding = n
-        sched = np.diff(input_batch.query_start_loc_np).astype(np.int32, copy=False)
-        input_batch.num_scheduled_tokens = sched
-        input_batch.max_query_len = int(sched.max()) if sched.size else n
-        sl = input_batch.seq_lens
-        if sl is not None and sl.numel() >= num_reqs:
-            sl[:num_reqs].fill_(prefix_len)
-        if input_batch.seq_lens_np is not None and input_batch.seq_lens_np.size >= num_reqs:
-            input_batch.seq_lens_np[:num_reqs] = prefix_len
-        ub = input_batch.seq_lens_cpu_upper_bound
-        if ub is not None and ub.numel() >= num_reqs:
-            ub[:num_reqs].fill_(prefix_len)
-        self._dsv4_fill_computed(input_batch, num_reqs, prefix_len)
-        self._dsv4_sync_draft_seq_lens(num_reqs, prefix_len)
-        self._dsv4_chunk_prefix_len = prefix_len
-
-    def _apply_dsv4_commit_prefix(
-        self,
-        input_batch: InputBatch,
-        last_hidden_states: torch.Tensor,
-        _aux_hidden_states: list[torch.Tensor] | None,
-        num_rejected: torch.Tensor,
-    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor]:
-        """Inject accepted target-hidden rows into draft KV incrementally.
-
-        The draft query owns only the speculative suffix slots. Accepted rows
-        replace that suffix with target-derived KV; older official-prefix KV
-        remains valid and does not need to be projected again.
-        """
-        n = self._dsv4_commit_n
-        pos = self._dsv4_commit_pos
-        qsl = self._dsv4_commit_qsl
-        commit_aux = self._dsv4_commit_aux
-        commit_hidden = self._dsv4_commit_hidden
-        self._dsv4_commit_n = None
-        self._dsv4_commit_pos = None
-        self._dsv4_commit_qsl = None
-        self._dsv4_commit_aux = None
-        self._dsv4_commit_hidden = None
-        chunk_hidden = (
-            commit_hidden if commit_hidden is not None else last_hidden_states[:n]
-        )
-        chunk_aux = commit_aux
-        num_reqs = qsl.shape[0] - 1
-        self._dsv4_prefix_merge(
-            chunk_hidden, chunk_aux, pos, qsl, num_reqs, replace=False
-        )
-        num_rejected = torch.zeros_like(num_rejected)
-        pmax = int(pos[:n].amax().item())  # D2H
-        prefix_len = pmax + 1
-        self._dsv4_bind_chunk_batch(input_batch, pos, qsl, n, prefix_len)
-        return chunk_hidden, chunk_aux, num_rejected
 
     def propose(
         self,
@@ -885,45 +823,38 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         is_profile: bool = False,
         dp_sync: Any = None,
     ) -> torch.Tensor:
-        snap = None
-        try:
-            if not dummy_run and self._dsv4_commit_n:
-                snap = self._dsv4_snapshot_batch(input_batch)
-                last_hidden_states, aux_hidden_states, num_rejected = (
-                    self._apply_dsv4_commit_prefix(
-                        input_batch,
-                        last_hidden_states,
-                        aux_hidden_states,
-                        num_rejected,
-                    )
-                )
-            else:
-                path_node_ids = input_batch.path_node_ids
-                if (
-                    self._dsv4_dspark_draft
-                    and not dummy_run
-                    and (path_node_ids is None or bool(input_batch.has_prefill))
-                ):
-                    self._dsv4_absorb_official_prefix(
-                        last_hidden_states, aux_hidden_states, input_batch
-                    )
-                if path_node_ids is not None and not dummy_run:
-                    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+            clear_tree_chain_layout,
+        )
 
-                    tree_q = 1 + (get_ascend_config().tree_spec_config.budget or 0)
-                    # Skip when this step is not a full tree verify (e.g. 16 tokens
-                    # padded to the 17-token FULL gear at max_seq_len).
-                    if last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q:
-                        tensors = [last_hidden_states]
-                        if aux_hidden_states:
-                            tensors.extend(aux_hidden_states)
-                        with tree_time("compact_query_path"):
-                            compact_tree_query_along_path(
-                                tensors,
-                                input_batch.query_start_loc,
-                                path_node_ids,
-                                linearize_positions=input_batch.positions,
-                            )
+        clear_tree_chain_layout()
+        try:
+            path_node_ids = input_batch.path_node_ids
+            if (
+                self._dsv4_dspark_draft
+                and not dummy_run
+                and (path_node_ids is None or bool(input_batch.has_prefill))
+            ):
+                self._dsv4_absorb_official_prefix(
+                    last_hidden_states, aux_hidden_states, input_batch
+                )
+            if path_node_ids is not None and not dummy_run:
+                from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+                tree_q = 1 + (get_ascend_config().tree_spec_config.budget or 0)
+                # Skip when this step is not a full tree verify (e.g. 16 tokens
+                # padded to the 17-token FULL gear at max_seq_len).
+                if last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q:
+                    tensors = [last_hidden_states]
+                    if aux_hidden_states:
+                        tensors.extend(aux_hidden_states)
+                    with tree_time("compact_query_path"):
+                        compact_tree_query_along_path(
+                            tensors,
+                            input_batch.query_start_loc,
+                            path_node_ids,
+                            linearize_positions=input_batch.positions,
+                        )
             self._tree_finalized = False
             if self.draft_backend == "dspark":
                 copy_w = (
@@ -950,7 +881,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 plen = self._dsv4_chunk_prefix_len
                 if plen is not None:
                     seq_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-                    seq_np[: input_batch.num_reqs] = plen + int(self.num_query_per_req)
+                    sl_np = getattr(self.input_buffers, "seq_lens_np", None)
+                    nreq = input_batch.num_reqs
+                    if sl_np is not None and sl_np.size >= nreq:
+                        seq_np[:nreq] = sl_np[:nreq]
+                    else:
+                        seq_np[:nreq] = plen + int(self.num_query_per_req)
                 with (
                     build_attn_metadata_wrapper(),
                     build_draft_attn_metadata_factory(
@@ -1004,10 +940,30 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             # FULL replay only runs draft forward; prefix may replay a second graph.
             if not dummy_run:
                 self._finalize_tree(input_batch.num_reqs)
+                # #region agent log
+                tree = self.tree
+                _agent_dbg(
+                    "tree/speculator.py:propose",
+                    "propose_out",
+                    {
+                        "method": self.method,
+                        "budget": self.budget,
+                        "topk": self.topk,
+                        "n_spec": self.num_speculative_steps,
+                        "n_req": int(input_batch.num_reqs),
+                        "hidden": int(last_hidden_states.shape[0]),
+                        "tok_shape": list(tokens.shape),
+                        "tok0": tokens,
+                        "nodes": None if tree is None else tree.num_nodes,
+                        "tree_tok0": None if tree is None else tree.tokens,
+                        "dep0": None if tree is None else tree.depths,
+                        "par0": None if tree is None else tree.parents,
+                    },
+                    "H4",
+                )
+                # #endregion
             return tokens
         finally:
-            if snap is not None:
-                self._dsv4_restore_batch(input_batch, snap)
             self._dsv4_chunk_prefix_len = None
 
     def capture(self) -> None:
@@ -1183,6 +1139,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
             num_reqs, nqp
         )[:, 0]
+        # Draft-query dump. Paused for the coverage run.
+        if False and self.method == "beam":
+            _note_beam_life_ctx(
+                self, num_reqs, nqp, sample_hidden_states, root_token_ids
+            )
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
@@ -1198,6 +1159,23 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         with tree_time("build_draft_tree"):
             self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
         self._tree_finalized = True
+        # #region agent log
+        _agent_dbg(
+            "tree/speculator.py:_finalize_tree",
+            "tree_built",
+            {
+                "method": self.method,
+                "branch": "build",
+                "logits": list(logits.shape),
+                "nodes": self.tree.num_nodes,
+                "tok0": self.tree.tokens,
+                "dep0": self.tree.depths,
+                "par0": self.tree.parents,
+                "child0": self.tree.first_child,
+            },
+            "H5",
+        )
+        # #endregion
 
     def _generate_draft(
         self,

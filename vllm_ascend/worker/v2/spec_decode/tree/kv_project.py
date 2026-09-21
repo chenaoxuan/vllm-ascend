@@ -1,13 +1,6 @@
-import numpy as np
 import torch
-from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
     iter_unique_kv_cache_tensors,
 )
@@ -62,11 +55,9 @@ def needs_causal_kv_repair(runner) -> bool:
 class TreeKvCompact:
     """Move accepted-path target KV from tree slots onto the linear prefix.
 
-    Verify wrote ori KV at packed ``prefix+node``. GQA keeps the root at
-    ``prefix`` and lands drafts at ``prefix+1..``. DSV4 packed verify
-    recomputes the root at ``prefix``; official sampled tokens start there,
-    so drafts land at ``prefix+0..`` (``dst_from_zero``). C4/indexer/state
-    are not compacted.
+    Verify wrote ori KV at packed ``prefix+node``. DSV4 sampled tokens
+    start at ``prefix+0`` (``dst_from_zero``). C4/indexer/state are
+    compacted separately by the winning chain.
 
     Single-stream: ``run`` after target+reject and before
     ``num_computed`` increments. One ACLGraph per ``num_reqs`` so the
@@ -85,6 +76,7 @@ class TreeKvCompact:
         self._graphs: dict[int, object] = {}
         self._groups = None
         self._held = None
+        self._held_keep = None
         self._hold = False
         self._idx = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._path = torch.full(
@@ -149,15 +141,6 @@ class TreeKvCompact:
         self._bind_groups()
         self._compact(num_reqs)
 
-    def scatter_held(self) -> None:
-        """Re-apply the last gather onto dest slots (after a later overwrite)."""
-        if not self._held:
-            return
-        for cache, scratch, dst_flat in self._held:
-            tail = cache.shape[2:]
-            flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
-            flat.index_copy_(0, dst_flat, scratch)
-
     def _bind_groups(self) -> None:
         if self._groups is not None:
             return
@@ -204,6 +187,7 @@ class TreeKvCompact:
     def _compact(self, num_reqs: int) -> None:
         if not self._groups:
             self._held = None
+            self._held_keep = None
             return
         idx = self._idx[:num_reqs]
         path = self._path[:num_reqs]
@@ -211,6 +195,23 @@ class TreeKvCompact:
         nslot = num_reqs * self.spec_len
         safe_idx = idx.clamp(min=0)
         prefix = num_computed[safe_idx]
+        if num_reqs > 0:
+            try:
+                from debug_trace import cmp_log
+
+                path0 = path[0].detach().to("cpu").tolist()
+                accepted = [int(n) for n in path0 if int(n) >= 0]
+                cmp_log(
+                    {
+                        "ori_move": 1,
+                        "dst_from_zero": bool(self._hold),
+                        "prefix": int(prefix[0].item()),
+                        "src": accepted[:8],
+                        "dst_off": [int(x) for x in self._dst_off[: len(accepted)].tolist()],
+                    }
+                )
+            except Exception:
+                pass
         dst_pos = prefix.unsqueeze(1) + self._dst_off
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
         valid = (path >= 0) & (idx >= 0).unsqueeze(1)
@@ -247,226 +248,219 @@ class TreeKvCompact:
                 if hold:
                     held.append((cache, scratch, dst_keep))
         self._held = held if hold else None
+        self._held_keep = valid.reshape(-1) if hold else None
 
 
-def run_short_causal_forward(
-    runner,
-    input_batch: AscendInputBatch,
-    *,
-    model=None,
-    model_kwargs: dict | None = None,
-):
-    """Eager causal target forward. Caller owns input-buffer save/restore."""
-    n = input_batch.num_tokens
-    eplb = runner.eplb
-    if eplb is not None:
-        eplb.prepare_forward(runner.model_config, n)
-    block_tables, slot_mappings = runner.prepare_attn(input_batch)
-    attn_metadata = runner.model_state.prepare_attn(
-        input_batch,
-        CUDAGraphMode.NONE,
-        block_tables,
-        slot_mappings,
-        runner.attn_groups,
-        runner.kv_cache_config,
-    )
-    slot_mappings_by_layer = build_slot_mappings_by_layer(
-        slot_mappings, runner.kv_cache_config
-    )
-    fwd_model = model if model is not None else runner.model
-    inputs = {
-        "input_ids": input_batch.input_ids,
-        "positions": input_batch.positions,
-        "inputs_embeds": None,
-        "intermediate_tensors": None,
-        **runner.model_state.prepare_inputs(input_batch, runner.req_states),
-    }
-    if model_kwargs:
-        inputs.update(model_kwargs)
-        inputs["input_ids"] = input_batch.input_ids
-        inputs["positions"] = input_batch.positions
-    batch_descriptor = BatchDescriptor(num_tokens=n)
-    with set_forward_context(
-        attn_metadata,
-        runner.vllm_config,
-        num_tokens=n,
-        cudagraph_runtime_mode=CUDAGraphMode.NONE,
-        batch_descriptor=batch_descriptor,
-        slot_mapping=slot_mappings_by_layer,
-        is_padding=input_batch.is_padding,
-    ):
-        return fwd_model(**inputs)
-
-
-def commit_dsv4_accepted_chain(
-    runner,
-    idx_mapping: torch.Tensor,
-    sampled_tokens: torch.Tensor,
-    num_sampled: torch.Tensor,
-) -> None:
-    """Write the accepted chain onto official prefix KV after packed verify.
-
-    Packed tree verify skips C4/indexer/state and writes ori with SWA-C4
-    hidden. A later causal re-forward repairs C4/state and the bonus ori
-    slot; accepted ori slots are restored from the tree-verify gather so
-    the next SWA-C4 verify does not mix true-C4 keys with SWA-C4 queries.
-    Draft hidden/aux use the repaired MTP rows.
-    """
-    sampler = runner.rejection_sampler
-    path = sampler.path_node_ids
-    compact = runner.tree_kv_compact
-    getter = getattr(runner.model, "get_mtp_target_hidden_states", None)
-    if compact is not None and path is not None:
-        compact.run(idx_mapping, path, dst_from_zero=True)
-    spec = runner.speculator
-    meta = repair_tree_kv_causal(runner, idx_mapping, sampled_tokens, num_sampled)
-    if compact is not None and path is not None:
-        compact.scatter_held()
-    if meta is None or spec is None:
-        return
-    n, pos, qsl, aux = meta
-    spec._dsv4_commit_n = n
-    spec._dsv4_commit_pos = pos
-    spec._dsv4_commit_qsl = qsl
-    spec._dsv4_commit_aux = [a.clone() for a in aux] if aux else None
-    mtp = getter() if callable(getter) else None
-    spec._dsv4_commit_hidden = mtp[:n].clone() if mtp is not None else None
-
-
-def repair_tree_kv_causal(
-    runner,
-    idx_mapping: torch.Tensor,
-    sampled_tokens: torch.Tensor,
-    num_sampled: torch.Tensor,
-):
-    """Causal re-forward of accepted tokens onto official linear KV.
-
-    Packed tree verify skipped C4/indexer/state; this writes them on the
-    accepted chain. Caller saves/restores shared input buffers.
-
-    Returns ``(n, positions, query_start_loc, aux)`` or ``None``. ``n`` is
-    a host int.
-    """
-    orig_reqs = sampled_tokens.shape[0]
-    if orig_reqs <= 0:
-        return None
-    idx = idx_mapping[:orig_reqs]
-    keep = num_sampled[:orig_reqs] > 0
-    n_keep = int(keep.sum().item())  # D2H
-    if n_keep <= 0:
-        return None
-    num_reqs = orig_reqs
-    if n_keep < orig_reqs:
-        idx = idx[keep]
-        sampled_tokens = sampled_tokens[keep]
-        num_sampled = num_sampled[keep]
-        num_reqs = n_keep
-    safe_idx = idx.clamp(min=0)
-    device = sampled_tokens.device
-    max_q = sampled_tokens.shape[1]
-    local = torch.arange(max_q, device=device)
-    mask = local.unsqueeze(0) < num_sampled.unsqueeze(1)
-    qsl = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-    qsl[1:] = num_sampled.to(dtype=torch.int32).cumsum(0)
-    n = int(qsl[-1].item())  # D2H
-    if n <= 0:
-        return None
-
-    prefix = runner.req_states.num_computed_tokens.gpu[safe_idx]
-    ids = sampled_tokens.masked_select(mask)
-    pos = (prefix.unsqueeze(1) + local.to(dtype=prefix.dtype)).masked_select(mask)
-    seq_lens = prefix + num_sampled.to(dtype=prefix.dtype)
-
-    bufs = runner.input_buffers
-    old_qsl = bufs.query_start_loc[: orig_reqs + 1].clone()
-    old_n = int(old_qsl[-1].item())  # D2H
-    old_n = max(old_n, n)
-    old_ids = bufs.input_ids[:old_n].clone()
-    old_pos = bufs.positions[:old_n].clone()
-    old_seq = bufs.seq_lens[:orig_reqs].clone()
-    old_seq_np = bufs.seq_lens_np[:orig_reqs].copy()
-    old_pad = bufs.is_padding[:old_n].clone()
-
-    idx_np = safe_idx.cpu().numpy()  # D2H
-    qsl_np = qsl.cpu().numpy()  # D2H
-    seq_np = seq_lens.cpu().numpy().astype(np.int32, copy=False)  # D2H
-    scheduled_np = num_sampled.cpu().numpy().astype(np.int32, copy=False)  # D2H
-    computed_np = prefix.cpu().numpy().astype(np.int32, copy=False)  # D2H
-
-    bufs.input_ids[:n].copy_(ids.to(dtype=bufs.input_ids.dtype))
-    bufs.positions[:n].copy_(pos.to(dtype=bufs.positions.dtype))
-    bufs.query_start_loc[: num_reqs + 1].copy_(qsl)
-    bufs.seq_lens[:num_reqs].copy_(seq_lens.to(dtype=bufs.seq_lens.dtype))
-    bufs.seq_lens_np[:num_reqs] = seq_np
-    bufs.is_padding[:n].fill_(False)
-    update_cos_sin(bufs.positions[:n])
-
-    prefill_np = runner.req_states.prefill_len.np[idx_np]
-    input_batch = AscendInputBatch(
-        req_ids=[""] * num_reqs,
-        num_reqs=num_reqs,
-        num_reqs_after_padding=num_reqs,
-        idx_mapping=idx,
-        idx_mapping_np=idx_np,
-        expanded_idx_mapping=idx,
-        expanded_local_pos=torch.zeros(
-            num_reqs, dtype=torch.int32, device=device
-        ),
-        num_scheduled_tokens=scheduled_np,
-        num_tokens=n,
-        num_tokens_after_padding=n,
-        num_draft_tokens=0,
-        num_draft_tokens_per_req=None,
-        query_start_loc=bufs.query_start_loc[: num_reqs + 1],
-        query_start_loc_np=qsl_np,
-        seq_lens=bufs.seq_lens[:num_reqs],
-        seq_lens_cpu_upper_bound=torch.from_numpy(np.array(seq_np, copy=True)),
-        dcp_local_seq_lens=None,
-        num_computed_tokens_np=computed_np,
-        prefill_len_np=prefill_np,
-        num_computed_prefill_tokens_np=runner.req_states.num_computed_prefill_tokens[
-            idx_np
-        ],
-        is_prefilling_np=np.zeros(num_reqs, dtype=bool),
-        has_prefill=False,
-        input_ids=bufs.input_ids[:n],
-        positions=bufs.positions[:n],
-        is_padding=bufs.is_padding[:n],
-        logits_indices=bufs.query_start_loc[1 : num_reqs + 1] - 1,
-        cu_num_logits=bufs.query_start_loc[: num_reqs + 1],
-        cu_num_logits_np=qsl_np,
-        has_structured_output_reqs=False,
-        prompt_lens=None,
-        max_query_len=int(scheduled_np.max()) if scheduled_np.size else 0,
-        seq_lens_np=bufs.seq_lens_np[:num_reqs],
-        attn_state=AscendAttentionState.ChunkedPrefill,
-        tree_visibility=None,
-        slot_positions=None,
-    )
-
-    out = None
+def _cmp_case_log(prefix, path_nodes, parents, depths, num_nodes, moves) -> None:
+    """Classify CSA/HCA windows for request 0. Host-side, last rank only."""
     try:
-        out = run_short_causal_forward(runner, input_batch)
-    finally:
-        bufs.input_ids[:old_n].copy_(old_ids)
-        bufs.positions[:old_n].copy_(old_pos)
-        bufs.query_start_loc[: orig_reqs + 1].copy_(old_qsl)
-        bufs.seq_lens[:orig_reqs].copy_(old_seq)
-        bufs.seq_lens_np[:orig_reqs] = old_seq_np
-        bufs.is_padding[:old_n].copy_(old_pad)
-        update_cos_sin(bufs.positions[:old_n])
-    if out is None:
-        return None
-    _, aux = _split_model_output(out)
-    return n, pos, qsl, aux
+        from debug_trace import cmp_log
+    except Exception:
+        import importlib.util
+        import sys
+
+        spec = importlib.util.spec_from_file_location(
+            "debug_trace", "/home/specdec/spec260922/debug_trace.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cmp_log = mod.cmp_log
+    p0 = int(prefix[0].item()) if hasattr(prefix, "numel") else int(prefix)
+    nodes = [int(x) for x in path_nodes[:16]]
+    n = int(num_nodes)
+    dep = [int(x) for x in depths[:n]]
+    par = [int(x) for x in parents[:n]]
+    by_ratio = {}
+    for ratio in (4, 128):
+        residual = p0 % ratio
+        groups: dict[int, list[int]] = {}
+        rope_groups: dict[int, list[int]] = {}
+        for i in range(n):
+            nid = i + 1
+            slot_c = (p0 + nid) // ratio
+            rope_c = (p0 + dep[i]) // ratio
+            groups.setdefault(slot_c, []).append(nid)
+            rope_groups.setdefault(rope_c, []).append(nid)
+        slot_stomp = []
+        chain_mix = 0
+        for ids in groups.values():
+            if len(ids) < 2:
+                continue
+            slot_stomp.append(ids[:8])
+            # A real window is one parent chain. Mixed ids are siblings or
+            # unrelated nodes written into the same compressed slot.
+            idset = set(ids)
+            linked = 0
+            for nid in ids:
+                parent = par[nid - 1] if nid - 1 < len(par) else -1
+                if parent in idset or parent == 0:
+                    linked += 1
+            if linked < len(ids):
+                chain_mix += 1
+            if len(slot_stomp) >= 6:
+                break
+        # Siblings share a RoPE depth, so they fall in one compressed window.
+        branch = []
+        for ids in rope_groups.values():
+            if len(ids) < 2:
+                continue
+            d0 = dep[ids[0] - 1]
+            if any(dep[j - 1] == d0 for j in ids[1:]):
+                branch.append(ids[:8])
+            if len(branch) >= 4:
+                break
+        by_ratio["r" + str(ratio)] = {
+            "residual": residual,
+            "partial": residual != 0,
+            "n_slot": len(groups),
+            "slot_stomp": slot_stomp,
+            "rope_branch": branch,
+        }
+    cmp_log(
+        {
+            "prefix": p0,
+            "path": nodes,
+            "moves": moves,
+            "cmp": by_ratio,
+        }
+    )
 
 
-def _split_model_output(output):
-    if isinstance(output, tuple):
-        hidden, rest = output[0], output[1]
-        if rest is None:
-            return hidden, None
-        if isinstance(rest, torch.Tensor):
-            return hidden, [rest]
-        return hidden, list(rest)
-    return output, None
+def move_accepted_compress_slots(
+    runner, idx_mapping, path_node_ids, num_sampled, tree=None
+) -> dict:
+    """Move accepted-path compressed windows onto the linear prefix.
+
+    Verify writes each tree query at ``prefix + node_id``. After accept, draft
+    ``i`` belongs at ``prefix + i``. When that position closes a ratio-4 or
+    ratio-128 window, copy the compressed slot from the tree position.
+    """
+    groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None)
+    if (
+        not groups
+        or path_node_ids is None
+        or num_sampled is None
+        or int(num_sampled.shape[0]) == 0
+    ):
+        return {"groups": 0, "copies": 0}
+    from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import commit_winner
+
+    committed = commit_winner(path_node_ids)
+    if committed is not None:
+        return committed
+    num_reqs = int(num_sampled.shape[0])
+    idx = idx_mapping[:num_reqs].clamp(min=0)
+    prefix = runner.req_states.num_computed_tokens.gpu[idx]
+    spec = int(path_node_ids.shape[1])
+    node = path_node_ids[:num_reqs].to(dtype=torch.long)
+    valid = node >= 0
+    offs = torch.arange(spec, device=prefix.device)
+    ctx = runner.compilation_config.static_forward_context
+    n_groups = 0
+    n_copies = 0
+    move_rows = []
+    for gid, group in enumerate(groups):
+        if _group_is_linear_token_cache(group):
+            continue
+        spec = group.kv_cache_spec
+        inner = getattr(spec, "kv_cache_specs", None)
+        items = list(inner.values()) if inner else [spec]
+        ratio = 0
+        for item in items:
+            ratio = int(
+                getattr(item, "compress_ratio", 0)
+                or getattr(item, "tokens_per_state", 0)
+                or 0
+            )
+            if ratio > 1:
+                break
+        if ratio not in (4, 128):
+            continue
+        block_size = int(runner.block_tables.kernel_block_sizes[gid])
+        if block_size % ratio != 0:
+            continue
+        page = block_size // ratio
+        block_table = runner.block_tables.block_tables[gid].gpu
+        tensors: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for name in group.layer_names:
+            layer = ctx.get(name)
+            if layer is None:
+                continue
+            for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
+                ptr = tensor.untyped_storage().data_ptr()
+                if ptr in seen:
+                    continue
+                seen.add(ptr)
+                tensors.append(tensor)
+        if not tensors:
+            continue
+        pos = prefix.unsqueeze(1) + offs
+        src_pos = prefix.unsqueeze(1) + node.clamp(min=0)
+        boundary = valid & torch.remainder(pos + 1, ratio).eq(0)
+        dst_cpos = torch.div(pos, ratio, rounding_mode="floor")
+        src_cpos = torch.div(src_pos, ratio, rounding_mode="floor")
+        take = boundary & src_cpos.ne(dst_cpos)
+        if ratio in (4, 128) and len(move_rows) < 4:
+            taken = take[0].tolist()
+            src_l = src_cpos[0].tolist()
+            dst_l = dst_cpos[0].tolist()
+            pairs = [
+                [int(s), int(d)]
+                for s, d, ok in zip(src_l, dst_l, taken)
+                if ok
+            ]
+            dst_count: dict[int, int] = {}
+            for _, d in pairs:
+                dst_count[d] = dst_count.get(d, 0) + 1
+            move_rows.append(
+                {
+                    "ratio": ratio,
+                    "closed": len(pairs),
+                    "dst_stomp": [d for d, c in dst_count.items() if c > 1][:4],
+                    "pairs": pairs[:8],
+                }
+            )
+        if not bool(take.any().item()):
+            continue
+        req = idx.unsqueeze(1).expand_as(pos)
+        max_block = block_table.shape[1] - 1
+
+        def _flat(cpos: torch.Tensor) -> torch.Tensor:
+            bi = torch.div(cpos, page, rounding_mode="floor").clamp(0, max_block)
+            bo = torch.remainder(cpos, page)
+            blocks = block_table[req, bi]
+            return (blocks * page + bo).to(dtype=torch.long)
+
+        src_flat = _flat(src_cpos.clamp(min=0))[take]
+        dst_flat = _flat(dst_cpos)[take]
+        ranked = [t for t in tensors if t.ndim >= 3]
+        if not ranked:
+            continue
+        n_groups += 1
+        limit = min(int(t.shape[0] * t.shape[1]) for t in ranked)
+        in_range = (src_flat >= 0) & (dst_flat >= 0) & (src_flat < limit) & (dst_flat < limit)
+        src_flat = src_flat[in_range]
+        dst_flat = dst_flat[in_range]
+        if src_flat.numel() == 0:
+            continue
+        n_copies += int(src_flat.numel())
+        for tensor in ranked:
+            tail = tensor.shape[2:]
+            flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], *tail)
+            flat.index_copy_(0, dst_flat, flat.index_select(0, src_flat))
+    try:
+        if tree is not None:
+            n_nodes = int(tree.num_nodes[0].item())
+            _cmp_case_log(
+                prefix,
+                node[0].tolist(),
+                tree.parents[0, :n_nodes].tolist(),
+                tree.depths[0, :n_nodes].tolist(),
+                n_nodes,
+                move_rows,
+            )
+    except Exception:
+        pass
+    return {"groups": n_groups, "copies": n_copies}
+

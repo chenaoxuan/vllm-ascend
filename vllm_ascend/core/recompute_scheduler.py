@@ -1451,3 +1451,10 @@ class DyntraLBRecomputeScheduler(DyntraLBPolicyMixin, RecomputeScheduler):
 # delta for dyntra_lb: combine async recompute scheduling with the same DyntraLB policy.
 class AsyncDyntraLBRecomputeScheduler(DyntraLBPolicyMixin, AsyncRecomputeScheduler):
     pass
+
+
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
+
+_patch_tree_verify_width(RecomputeScheduler)

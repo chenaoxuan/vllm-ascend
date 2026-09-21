@@ -26,7 +26,12 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.sequence import IntermediateTensors
 from vllm.v1.core.sched.output import SchedulerOutput
+
+
+from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
+
+logger = init_logger("vllm.npu_model_runner")
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -71,7 +76,6 @@ from vllm_ascend.worker.v2.pp_utils import (
 )
 from vllm_ascend.worker.v2.spec_decode import (
     dflash_tree_spec_enabled,
-    dsv4_dspark_draft,
     init_speculator,
     tree_target_query_len,
 )
@@ -474,11 +478,13 @@ class NPUModelRunner(GPUModelRunner):
             if dflash_tree_spec_enabled(self.vllm_config)
             else None
         )
+        # topk>1 packed tree: RoPE from depth, KV from unique slot_positions.
+        # DSV4 DSpark beam must take this path; linear pos makes siblings
+        # look like a chain and tanks acceptance. topk=1 stays linear.
         use_tree_pos = (
             tree_depths is not None
             and self.ascend_config.tree_spec_config.topk is not None
             and self.ascend_config.tree_spec_config.topk > 1
-            and not dsv4_dspark_draft(self.vllm_config)
         )
         if use_tree_pos:
             is_prefilling = async_copy_to_gpu(
@@ -611,6 +617,22 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch.slot_positions = self.input_buffers.slot_positions[
                     :num_tokens_after_padding
                 ]
+
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+            clear_tree_chain_layout,
+            set_tree_chain_layout,
+        )
+
+        if use_tree_pos and not batch_req_state.has_prefill:
+            set_tree_chain_layout(
+                input_batch.tree_parents,
+                input_batch.tree_num_nodes,
+                input_batch.tree_depths,
+                input_batch.query_start_loc,
+                self.req_states.num_computed_tokens.gpu[idx_mapping],
+            )
+        else:
+            clear_tree_chain_layout()
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
@@ -783,11 +805,6 @@ class NPUModelRunner(GPUModelRunner):
             sampler = self.rejection_sampler
             path_node_ids = sampler.path_node_ids
             if path_node_ids is not None:
-                from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
-                    commit_dsv4_accepted_chain,
-                    needs_causal_kv_repair,
-                    repair_tree_kv_causal,
-                )
                 from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
                 with tree_time("compact_kv_path"):
@@ -796,12 +813,21 @@ class NPUModelRunner(GPUModelRunner):
                         isinstance(spec, AscendTreeSpeculator)
                         and spec.packed_dsv4_verify()
                     ):
-                        commit_dsv4_accepted_chain(
-                            self, idx_mapping, sampled_tokens, num_sampled
+                        # DSV4 sampled tokens start at prefix+0. Root slot is
+                        # replaced by the first accepted draft.
+                        self.tree_kv_compact.run(
+                            idx_mapping, path_node_ids, dst_from_zero=True
                         )
-                    elif needs_causal_kv_repair(self):
-                        repair_tree_kv_causal(
-                            self, idx_mapping, sampled_tokens, num_sampled
+                        from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
+                            move_accepted_compress_slots,
+                        )
+
+                        move_accepted_compress_slots(
+                            self,
+                            idx_mapping,
+                            path_node_ids,
+                            num_sampled,
+                            tree=getattr(self.speculator, "tree", None),
                         )
                     else:
                         self.tree_kv_compact.run(idx_mapping, path_node_ids)

@@ -10,6 +10,25 @@ from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
 
+
+def _agent_dbg(location, message, data, hypothesis_id, limit=400):
+    try:
+        import importlib.util
+        import sys
+
+        mod = sys.modules.get("_agent_debug_trace")
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(
+                "_agent_debug_trace",
+                "/home/specdec/spec260922/debug_trace.py",
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_agent_debug_trace"] = mod
+            spec.loader.exec_module(mod)
+        mod.dbg(location, message, data, hypothesis_id, limit=limit)
+    except Exception:
+        pass
+
 # Device-keyed scalar / arange caches for the reject hot path.
 _neg_one: dict[torch.device, torch.Tensor] = {}
 _zero_long: dict[torch.device, torch.Tensor] = {}
@@ -311,6 +330,90 @@ class TreeRejectionSampler(RejectionSampler):
         path_node_ids = path_node_ids.masked_fill(
             (num_sampled == 0).unsqueeze(1), -1
         )
+        # Previous sibling / lifecycle dump. Paused.
+        if False:
+            fail_at, want, siblings = 0, -1, []
+            try:
+                target_at = target_logits[:num_reqs].argmax(dim=-1)
+                path_row = path_node_ids[0]
+                for nid in path_row.tolist():
+                    if int(nid) < 0:
+                        break
+                    fail_at += 1
+                parent = 0 if fail_at == 0 else int(path_row[fail_at - 1])
+                if parent < target_at.shape[1]:
+                    want = int(target_at[0, parent].item())
+                child = int(tree.first_child[0, parent].item()) if parent < tree.first_child.shape[1] else -1
+                seen = 0
+                while child >= 0 and seen < 8 and child < tree.next_sibling.shape[1]:
+                    slot = child - 1
+                    if 0 <= slot < tree.tokens.shape[1]:
+                        siblings.append(int(tree.tokens[0, slot].item()))
+                    child = int(tree.next_sibling[0, child].item())
+                    seen += 1
+            except Exception:
+                pass
+            life_join = {}
+            try:
+                from vllm_ascend.worker.v2.spec_decode.tree.beam import LAST_LIFE
+
+                parent_info = LAST_LIFE.get("by_parent", {}).get(parent, {})
+                top = parent_info.get("top", [])
+                level_kept = parent_info.get("level_kept", [])
+                shadow = LAST_LIFE.get("shadow", [])
+                path_toks = []
+                for nid in path_row.tolist():
+                    if int(nid) < 0:
+                        break
+                    slot = int(nid) - 1
+                    if 0 <= slot < tree.tokens.shape[1]:
+                        path_toks.append(int(tree.tokens[0, slot].item()))
+                match = 0
+                for a, b in zip(path_toks, shadow):
+                    if a != b:
+                        break
+                    match += 1
+                shadow_at = shadow[fail_at] if fail_at < len(shadow) else None
+                life_join = {
+                    "aligned": match == fail_at,
+                    "root": LAST_LIFE.get("root"),
+                    "path_toks": path_toks,
+                    "shadow": shadow,
+                    "raw": LAST_LIFE.get("raw"),
+                    "shadow_match": match,
+                    "shadow_at_fail": shadow_at,
+                    "shadow_is_want": shadow_at == want,
+                    "parent_tok": parent_info.get("tok"),
+                    "parent_top": top,
+                    "level_kept": level_kept,
+                    "want_in_top": want in top,
+                    "want_in_level": want in level_kept,
+                    "ctx": LAST_LIFE.get("ctx"),
+                }
+            except Exception:
+                pass
+            _agent_dbg(
+                "tree/rejection_sampler.py:__call__",
+                "tree_reject",
+                {
+                    "method": method,
+                    "logits_rows": int(logits.shape[0]),
+                    "node_dim": int(node_dim),
+                    "nodes": tree.num_nodes,
+                    "num_sampled": num_sampled,
+                    "num_rejected": num_rejected,
+                    "path0": path_node_ids,
+                    "sampled0": sampled,
+                    "draft_tok0": tree.tokens,
+                    "fail_depth": fail_at,
+                    "want": want,
+                    "siblings": siblings,
+                    "want_in_siblings": want in siblings,
+                    "life": life_join,
+                },
+                "H3",
+            )
+        # #endregion
         self.path_node_ids = path_node_ids
         input_batch.path_node_ids = path_node_ids
         return SamplerOutput(

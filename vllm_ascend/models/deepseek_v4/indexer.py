@@ -168,11 +168,18 @@ class IndexerOverlapPlan:
 
 
 class AscendIndexerOps:
-    def __init__(self, index_topk: int) -> None:
+    def __init__(
+        self,
+        index_topk: int,
+        index_n_heads: int = 64,
+        index_head_dim: int = 128,
+    ) -> None:
         from vllm_ascend.device.device_op import DeviceOperator
 
         self.device_operator = DeviceOperator
         self.index_topk = index_topk
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = index_head_dim
 
     def unpack_dsa_indexer_kv_cache(self, kv_cache: tuple[torch.Tensor, ...]):
         return self.device_operator.unpack_dsa_indexer_kv_cache(kv_cache)
@@ -215,6 +222,62 @@ class AscendIndexerOps:
         scale_cache: torch.Tensor,
         metadata: typing.Any,
     ) -> torch.Tensor:
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import indexer_batch
+
+        batch = indexer_batch(key_cache)
+        if batch is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import pack_chain_tokens
+
+            query = pack_chain_tokens(query)
+            weights = pack_chain_tokens(weights)
+            query_scale = pack_chain_tokens(query_scale)
+            qli = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+                num_heads_q=self.index_n_heads,
+                num_heads_k=1,
+                head_dim=self.index_head_dim,
+                topk=self.index_topk,
+                quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
+                cu_seqlens_q=batch["cu"],
+                seqused_k=batch["seqused_k"],
+                cmp_residual_k=batch["residual"],
+                batch_size=batch["batch"],
+                max_seqlen_q=batch["max_q"],
+                max_seqlen_k=max(batch["max_k"], 1),
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
+                cmp_ratio=4,
+                device=str(key_cache.device),
+            )
+            topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+                query=query,
+                key=key_cache,
+                weights=self.device_operator.prepare_dsa_indexer_weights(weights),
+                query_dequant_scale=self.device_operator.prepare_dsa_indexer_query_scale(query_scale),
+                key_dequant_scale=self.device_operator.prepare_dsa_indexer_key_scale(scale_cache),
+                topk=self.index_topk,
+                quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
+                cu_seqlens_q=batch["cu"],
+                seqused_k=batch["seqused_k"],
+                cmp_residual_k=batch["residual"],
+                block_table=batch["block_table"],
+                metadata=qli,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                mask_mode=3,
+                cmp_ratio=4,
+                return_value=0,
+            )
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import note_read
+
+            head = topk_idxs[0, 0] if topk_idxs.ndim == 3 else topk_idxs[0]
+            note_read(
+                "indexer",
+                k0=int(batch["seqused_k"][0].item()),
+                k_last=int(batch["seqused_k"][-1].item()),
+                i0=[int(x) for x in head[:8].detach().to("cpu").tolist()],
+            )
+            return topk_idxs
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
         topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
             query=query,
@@ -305,7 +368,11 @@ class DeepseekV4Indexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         if self.skip_topk and self.topk_indices_buffer is None:
             raise ValueError("skip_topk requires topk_indices_buffer")
-        self.ops = AscendIndexerOps(index_topk=self.index_topk)
+        self.ops = AscendIndexerOps(
+            index_topk=self.index_topk,
+            index_n_heads=self.n_heads,
+            index_head_dim=self.head_dim,
+        )
         self.weights_proj = ReplicatedLinear(
             config.hidden_size,
             self.n_heads,
@@ -367,11 +434,14 @@ class DeepseekV4Indexer(nn.Module):
         _, hadamard = self._get_indexer_cache_metadata(metadata)
         compressor = self.compressor
         assert compressor is not None
-        key, slot_mapping = compressor(
-            hidden_states=hidden_states,
-            state_cache=state_cache,
-            metadata=metadata.compressor,
-        )
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_kv_scope
+
+        with chain_kv_scope([key_cache, scale_cache, full_cache]):
+            key, slot_mapping = compressor(
+                hidden_states=hidden_states,
+                state_cache=state_cache,
+                metadata=metadata.compressor,
+            )
         if key.shape[0] == 0:
             return
         if compressor.rotate:
@@ -509,11 +579,14 @@ class DeepseekV4Indexer(nn.Module):
         else:
             qr_quant_ready, qr_scale_ready = self.cv_wq_b.quantize(qr)
 
-        kv, slot_mapping_indexer = compressor(
-            hidden_states=hidden_states,
-            state_cache=indexer_state_cache,
-            metadata=metadata.compressor,
-        )
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_kv_scope
+
+        with chain_kv_scope([indexer_k_cache, indexer_scale_cache, indexer_full_cache]):
+            kv, slot_mapping_indexer = compressor(
+                hidden_states=hidden_states,
+                state_cache=indexer_state_cache,
+                metadata=metadata.compressor,
+            )
         if kv.numel() == 0:
             kv = None
         elif compressor.rotate:
@@ -677,11 +750,14 @@ class DeepseekV4Indexer(nn.Module):
         kv = None
         indexer_slot_mapping = None
         if write_cache:
-            kv, indexer_slot_mapping = compressor(
-                hidden_states=x,
-                state_cache=indexer_state_cache,
-                metadata=metadata.compressor,
-            )
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_kv_scope
+
+            with chain_kv_scope([indexer_k_cache, indexer_scale_cache, indexer_full_cache]):
+                kv, indexer_slot_mapping = compressor(
+                    hidden_states=x,
+                    state_cache=indexer_state_cache,
+                    metadata=metadata.compressor,
+                )
             if kv.numel() == 0:
                 kv = None
             elif compressor.rotate:

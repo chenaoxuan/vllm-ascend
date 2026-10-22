@@ -155,7 +155,11 @@ class NPUModelRunner(GPUModelRunner):
             # Shared update_stream: main model (ModelAclGraphManager) and draft
             # (Eagle/DFlash/DSpark AclGraphManager) all use this same stream.
             self.speculator.update_stream = self.update_stream
-
+        self._dsv4_tree_chain = (
+            isinstance(self.speculator, AscendTreeSpeculator)
+            and self.speculator._dsv4_dspark_draft
+            and self.speculator.topk == 1
+            )
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
         self.req_states: AscendRequestState = AscendRequestState(
@@ -166,6 +170,14 @@ class NPUModelRunner(GPUModelRunner):
             vocab_size=self.vocab_size,
             device=self.device,
         )
+
+        if self._dsv4_tree_chain:
+            # The inherited sample_tokens() assigns the whole returned draft
+            # row and forwards this whole request-state row to the scheduler.
+            # Keep its logical width K, while tree metadata retains its budget.
+            self.req_states.draft_tokens = self.req_states.draft_tokens[
+                :, :self.num_speculative_steps
+            ].contiguous()
         if self.use_spec_pp and vllm_version_is("0.28.0"):
             from vllm_ascend.patch.worker.patch_v2.patch_spec_pp import (
                 install_spec_pp_token_broadcast,
@@ -251,7 +263,6 @@ class NPUModelRunner(GPUModelRunner):
             self.execute_model_state = self.execute_model_state._replace(
                 input_batch=pcp_manager.global_batch,
             )
-
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
         if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
@@ -370,6 +381,14 @@ class NPUModelRunner(GPUModelRunner):
         npu attention backends need seq_lens_cpu to work.
         so we need to prepare seq_lens_cpu here.
         """
+        if self._dsv4_tree_chain:
+            for req_id, draft_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+                if len(draft_ids) > self.num_speculative_steps:
+                    raise RuntimeError(
+                        f"V4 topk=1 request {req_id} scheduled {len(draft_ids)} drafts; "
+                        f"expected at most {self.num_speculative_steps}. "
+                        "Restart after applying both chain-width changes."
+                    )
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
@@ -475,7 +494,7 @@ class NPUModelRunner(GPUModelRunner):
 
         tree_depths = (
             self.req_states.tree_depths
-            if dflash_tree_spec_enabled(self.vllm_config)
+            if dflash_tree_spec_enabled(self.vllm_config) and not self._dsv4_tree_chain
             else None
         )
         # topk>1 packed tree: RoPE from depth, KV from unique slot_positions.
@@ -623,15 +642,37 @@ class NPUModelRunner(GPUModelRunner):
             set_tree_chain_layout,
         )
 
-        if use_tree_pos and not batch_req_state.has_prefill:
+        is_v4_tree = (
+            isinstance(self.speculator, AscendTreeSpeculator)
+            and self.speculator.packed_dsv4_verify()
+        )
+        n_req = input_batch.num_reqs
+        if use_tree_pos and is_v4_tree and batch_req_state.has_prefill:
+            all_prefill = bool(batch_req_state.is_prefilling_np[:n_req].all())
+            if not all_prefill:
+                raise RuntimeError(
+                    "This eager V4 tree patch requires separate prefill and decode batches"
+                )
+        if (
+            use_tree_pos
+            and is_v4_tree
+            and not batch_req_state.has_prefill
+            and input_batch.num_draft_tokens > 0
+        ):
+            active_idx = idx_mapping[:n_req]
             set_tree_chain_layout(
-                input_batch.tree_parents,
-                input_batch.tree_num_nodes,
-                input_batch.tree_depths,
-                input_batch.query_start_loc,
-                self.req_states.num_computed_tokens.gpu[idx_mapping],
+                input_batch.tree_parents[:n_req],
+                input_batch.tree_num_nodes[:n_req],
+                input_batch.tree_depths[:n_req],
+                input_batch.query_start_loc[:n_req + 1],
+                self.req_states.num_computed_tokens.gpu[active_idx],
+                idx_mapping=active_idx,
             )
         else:
+            if is_v4_tree and input_batch.num_draft_tokens == 0:
+                # Ordinary sampling bypasses the tree rejection sampler. Let the
+                # ordinary target path update root/prefill caches directly.
+                input_batch.tree_visibility = None
             clear_tree_chain_layout()
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
@@ -647,7 +688,6 @@ class NPUModelRunner(GPUModelRunner):
                 input_batch,
                 padded_num_tokens=batch_desc.num_tokens,
             )
-
         # For mla/sfa, update cos/sin. Here is for execute_model.
         update_cos_sin(input_batch.positions)
 
@@ -813,11 +853,8 @@ class NPUModelRunner(GPUModelRunner):
                         isinstance(spec, AscendTreeSpeculator)
                         and spec.packed_dsv4_verify()
                     ):
-                        # DSV4 sampled tokens start at prefix+0. Root slot is
-                        # replaced by the first accepted draft.
-                        self.tree_kv_compact.run(
-                            idx_mapping, path_node_ids, dst_from_zero=True
-                        )
+                        # Root is computed at P; accepted drafts continue at P+1.
+                        self.tree_kv_compact.run(idx_mapping, path_node_ids)
                         from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
                             move_accepted_compress_slots,
                         )
@@ -840,7 +877,6 @@ class NPUModelRunner(GPUModelRunner):
             num_rejected,
             query_start_loc,
         )
-
         # Without MTP, update_requests writes the shared NumPy/torch CPU state.
         if self.speculator is not None:
             self._copy_num_computed_tokens_to_cpu()

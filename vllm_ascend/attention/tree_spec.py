@@ -216,109 +216,81 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
         )
 
 
-def _positions_to_slots(
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    req_ids: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    """Map absolute token positions ``[T, W]`` to paged slot ids."""
+def _positions_to_slots(positions, block_table, req_ids, block_size):
     nblocks = block_table.shape[1]
     block_nums = torch.div(positions, block_size, rounding_mode="floor")
     safe_nums = block_nums.clamp(min=0, max=nblocks - 1).to(torch.long)
-    block_offsets = torch.remainder(positions, block_size)
-    req_tables = block_table[req_ids]
-    block_ids = torch.gather(req_tables, 1, safe_nums)
-    return (block_ids * block_size + block_offsets).to(torch.int32)
+    block_ids = torch.gather(block_table[req_ids], 1, safe_nums)
+    valid = (positions >= 0) & (block_nums < nblocks) & (block_ids > 0)
+    slots = block_ids * block_size + torch.remainder(positions, block_size)
+    return torch.where(valid, slots, -1).to(torch.int32)
 
 
 def build_tree_ori_sparse_indices(
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    tree_visibility: torch.Tensor,
-    num_decodes: int,
-    num_tokens: int,
-    window_size: int,
-    storage_block_size: int,
-    buffer: torch.Tensor,
-) -> torch.Tensor:
-    """Per-token ori slots for tree target verify (and mixed-batch prefills).
-
-    Decode queries see the trailing SWA window of the committed prefix
-    (including the root slot) plus draft slots allowed by ``tree_visibility``.
-    Prefill tokens in a mixed batch keep a causal sliding window.
-    Valid slots are left-packed: the A3 SWA kernel stops at the first -1.
-    Returned view is a leading slice of ``buffer`` so ACLGraph keeps a stable
-    pointer.
-    """
+    block_table, seq_lens, query_start_loc, tree_visibility,
+    num_decodes, num_tokens, window_size, storage_block_size, buffer,
+):
     device = buffer.device
-    num_reqs = seq_lens.shape[0]
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    prefix_lens = seq_lens - query_lens
+    n_req = int(seq_lens.shape[0])
     budget = int(tree_visibility.shape[-1])
-    query_len = 1 + budget
-    vis = tree_visibility[:num_decodes]
-    if vis.shape[0] < num_decodes:
-        vis = vis[: vis.shape[0]]
+    if n_req == 0 or num_tokens == 0:
+        buffer.fill_(-1)
+        return buffer[:num_tokens]
+    if budget <= 0 or not 0 < num_decodes <= n_req:
+        raise RuntimeError("Invalid tree visibility/decode batch")
+    if tree_visibility.shape[0] < num_decodes:
+        raise RuntimeError("Missing tree visibility rows")
+    qsl = query_start_loc[:n_req + 1].to(torch.long)
+    qlens = qsl[1:] - qsl[:-1]
+    prefixes = seq_lens.to(torch.long) - qlens
+    token = torch.arange(num_tokens, device=device)
+    req = torch.searchsorted(qsl[1:], token, right=True).clamp(max=n_req - 1)
+    offset = token - qsl[req]
+    in_query = (offset >= 0) & (offset < qlens[req])
+    decode = (req < num_decodes) & in_query
+    vis = tree_visibility[:num_decodes].to(device=device, dtype=torch.bool)
+    # Each row includes this node and all non-root ancestors.
+    node_depth = vis.sum(dim=-1, dtype=torch.long)
+    vis_req = req.clamp(max=num_decodes - 1)
+    vis_row = (offset - 1).clamp(min=0, max=budget - 1)
+    draft_query = decode & (offset >= 1) & (offset <= budget)
+    depth = torch.where(draft_query, node_depth[vis_req, vis_row], 0)
+    logical_pos = prefixes[req] + torch.where(decode, depth, offset)
+    window_start = (logical_pos - int(window_size) + 1).clamp(min=0)
 
-    query_lens = query_lens.to(torch.long)
-    req_ids = torch.repeat_interleave(
-        torch.arange(num_reqs, device=device, dtype=torch.long),
-        query_lens,
-    )
-    if req_ids.numel() < num_tokens:
-        pad_n = num_tokens - req_ids.numel()
-        fill = req_ids[-1] if req_ids.numel() > 0 else torch.zeros((), device=device, dtype=torch.long)
-        req_ids = torch.cat([req_ids, fill.reshape(1).expand(pad_n)])
-    elif req_ids.numel() > num_tokens:
-        req_ids = req_ids[:num_tokens]
+    # The prefix segment includes the root at P, if P is still in the window.
+    prefix_end = torch.where(decode, prefixes[req], logical_pos)
+    prefix_len = (prefix_end - window_start + 1).clamp(min=0, max=window_size)
+    col = torch.arange(window_size, device=device)
+    prefix_pos = window_start[:, None] + col[None, :]
+    prefix_slots = _positions_to_slots(prefix_pos, block_table, req, storage_block_size)
+    prefix_valid = (col[None, :] < prefix_len[:, None]) & in_query[:, None]
+    prefix_slots = prefix_slots.masked_fill(~prefix_valid, -1)
 
-    token_offsets = torch.arange(num_tokens, device=device, dtype=torch.long) - query_start_loc[req_ids]
-    in_query = token_offsets < query_lens[req_ids]
-    positions = prefix_lens[req_ids] + token_offsets
-    is_decode = (req_ids < num_decodes) & in_query
-
-    decode_start = (prefix_lens - window_size + 1).clamp(min=0)[req_ids]
-    prefill_start = (positions - window_size + 1).clamp(min=0)
-    starts = torch.where(is_decode, decode_start, prefill_start)
-    decode_end = prefix_lens[req_ids]
-    ends = torch.where(is_decode, decode_end, positions)
-    vis_len = (ends - starts + 1).clamp(min=0)
-
-    prefix_cols = torch.arange(window_size, device=device)
-    prefix_pos = starts.unsqueeze(1) + prefix_cols.unsqueeze(0)
-    prefix_valid = (prefix_cols.unsqueeze(0) < vis_len.unsqueeze(1)) & in_query.unsqueeze(1)
-    prefix_slots = _positions_to_slots(prefix_pos, block_table, req_ids, storage_block_size)
-    prefix_slots = prefix_slots.where(prefix_valid, prefix_slots.new_full((), -1))
-
-    vis_req = req_ids.clamp(max=max(vis.shape[0] - 1, 0))
-    vis_row = (token_offsets - 1).clamp(min=0, max=budget - 1)
-    vis_rows = vis[vis_req, vis_row]
-    draft_query = is_decode & (token_offsets >= 1) & (token_offsets < query_len)
-    draft_valid = vis_rows & draft_query.unsqueeze(1)
-    draft_cols = torch.arange(budget, device=device)
-    draft_pos = prefix_lens[req_ids].unsqueeze(1) + 1 + draft_cols.unsqueeze(0)
-    draft_slots = _positions_to_slots(draft_pos, block_table, req_ids, storage_block_size)
-    draft_slots = draft_slots.where(draft_valid, draft_slots.new_full((), -1))
+    # Physical slots use flat node IDs; visibility uses logical tree depths.
+    draft_depth = node_depth[vis_req]
+    draft_logical_pos = prefixes[req, None] + draft_depth
+    draft_valid = vis[vis_req, vis_row] & draft_query[:, None]
+    draft_valid &= (draft_logical_pos >= window_start[:, None])
+    draft_valid &= (draft_logical_pos <= logical_pos[:, None]) & (draft_depth > 0)
+    node_id = torch.arange(1, budget + 1, device=device)
+    physical_pos = prefixes[req, None] + node_id[None, :]
+    draft_slots = _positions_to_slots(physical_pos, block_table, req, storage_block_size)
+    draft_slots = draft_slots.masked_fill(~draft_valid, -1)
 
     packed = torch.cat([prefix_slots, draft_slots], dim=-1)
-    # A3 SWA GetOriSparseActualSeqLen stops at the first -1, so valid prefix
-    # and ancestor draft slots must be left-packed. A hole in the SWA window
-    # would drop every later draft slot and collapse pos1+ logits.
     valid = packed >= 0
     ncol = packed.shape[-1]
-    order = torch.arange(ncol, device=device, dtype=torch.float32)
-    key = order + (~valid).to(order.dtype) * float(ncol)
+    order = torch.arange(ncol, device=device)
+    key = order[None, :] + (~valid).to(torch.long) * ncol
     packed = packed.gather(1, key.argsort(dim=-1))
-    index_width = buffer.shape[-1]
-    if packed.shape[-1] < index_width:
-        pad = packed.new_full((num_tokens, index_width - packed.shape[-1]), -1)
-        packed = torch.cat([packed, pad], dim=-1)
-    elif packed.shape[-1] > index_width:
-        packed = packed[:, :index_width]
-    packed = packed.unsqueeze(1)
-    buffer[:num_tokens].copy_(packed)
-    if buffer.shape[0] > num_tokens:
-        buffer[num_tokens:].fill_(-1)
+    width = int(buffer.shape[-1])
+    if width < window_size:
+        raise RuntimeError("Tree SWA buffer is smaller than the model window")
+    if ncol < width:
+        packed = torch.cat([packed, packed.new_full((num_tokens, width - ncol), -1)], dim=1)
+    else:
+        packed = packed[:, :width]
+    buffer[:num_tokens].copy_(packed[:, None, :])
+    buffer[num_tokens:].fill_(-1)
     return buffer[:num_tokens]

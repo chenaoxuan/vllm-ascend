@@ -54,6 +54,13 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
+from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+    cache_tree_topk,
+    chain_layout_active,
+    get_tree_topk,
+    tree_cache_view,
+)
+
 
 def hadamard_linear(x: torch.Tensor, hadamard: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], int]:
     x_shape = x.shape
@@ -226,6 +233,8 @@ class AscendIndexerOps:
 
         batch = indexer_batch(key_cache)
         if batch is not None:
+            key_cache = tree_cache_view(key_cache)
+            scale_cache = tree_cache_view(scale_cache)
             from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import pack_chain_tokens
 
             query = pack_chain_tokens(query)
@@ -267,15 +276,6 @@ class AscendIndexerOps:
                 mask_mode=3,
                 cmp_ratio=4,
                 return_value=0,
-            )
-            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import note_read
-
-            head = topk_idxs[0, 0] if topk_idxs.ndim == 3 else topk_idxs[0]
-            note_read(
-                "indexer",
-                k0=int(batch["seqused_k"][0].item()),
-                k_last=int(batch["seqused_k"][-1].item()),
-                i0=[int(x) for x in head[:8].detach().to("cpu").tolist()],
             )
             return topk_idxs
         wait_for_device_metadata(DeviceMetadataStage.INDEXER, id(metadata.qli_metadata))
@@ -442,6 +442,9 @@ class DeepseekV4Indexer(nn.Module):
                 state_cache=state_cache,
                 metadata=metadata.compressor,
             )
+        key_cache = tree_cache_view(key_cache)
+        scale_cache = tree_cache_view(scale_cache)
+        full_cache = tree_cache_view(full_cache)
         if key.shape[0] == 0:
             return
         if compressor.rotate:
@@ -460,6 +463,8 @@ class DeepseekV4Indexer(nn.Module):
             )
 
     def _get_cached_topk_indices(self, num_tokens: int, offset: int = 0) -> torch.Tensor:
+        if chain_layout_active():
+            return get_tree_topk(self.topk_indices_buffer, offset=offset)
         if self.topk_indices_buffer is None:
             raise RuntimeError("topk_indices_buffer is required to read cached TopK indices")
         topk_indices = self.topk_indices_buffer[offset : offset + num_tokens]
@@ -468,6 +473,10 @@ class DeepseekV4Indexer(nn.Module):
         return topk_indices
 
     def _update_cached_topk_indices(self, topk_indices: torch.Tensor, offset: int = 0) -> None:
+        if chain_layout_active():
+            if self.topk_indices_buffer is not None:
+                cache_tree_topk(self.topk_indices_buffer, topk_indices, offset=offset)
+            return
         if self.topk_indices_buffer is None:
             return
         num_tokens = topk_indices.shape[0]
@@ -587,6 +596,9 @@ class DeepseekV4Indexer(nn.Module):
                 state_cache=indexer_state_cache,
                 metadata=metadata.compressor,
             )
+        indexer_k_cache = tree_cache_view(indexer_k_cache)
+        indexer_scale_cache = tree_cache_view(indexer_scale_cache)
+        indexer_full_cache = tree_cache_view(indexer_full_cache)
         if kv.numel() == 0:
             kv = None
         elif compressor.rotate:
@@ -758,6 +770,9 @@ class DeepseekV4Indexer(nn.Module):
                     state_cache=indexer_state_cache,
                     metadata=metadata.compressor,
                 )
+            indexer_k_cache = tree_cache_view(indexer_k_cache)
+            indexer_scale_cache = tree_cache_view(indexer_scale_cache)
+            indexer_full_cache = tree_cache_view(indexer_full_cache)
             if kv.numel() == 0:
                 kv = None
             elif compressor.rotate:

@@ -13,79 +13,16 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
     AscendDFlashSpeculator,
 )
-
 from vllm_ascend.worker.v2.spec_decode.tree.builder import (
     create_tree_builder,
 )
-from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import compact_tree_query_along_path
+from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
+    compact_tree_query_along_path,
+    compact_tree_query_along_path_eager,
+)
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
 
 logger = init_logger("vllm." + __name__)
-
-
-def _agent_dbg(location, message, data, hypothesis_id, limit=400):
-    try:
-        import importlib.util
-        import sys
-
-        mod = sys.modules.get("_agent_debug_trace")
-        if mod is None:
-            spec = importlib.util.spec_from_file_location(
-                "_agent_debug_trace",
-                "/home/specdec/spec260922/debug_trace.py",
-            )
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["_agent_debug_trace"] = mod
-            spec.loader.exec_module(mod)
-        mod.dbg(location, message, data, hypothesis_id, limit=limit)
-    except Exception:
-        pass
-
-
-def _plain_row(value, n: int = 16):
-    if value is None:
-        return None
-    if not isinstance(value, torch.Tensor):
-        return value
-    tensor = value.detach()
-    if tensor.ndim == 0:
-        if tensor.dtype.is_floating_point:
-            return round(float(tensor.item()), 4)
-        return int(tensor.item())
-    if tensor.ndim > 1:
-        tensor = tensor[0]
-    tensor = tensor.reshape(-1)[:n]
-    if tensor.dtype.is_floating_point:
-        return [round(float(x), 4) for x in tensor.tolist()]
-    return [int(x) for x in tensor.tolist()]
-
-
-def _note_beam_life_ctx(spec, num_reqs, nqp, sample_hidden, root_token_ids) -> None:
-    """Draft query the beam is about to expand. Req 0 only."""
-    try:
-        from vllm_ascend.worker.v2.spec_decode.tree.beam import note_life_ctx
-
-        n_spec = spec.num_speculative_steps
-        buf = spec.input_buffers
-        batch = getattr(spec, "input_batch", None)
-        hidden = sample_hidden.view(num_reqs, n_spec, -1)
-        path = None if batch is None else getattr(batch, "path_node_ids", None)
-        seq = getattr(buf, "seq_lens", None)
-        ctx = {
-            "q_ids": _plain_row(buf.input_ids[:nqp], nqp),
-            "q_pos": _plain_row(buf.positions[:nqp], nqp),
-            "sample_idx": _plain_row(spec.sample_indices[:n_spec], n_spec),
-            "sample_pos": _plain_row(spec.sample_pos[:n_spec], n_spec),
-            "seq": _plain_row(None if seq is None else seq[:num_reqs], 4),
-            "root": _plain_row(root_token_ids, 1),
-            "path": _plain_row(path, 8),
-            "prefix_n": int(getattr(spec, "_dsv4_prefix_n", -1) or 0),
-            "h_mean": [round(float(x), 4) for x in hidden[0].abs().mean(-1).tolist()],
-        }
-        note_life_ctx(ctx)
-        _agent_dbg("tree/speculator.py:_finalize_tree", "life_ctx", ctx, "H6")
-    except Exception:
-        pass
 
 
 def _hf_dflash_config(hf_config) -> dict:
@@ -183,6 +120,21 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         from vllm_ascend.worker.v2.spec_decode import dsv4_dspark_draft
 
         self._dsv4_dspark_draft = dsv4_dspark_draft(vllm_config)
+        if self._dsv4_dspark_draft and self.topk > 1:
+            if not vllm_config.model_config.enforce_eager:
+                raise ValueError("This V4 tree correctness patch requires --enforce-eager")
+            if tree_cfg.rejection_sampler != "greedy":
+                raise ValueError("Validate V4 trees with rejection_sampler='greedy' first")
+            parallel = vllm_config.parallel_config
+            for name in (
+                "pipeline_parallel_size",
+                "prefill_context_parallel_size",
+                "decode_context_parallel_size",
+            ):
+                if int(getattr(parallel, name, 1)) != 1:
+                    raise ValueError(f"This V4 tree patch requires {name}=1")
+            if getattr(vllm_config, "kv_transfer_config", None) is not None:
+                raise ValueError("Tree branch commitment is not integrated with KV transfer")
 
         self.tree_builder = None
         self._domino_scorer = None
@@ -433,7 +385,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             prefix = _dspark_swa_prefix(layer)
             gid = _gid_for_swa_prefix(prefix, groups)
             if gid is None or gid not in gid_to_idx:
-                continue
+                raise RuntimeError(f"DSpark SWA layer has no context KV group: {prefix!r}")
             gidx = gid_to_idx[gid]
             name_to_gidx[prefix] = gidx
             aligned.append(gidx)
@@ -448,8 +400,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             return {}
         out: dict[str, Any] = {}
         for prefix, gidx in name_to_gidx.items():
-            if 0 <= gidx < maps.shape[0]:
-                out[prefix] = maps[gidx, :n]
+            if not 0 <= gidx < maps.shape[0] or n > maps.shape[1]:
+                raise RuntimeError(f"DSpark SWA context slot row is invalid: {prefix!r}")
+            out[prefix] = maps[gidx, :n]
         return out
 
     def _install_dspark_all_group_context_kv(self, kv_cache_config: Any) -> None:
@@ -468,28 +421,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             inner._draft_kv_slots_by_name = (
                 self._dspark_slots_by_swa_name(n) if bound else None
             )
-            # Draft KV is rewritten from the accepted-path hidden, one store
-            # for every SWA layer. Log the positions so this stays visible
-            # next to the target compress commit.
-            if n > 0 and context_positions is not None and context_positions.numel() > 0:
-                try:
-                    from debug_trace import cmp_log
-
-                    pos = context_positions[:n]
-                    cmp_log(
-                        {
-                            "draft_kv": 1,
-                            "n": n,
-                            "pos0": int(pos[0].item()),
-                            "pos_mid": int(pos[min(n - 1, 7)].item()),
-                            "posn": int(pos[n - 1].item()),
-                            "layers": len(inner._draft_kv_slots_by_name or {}),
-                        }
-                    )
-                except Exception:
-                    pass
-            orig(context_states, context_positions, context_slot_mapping)
-            inner._draft_kv_slots_by_name = None
+            try:
+                orig(context_states, context_positions, context_slot_mapping)
+            finally:
+                inner._draft_kv_slots_by_name = None
 
         self.model.precompute_and_store_context_kv = _precompute
         self._dspark_ctx_kv_wrapped = True
@@ -841,20 +776,27 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             if path_node_ids is not None and not dummy_run:
                 from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
 
-                tree_q = 1 + (get_ascend_config().tree_spec_config.budget or 0)
-                # Skip when this step is not a full tree verify (e.g. 16 tokens
-                # padded to the 17-token FULL gear at max_seq_len).
-                if last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q:
-                    tensors = [last_hidden_states]
-                    if aux_hidden_states:
-                        tensors.extend(aux_hidden_states)
+                tensors = [last_hidden_states]
+                if aux_hidden_states:
+                    tensors.extend(aux_hidden_states)
+                if self.packed_dsv4_verify():
                     with tree_time("compact_query_path"):
-                        compact_tree_query_along_path(
+                        compact_tree_query_along_path_eager(
                             tensors,
                             input_batch.query_start_loc,
                             path_node_ids,
                             linearize_positions=input_batch.positions,
                         )
+                else:
+                    tree_q = 1 + (get_ascend_config().tree_spec_config.budget or 0)
+                    if last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q:
+                        with tree_time("compact_query_path"):
+                            compact_tree_query_along_path(
+                                tensors,
+                                input_batch.query_start_loc,
+                                path_node_ids,
+                                linearize_positions=input_batch.positions,
+                            )
             self._tree_finalized = False
             if self.draft_backend == "dspark":
                 copy_w = (
@@ -940,28 +882,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             # FULL replay only runs draft forward; prefix may replay a second graph.
             if not dummy_run:
                 self._finalize_tree(input_batch.num_reqs)
-                # #region agent log
-                tree = self.tree
-                _agent_dbg(
-                    "tree/speculator.py:propose",
-                    "propose_out",
-                    {
-                        "method": self.method,
-                        "budget": self.budget,
-                        "topk": self.topk,
-                        "n_spec": self.num_speculative_steps,
-                        "n_req": int(input_batch.num_reqs),
-                        "hidden": int(last_hidden_states.shape[0]),
-                        "tok_shape": list(tokens.shape),
-                        "tok0": tokens,
-                        "nodes": None if tree is None else tree.num_nodes,
-                        "tree_tok0": None if tree is None else tree.tokens,
-                        "dep0": None if tree is None else tree.depths,
-                        "par0": None if tree is None else tree.parents,
-                    },
-                    "H4",
-                )
-                # #endregion
+                if self._dsv4_dspark_draft and self.topk == 1:
+                    # Storage capacity is the tree budget; the chain has only K
+                    # draft tokens. Never publish the padded suffix to the runner.
+                    return tokens[:input_batch.num_reqs, :self.num_speculative_steps]
             return tokens
         finally:
             self._dsv4_chunk_prefix_len = None
@@ -1139,11 +1063,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(
             num_reqs, nqp
         )[:, 0]
-        # Draft-query dump. Paused for the coverage run.
-        if False and self.method == "beam":
-            _note_beam_life_ctx(
-                self, num_reqs, nqp, sample_hidden_states, root_token_ids
-            )
         proposal = None
         if self.tree_proposal_logits is not None:
             proposal = self.tree_proposal_logits[:num_reqs, : self.budget + 1]
@@ -1159,23 +1078,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         with tree_time("build_draft_tree"):
             self.tree = self.tree_builder.build(logits, layout, **build_kwargs)
         self._tree_finalized = True
-        # #region agent log
-        _agent_dbg(
-            "tree/speculator.py:_finalize_tree",
-            "tree_built",
-            {
-                "method": self.method,
-                "branch": "build",
-                "logits": list(logits.shape),
-                "nodes": self.tree.num_nodes,
-                "tok0": self.tree.tokens,
-                "dep0": self.tree.depths,
-                "par0": self.tree.parents,
-                "child0": self.tree.first_child,
-            },
-            "H5",
-        )
-        # #endregion
 
     def _generate_draft(
         self,

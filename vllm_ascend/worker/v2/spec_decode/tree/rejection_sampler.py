@@ -10,25 +10,6 @@ from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
 
-
-def _agent_dbg(location, message, data, hypothesis_id, limit=400):
-    try:
-        import importlib.util
-        import sys
-
-        mod = sys.modules.get("_agent_debug_trace")
-        if mod is None:
-            spec = importlib.util.spec_from_file_location(
-                "_agent_debug_trace",
-                "/home/specdec/spec260922/debug_trace.py",
-            )
-            mod = importlib.util.module_from_spec(spec)
-            sys.modules["_agent_debug_trace"] = mod
-            spec.loader.exec_module(mod)
-        mod.dbg(location, message, data, hypothesis_id, limit=limit)
-    except Exception:
-        pass
-
 # Device-keyed scalar / arange caches for the reject hot path.
 _neg_one: dict[torch.device, torch.Tensor] = {}
 _zero_long: dict[torch.device, torch.Tensor] = {}
@@ -210,6 +191,37 @@ def _pack_tree_target_logits(
         packed[i, :n] = logits[start : start + n]
     return packed
 
+def _limit_tree_to_verified_nodes(tree, input_batch):
+    """Rebuild links so rejection cannot walk into unscheduled node logits."""
+    n_req = input_batch.num_reqs
+    logits_cu = input_batch.cu_num_logits[:n_req + 1].detach().cpu().tolist()
+    query_cu = input_batch.query_start_loc[:n_req + 1].detach().cpu().tolist()
+    proposed = tree.num_nodes[:n_req].detach().cpu().tolist()
+    parents = tree.parents[:n_req].detach().cpu().tolist()
+    first = torch.full_like(tree.first_child, -1)
+    sibling = torch.full_like(tree.next_sibling, -1)
+    counts = []
+    for req in range(n_req):
+        n_logits = int(logits_cu[req + 1] - logits_cu[req])
+        n_query = int(query_cu[req + 1] - query_cu[req])
+        if n_logits != n_query or n_logits < 1:
+            raise RuntimeError("Tree verify must return one logit row per scheduled query")
+        count = min(int(proposed[req]), n_logits - 1)
+        counts.append(count)
+        children = [-1] * first.shape[1]
+        siblings = [-1] * sibling.shape[1]
+        for node in range(1, count + 1):
+            parent = int(parents[req][node - 1])
+            if not 0 <= parent < node:
+                raise RuntimeError("Scheduled tree prefix is not topologically ordered")
+            siblings[node] = children[parent]
+            children[parent] = node
+        first[req] = torch.tensor(children, dtype=first.dtype, device=first.device)
+        sibling[req] = torch.tensor(siblings, dtype=sibling.dtype, device=sibling.device)
+    tree.first_child = first
+    tree.next_sibling = sibling
+    tree.num_nodes = torch.tensor(counts, dtype=tree.num_nodes.dtype, device=tree.num_nodes.device)
+    return tree
 
 class TreeRejectionSampler(RejectionSampler):
     """v2 rejection sampler for a DFlash draft tree.
@@ -276,7 +288,10 @@ class TreeRejectionSampler(RejectionSampler):
             first_child=input_batch.tree_first_child,
             next_sibling=input_batch.tree_next_sibling,
         )
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
 
+        if chain_layout_active():
+            tree = _limit_tree_to_verified_nodes(tree, input_batch)
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         num_reqs = input_batch.num_reqs
         node_dim = tree.tokens.shape[1] + 1
@@ -330,90 +345,6 @@ class TreeRejectionSampler(RejectionSampler):
         path_node_ids = path_node_ids.masked_fill(
             (num_sampled == 0).unsqueeze(1), -1
         )
-        # Previous sibling / lifecycle dump. Paused.
-        if False:
-            fail_at, want, siblings = 0, -1, []
-            try:
-                target_at = target_logits[:num_reqs].argmax(dim=-1)
-                path_row = path_node_ids[0]
-                for nid in path_row.tolist():
-                    if int(nid) < 0:
-                        break
-                    fail_at += 1
-                parent = 0 if fail_at == 0 else int(path_row[fail_at - 1])
-                if parent < target_at.shape[1]:
-                    want = int(target_at[0, parent].item())
-                child = int(tree.first_child[0, parent].item()) if parent < tree.first_child.shape[1] else -1
-                seen = 0
-                while child >= 0 and seen < 8 and child < tree.next_sibling.shape[1]:
-                    slot = child - 1
-                    if 0 <= slot < tree.tokens.shape[1]:
-                        siblings.append(int(tree.tokens[0, slot].item()))
-                    child = int(tree.next_sibling[0, child].item())
-                    seen += 1
-            except Exception:
-                pass
-            life_join = {}
-            try:
-                from vllm_ascend.worker.v2.spec_decode.tree.beam import LAST_LIFE
-
-                parent_info = LAST_LIFE.get("by_parent", {}).get(parent, {})
-                top = parent_info.get("top", [])
-                level_kept = parent_info.get("level_kept", [])
-                shadow = LAST_LIFE.get("shadow", [])
-                path_toks = []
-                for nid in path_row.tolist():
-                    if int(nid) < 0:
-                        break
-                    slot = int(nid) - 1
-                    if 0 <= slot < tree.tokens.shape[1]:
-                        path_toks.append(int(tree.tokens[0, slot].item()))
-                match = 0
-                for a, b in zip(path_toks, shadow):
-                    if a != b:
-                        break
-                    match += 1
-                shadow_at = shadow[fail_at] if fail_at < len(shadow) else None
-                life_join = {
-                    "aligned": match == fail_at,
-                    "root": LAST_LIFE.get("root"),
-                    "path_toks": path_toks,
-                    "shadow": shadow,
-                    "raw": LAST_LIFE.get("raw"),
-                    "shadow_match": match,
-                    "shadow_at_fail": shadow_at,
-                    "shadow_is_want": shadow_at == want,
-                    "parent_tok": parent_info.get("tok"),
-                    "parent_top": top,
-                    "level_kept": level_kept,
-                    "want_in_top": want in top,
-                    "want_in_level": want in level_kept,
-                    "ctx": LAST_LIFE.get("ctx"),
-                }
-            except Exception:
-                pass
-            _agent_dbg(
-                "tree/rejection_sampler.py:__call__",
-                "tree_reject",
-                {
-                    "method": method,
-                    "logits_rows": int(logits.shape[0]),
-                    "node_dim": int(node_dim),
-                    "nodes": tree.num_nodes,
-                    "num_sampled": num_sampled,
-                    "num_rejected": num_rejected,
-                    "path0": path_node_ids,
-                    "sampled0": sampled,
-                    "draft_tok0": tree.tokens,
-                    "fail_depth": fail_at,
-                    "want": want,
-                    "siblings": siblings,
-                    "want_in_siblings": want in siblings,
-                    "life": life_join,
-                },
-                "H3",
-            )
-        # #endregion
         self.path_node_ids = path_node_ids
         input_batch.path_node_ids = path_node_ids
         return SamplerOutput(

@@ -76,6 +76,11 @@ if HAS_TRITON:
 else:
     triton_q_rms = None  # type: ignore
 
+from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+    chain_layout_active,
+    finish_tree_layer,
+    tree_cache_view,
+)
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
@@ -2224,7 +2229,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             ) -> None:
                 if compressed_kv.shape[0] > 0:
                     get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
-                        compress_kv_cache,
+                        tree_cache_view(compress_kv_cache),
                         compressed_kv,
                         compress_slot_mapping,
                     )
@@ -2233,13 +2238,13 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 compute_attention_compressed_kv=compute_attention_compressed_kv,
                 scatter_attention_compressed_kv=scatter_attention_compressed_kv,
                 aux_stream=(
-                    None
-                    if not write_cache
-                    else (
-                        dsv4_dsa_overlap_stream()
-                        if self.multistream_dsv4_dsa_overlap
-                        else None
+                    dsv4_dsa_overlap_stream()
+                    if (
+                        write_cache
+                        and self.multistream_dsv4_dsa_overlap
+                        and not chain_layout_active()
                     )
+                    else None
                 ),
             )
             return self.indexer(
@@ -2269,7 +2274,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 )
         if compressed_kv.shape[0] > 0:
             get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(
-                compress_kv_cache,
+                tree_cache_view(compress_kv_cache),
                 compressed_kv,
                 compress_slot_mapping,
             )
@@ -2304,6 +2309,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         common_metadata = _require_req_metadata(common_attn_metadata)
         swa_req_metadata = _require_req_metadata(swa_metadata)
+        # dspark-ori-binding-fix:v1
+        if chain_layout_active():
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_binding import record_original_kv
+            record_original_kv(
+                layer_name, swa_kv_cache, swa_req_metadata, hidden_states.shape[0])
         has_prefill = common_attn_metadata.num_prefills > 0
         num_tokens = hidden_states.shape[0]
         cos = common_metadata.cos[layer_name][:num_tokens]
@@ -2313,14 +2323,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
 
+        if chain_layout_active() and cache_is_prepared:
+            raise RuntimeError("Packed V4 verification requires its own cache updates")
+
         write_swa_cache = not cache_is_prepared
         write_cmp = not cache_is_prepared
+        use_overlap = self.multistream_dsv4_dsa_overlap and not chain_layout_active()
         compressor_tail_fn = None
-        if (
-            self.multistream_dsv4_dsa_overlap
-            and self.compress_ratio > 1
-            and write_cmp
-        ):
+        if use_overlap and self.compress_ratio > 1 and write_cmp:
             compressor = self.compressor
             tail_compressor_metadata = layer_metadata.compressor
             assert compressor is not None
@@ -2338,7 +2348,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                         metadata=tail_compressor_metadata,
                     )
 
-        if self.multistream_dsv4_dsa_overlap and write_cmp:
+        if use_overlap and write_cmp:
             q, qr, qr_pertoken_scale, compressor_overlap_output = self._mla_prolog_multistream(
                 hidden_states,
                 cos,
@@ -2427,12 +2437,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 attn_kwargs["cmp_sparse_indices"] = compress_topk_idxs
             from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
                 chain_attention_view,
-                chain_layout_active,
                 chain_length_cus,
                 lookup_kv_table,
-                note_read,
             )
-
             chain_packed = False
             n_orig = int(q.shape[0])
             if chain_layout_active():
@@ -2440,13 +2447,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     swa_kv_cache,
                     swa_req_metadata.block_table,
                     int(swa_req_metadata.storage_block_size),
+                    int(self.window_size),
                 )
                 cmp_bt = lookup_kv_table(compress_kv_cache)
                 if view is not None and cmp_bt is not None:
                     # One launch. Operators see only the inner cu: segment k is chain k.
                     # Query lengths are cu_seqlens_q. KV lengths are seqused_kv and the
                     # matching ori/cmp cu. Every tree node is in this batch.
-                    win_left = int(ori_win_left)
+                    win_left = int(self.window_size) - 1
                     cmp_ratio = 4 if self.compress_ratio == 4 else 128
                     cmp_topk = (
                         int(self.indexer.index_topk)
@@ -2498,6 +2506,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                         seqused_kv=seqused,
                         ori_block_table=view["ori_bt"],
                         cmp_block_table=cmp_bt,
+                        ori_kv=view["ori_cache"],
+                        cmp_kv=tree_cache_view(compress_kv_cache),
                         ori_win_left=win_left,
                         ori_win_right=0,
                         metadata=sas,
@@ -2505,27 +2515,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     # TND query lengths live in cu_seqlens_q. The op rejects seqused_q.
                     attn_kwargs.pop("seqused_q", None)
                     attn_kwargs.pop("ori_sparse_indices", None)
-                    real = common_metadata.block_table
-                    changed = int((cmp_bt[:, 0] != real[0, 0]).sum().item()) if cmp_bt.shape[1] else 0
-                    note_read(
-                        "attn",
-                        ratio=int(self.compress_ratio),
-                        calls=1,
-                        n_chain=n_q,
-                        q_cu_last=int(view["cu"][-1].item()),
-                        q_lens=[int(x) for x in segs[:8].detach().to("cpu").tolist()],
-                        max_q=max_q,
-                        ori_cu_last=int(ori_cu[-1].item()),
-                        cmp_cu_last=int(cmp_cu[-1].item()),
-                        seq0=int(seqused[0].item()),
-                        seq_last=int(seqused[-1].item()),
-                        win_left=win_left,
-                        cmp_rows_changed=changed,
-                    )
 
         attn_out = attn_op(q, **attn_kwargs)[0]
         if self.compress_ratio > 1 and chain_packed:
             from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import unpack_chain_tokens
 
-            return unpack_chain_tokens(attn_out, n_orig)
+            attn_out = unpack_chain_tokens(attn_out, n_orig)
+            finish_tree_layer()
         return attn_out

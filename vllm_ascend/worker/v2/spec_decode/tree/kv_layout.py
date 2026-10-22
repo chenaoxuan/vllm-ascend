@@ -103,37 +103,48 @@ def compact_tree_query_along_path(
         tensor[dst_idx] = gathered
     base = linearize_positions[qsl.clamp(min=0, max=last)].unsqueeze(1)
     new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
-    # #region agent log
-    try:
-        import importlib.util
-        import sys
-
-        mod = sys.modules.get("_agent_debug_trace")
-        if mod is None:
-            spec_mod = importlib.util.spec_from_file_location(
-                "_agent_debug_trace",
-                "/home/specdec/spec260922/debug_trace.py",
-            )
-            mod = importlib.util.module_from_spec(spec_mod)
-            sys.modules["_agent_debug_trace"] = mod
-            spec_mod.loader.exec_module(mod)
-        mod.dbg(
-            "kv_layout.py:compact_tree_query_along_path",
-            "draft_hidden_move",
-            {
-                "path": node,
-                "src_off": src_off,
-                "dst_off": dst_off,
-                "n_tok": int(n_tok),
-                "n_valid": int(valid.sum().item()),
-            },
-            "H1",
-        )
-    except Exception:
-        pass
-    # #endregion
     cur = linearize_positions[dst_idx]
     linearize_positions[dst_idx] = torch.where(valid, new_pos, cur)
+
+def compact_tree_query_along_path_eager(
+    tensors, query_start_loc, path_node_ids, linearize_positions,
+):
+    """Compact only real accepted rows; supports unequal request query lengths."""
+    paths = path_node_ids.detach().cpu().tolist()
+    qsl = query_start_loc[:len(paths) + 1].detach().cpu().tolist()
+    source, destination, roots, depths = [], [], [], []
+    for req, row in enumerate(paths):
+        begin, end = int(qsl[req]), int(qsl[req + 1])
+        accepted, ended = [], False
+        for value in row:
+            node = int(value)
+            if node == -1:
+                ended = True
+            elif ended or node <= 0:
+                raise RuntimeError("Invalid accepted-path padding/node ID")
+            else:
+                accepted.append(node)
+        for depth, node in enumerate([0] + accepted):
+            src, dst = begin + node, begin + depth
+            if not begin <= src < end or not begin <= dst < end:
+                raise RuntimeError("Accepted path exceeds this request's query rows")
+            source.append(src)
+            destination.append(dst)
+            roots.append(begin)
+            depths.append(depth)
+    if not source:
+        return
+    device = path_node_ids.device
+    src = torch.tensor(source, dtype=torch.long, device=device)
+    dst = torch.tensor(destination, dtype=torch.long, device=device)
+    root = torch.tensor(roots, dtype=torch.long, device=device)
+    depth = torch.tensor(depths, dtype=linearize_positions.dtype, device=device)
+    # Gather every tensor first: last_hidden_states and auxiliary states may alias.
+    updates = [(tensor, tensor.index_select(0, src)) for tensor in tensors]
+    positions = linearize_positions.index_select(0, root) + depth
+    for tensor, gathered in updates:
+        tensor.index_copy_(0, dst, gathered)
+    linearize_positions.index_copy_(0, dst, positions)
 
 
 def mask_rejected_dflash_context_slots(

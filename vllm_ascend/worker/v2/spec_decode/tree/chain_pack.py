@@ -1,10 +1,8 @@
-"""One compressor call and one attention call for every tree chain.
+"""Eager tree verification with private cache tensors per layer.
 
-The outer boundary groups real requests. Operators never see it.
-They see one flat ``cu_seqlens`` whose segment ``k`` is tree chain ``k``,
-so each chain is its own request, and the kernel is launched once.
+Persistent caches are read during verification. Only accepted branch snapshots
+are copied back. Block 0 remains the null block in every temporary cache.
 """
-
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -16,20 +14,24 @@ _PLAN: dict | None = None
 _KV_STACK: list[list[torch.Tensor]] = []
 
 
-def set_tree_chain_layout(parents, num_nodes, depths, query_start_loc, start_pos) -> None:
+def _key(tensor):
+    return (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+
+
+def set_tree_chain_layout(parents, num_nodes, depths, query_start_loc, start_pos,
+                          idx_mapping=None) -> None:
     global _LAYOUT, _PLAN
-    _LAYOUT = {
-        "parents": parents,
-        "num_nodes": num_nodes,
-        "depths": depths,
-        "qsl": query_start_loc,
-        "start": start_pos,
-    }
+    if _PLAN is not None and not _PLAN.get("committed", False):
+        raise RuntimeError("Previous tree verification was not committed")
+    _LAYOUT = dict(parents=parents, num_nodes=num_nodes, depths=depths,
+                   qsl=query_start_loc, start=start_pos, idx=idx_mapping)
     _PLAN = None
 
 
 def clear_tree_chain_layout() -> None:
     global _LAYOUT, _PLAN
+    if _PLAN is not None and not _PLAN.get("committed", False):
+        raise RuntimeError("Cannot discard uncommitted tree state")
     _LAYOUT = None
     _PLAN = None
 
@@ -40,708 +42,398 @@ def chain_layout_active() -> bool:
 
 @contextmanager
 def chain_kv_scope(caches):
-    """Caches that share the block table the next compressor call writes."""
-    live = [c for c in caches if c is not None]
-    _KV_STACK.append(live)
+    _KV_STACK.append([cache for cache in caches if cache is not None])
     try:
         yield
     finally:
         _KV_STACK.pop()
 
 
-def _log(data: dict) -> None:
-    try:
-        from debug_trace import cmp_log
-    except Exception:
-        return
-    cmp_log(data)
-
-
 def _build_plan(num_tokens: int, device) -> dict | None:
-    """Flatten (request, chain) into the batch the operators see.
-
-    ``cu`` / ``attn_cu`` is the inner chain-token boundary the operators see.
-    Segment ``k`` has length equal to chain ``k`` (root through that node).
-    ``req_cu`` is the outer request boundary and is not passed to kernels.
-    """
     global _PLAN
     if _PLAN is not None:
         return _PLAN
+    if _LAYOUT is None:
+        return None
     layout = _LAYOUT
-    if layout is None:
-        return None
-    num_nodes_t = layout["num_nodes"]
-    if num_nodes_t is None or num_nodes_t.numel() == 0 or num_tokens <= 1:
-        return None
-    n_req = int(num_nodes_t.shape[0])
-    qsl = [int(x) for x in layout["qsl"][: n_req + 1].detach().to("cpu").tolist()]
-    prefixes_req = [int(x) for x in layout["start"][:n_req].detach().to("cpu").tolist()]
-    if len(qsl) < 2 or qsl[0] != 0:
-        return None
-    if qsl[-1] < num_tokens:
-        qsl[-1] = num_tokens
-
-    rows: list[int] = []
-    lens: list[int] = []
-    cmp_rows: list[int] = []
-    cmp_lens: list[int] = []
-    seqused: list[int] = []
-    chains: list[list[int]] = []
-    req_index: list[int] = []
-    prefix_of: list[int] = []
-    token_index: list[int] = []
-    req_counts = [0] * n_req
-    mismatch = 0
-    for req in range(n_req):
-        tok0 = qsl[req]
-        tok1 = min(qsl[req + 1], num_tokens)
-        n_nodes = int(num_nodes_t[req].item())
-        parents = layout["parents"][req, :n_nodes].tolist() if n_nodes > 0 else []
-        depths = layout["depths"][req, :n_nodes].tolist() if n_nodes > 0 else []
-        prefix = prefixes_req[req]
-        for token in range(tok0, tok1):
-            local = token - tok0
-            req_index.append(req)
-            prefix_of.append(prefix)
-            token_index.append(token)
-            req_counts[req] += 1
-            depth = int(depths[local - 1]) if 0 < local <= n_nodes else 0
-            if local == 0 or local > n_nodes or depth <= 0:
-                rows.append(tok0)
-                lens.append(1)
-                # Root chain has no draft. Keep one token so the segment is non-empty.
-                cmp_rows.append(tok0)
-                cmp_lens.append(1)
-                seqused.append(prefix + 1)
-                chains.append([])
-                continue
-            chain: list[int] = []
-            cur = local
-            seen: set[int] = set()
-            while cur > 0 and cur not in seen and len(chain) <= n_nodes:
-                seen.add(cur)
-                chain.append(cur)
-                parent = int(parents[cur - 1])
-                cur = 0 if parent == cur else parent
-            chain.reverse()
-            if len(chain) != depth:
-                mismatch += 1
-            seq = [tok0] + [tok0 + n if tok0 + n < num_tokens else tok0 for n in chain]
-            rows.extend(seq)
-            lens.append(len(seq))
-            # Drafts land at prefix+0 onward after dst_from_zero. Drop the root.
-            cmp_rows.extend(seq[1:])
-            cmp_lens.append(len(seq) - 1)
-            chains.append(chain)
-            seqused.append(prefix + depth + 1)
-    if not lens:
-        return None
-    cu = [0]
-    for length in lens:
-        cu.append(cu[-1] + length)
-    cmp_cu = [0]
-    for length in cmp_lens:
-        cmp_cu.append(cmp_cu[-1] + length)
+    n_req = int(layout["num_nodes"].numel())
+    if n_req == 0:
+        raise RuntimeError("Empty tree verification batch")
+    qsl = layout["qsl"][:n_req + 1].detach().cpu().tolist()
+    prefixes = layout["start"][:n_req].detach().cpu().tolist()
+    counts = layout["num_nodes"].detach().cpu().tolist()
+    parents = layout["parents"][:n_req].detach().cpu().tolist()
+    depths = layout["depths"][:n_req].detach().cpu().tolist()
+    if len(qsl) != n_req + 1 or qsl[0] != 0 or qsl[-1] > num_tokens:
+        raise RuntimeError("Invalid tree query boundaries")
+    rows, cu, chains, req_index, prefix_of, token_index = [], [0], [], [], [], []
     req_cu = [0]
-    for count in req_counts:
-        req_cu.append(req_cu[-1] + count)
-    n = len(lens)
+    for req in range(n_req):
+        begin, end = int(qsl[req]), int(qsl[req + 1])
+        proposed_count = int(counts[req])
+        if not 0 <= proposed_count <= len(parents[req]) or end <= begin:
+            raise RuntimeError("Invalid tree node count/query length")
+        # Near the output limit, only the scheduled prefix of the flat tree
+        # exists. The beam layout is topological, so that prefix is closed.
+        count = min(proposed_count, end - begin - 1)
+        for local in range(end - begin):
+            chain = []
+            if 0 < local <= count:
+                node, visited = local, set()
+                while node:
+                    if node in visited or not 1 <= node <= count:
+                        raise RuntimeError("Invalid/cyclic tree parent links")
+                    visited.add(node)
+                    chain.append(node)
+                    node = int(parents[req][node - 1])
+                chain.reverse()
+                if len(chain) != int(depths[req][local - 1]):
+                    raise RuntimeError("Tree depth does not match its ancestor path")
+            # Root is a real target input at prefix P, including when A == 0.
+            rows.extend([begin] + [begin + node for node in chain])
+            cu.append(len(rows))
+            chains.append(chain)
+            req_index.append(req)
+            prefix_of.append(int(prefixes[req]))
+            token_index.append(begin + local)
+        req_cu.append(len(chains))
+    lens = [len(chain) + 1 for chain in chains]
+    idx = layout["idx"]
     _PLAN = {
-        "prefix": prefix_of[0],
-        "prefixes": prefix_of,
-        "n": n,
-        "n_req": n_req,
-        "req_index": req_index,
-        "req_cu": req_cu,
+        "n": len(chains), "n_req": n_req, "req_cu": req_cu,
+        "idx": None if idx is None else idx[:n_req].detach().cpu().tolist(),
+        "req_index": req_index, "prefixes": prefix_of, "chains": chains,
+        "lens": lens, "max_q": max(lens),
         "rows": torch.tensor(rows, dtype=torch.long, device=device),
         "cu": torch.tensor(cu, dtype=torch.int32, device=device),
         "start": torch.tensor(prefix_of, dtype=torch.int32, device=device),
-        "lens": lens,
-        "cmp_rows": torch.tensor(cmp_rows, dtype=torch.long, device=device),
-        "cmp_cu": torch.tensor(cmp_cu, dtype=torch.int32, device=device),
-        "cmp_lens": cmp_lens,
-        "seqused": torch.tensor(seqused, dtype=torch.int32, device=device),
-        "attn_cu": torch.tensor(cu, dtype=torch.int32, device=device),
+        "seqused": torch.tensor([p + n for p, n in zip(prefix_of, lens)],
+                                 dtype=torch.int32, device=device),
         "token_index": torch.tensor(token_index, dtype=torch.long, device=device),
-        "max_q": max(lens),
-        "chains": chains,
-        "kv_tables": {},
-        "ori_views": {},
-        "scratch_used": {},
-        "records": [[] for _ in range(n)],
-        "logged": False,
-        "chain_mismatch": mismatch,
+        "cache_views": {}, "kv_tables": {}, "ori_views": {}, "index_topk": {},
+        "pending": [[] for _ in chains], "records": [[] for _ in chains],
+        "committed": False,
     }
     return _PLAN
 
 
-def _used_blocks(block_table: torch.Tensor, rows: list[int] | None = None) -> set[int]:
-    if rows is None:
-        rows = [0]
-    used: set[int] = set()
-    width = int(block_table.shape[0])
-    for row in rows:
-        if row < 0 or row >= width:
-            continue
-        ids = block_table[row].detach().to("cpu").tolist()
-        used.update(int(b) for b in ids if int(b) >= 0)
-    return used
-
-
-def _reserve_scratch(plan, cache: torch.Tensor, need: int, used: set[int]) -> list[int]:
-    """Scratch block ids for one cache stay unique for the whole verify step."""
-    taken = plan["scratch_used"].setdefault(cache.data_ptr(), set())
-    found = _alloc_scratch(int(cache.shape[0]), need, used | taken)
-    taken.update(found)
-    return found
-
-
-def _alloc_scratch(nblocks: int, need: int, used: set[int]) -> list[int]:
-    found: list[int] = []
-    block = nblocks - 1
-    while block > 0 and len(found) < need:
-        if block not in used:
-            found.append(block)
-        block -= 1
-    if len(found) < need:
-        raise RuntimeError(
-            f"tree chain scratch short: need {need}, free {len(found)}, blocks {nblocks}"
+def _new_cache_views(caches, num_pages):
+    """Preserve aliases such as packed FP8 key/scale/full-cache views."""
+    groups, result = [], [None] * len(caches)
+    order = sorted(range(len(caches)), key=lambda i: caches[i].data_ptr())
+    for i in order:
+        cache = caches[i]
+        if cache.ndim < 2 or any(stride < 0 for stride in cache.stride()):
+            raise RuntimeError("Unsupported cache tensor strides")
+        size = cache.element_size()
+        step = int(cache.stride(0)) * size
+        span = size + sum((int(n) - 1) * int(s) * size
+                          for n, s in zip(cache.shape[1:], cache.stride()[1:]))
+        if step <= 0 or span > step:
+            raise RuntimeError("Overlapping/invalid physical cache pages")
+        storage = cache.untyped_storage().data_ptr()
+        group = next((g for g in groups if g["storage"] == storage
+                      and g["step"] == step
+                      and 0 <= cache.data_ptr() - g["base"]
+                      and cache.data_ptr() - g["base"] + span <= step), None)
+        if group is None:
+            group = {"storage": storage, "step": step, "base": cache.data_ptr(),
+                     "bytes": torch.zeros(num_pages * step, dtype=torch.uint8,
+                                          device=cache.device)}
+            groups.append(group)
+        offset = cache.data_ptr() - group["base"]
+        if offset % size:
+            raise RuntimeError("Misaligned packed-cache view")
+        result[i] = torch.empty(0, dtype=cache.dtype, device=cache.device).set_(
+            group["bytes"].untyped_storage(), offset // size,
+            (num_pages, *cache.shape[1:]), tuple(cache.stride()),
         )
-    found.reverse()
-    return found
+    return result
 
 
-def _copy_blocks(cache: torch.Tensor, src: torch.Tensor, dst: torch.Tensor) -> None:
-    if src.numel() == 0:
-        return
-    cache.index_copy_(0, dst, cache.index_select(0, src))
+def _workspace(plan, caches, block_table, write_cols, kind, read_cols=None):
+    """Copy shared read pages once; allocate distinct write pages per chain.
+
+    No temporary block ID ever refers to storage in a persistent cache.
+    Aliased block-table entries within one chain retain their aliasing.
+    """
+    real = block_table.detach().cpu().tolist()
+    width = int(block_table.shape[1])
+    rows = [[0] * width for _ in range(plan["n"])]
+    sources = [0]  # Private, zero-filled null page.
+    allocated = {}
+    private = [[] for _ in rows]
+    for chain, req in enumerate(plan["req_index"]):
+        if not 0 <= req < len(real):
+            raise RuntimeError("Missing request block-table row")
+        original = real[req]
+        columns = range(width) if read_cols is None else read_cols[chain]
+        writable = set()
+        for col in write_cols[chain]:
+            if not 0 <= col < width or int(original[col]) <= 0:
+                raise RuntimeError("Tree write targets an unallocated/null cache page")
+            writable.add(int(original[col]))
+        for col in set(columns) | set(write_cols[chain]):
+            if not 0 <= col < width:
+                raise RuntimeError("Tree cache column exceeds block-table capacity")
+            src = int(original[col])
+            if src <= 0:
+                continue
+            owner = chain if src in writable else -1
+            tag = (owner, src)
+            if tag not in allocated:
+                allocated[tag] = len(sources)
+                sources.append(src)
+                if owner >= 0:
+                    private[chain].append((src, allocated[tag]))
+            rows[chain][col] = allocated[tag]
+    table = torch.tensor(rows, dtype=torch.int32, device=block_table.device)
+    views, seen = _new_cache_views(caches, len(sources)), set()
+    for cache, view in zip(caches, views):
+        key = _key(cache)
+        if key in seen or key in plan["cache_views"]:
+            raise RuntimeError("Duplicate cache binding/compressor call in one tree layer")
+        seen.add(key)
+        if cache.ndim < 2 or max(sources) >= int(cache.shape[0]):
+            raise RuntimeError("Cache tensor does not match its block table")
+        if len(sources) > 1:
+            src = torch.tensor(sources[1:], dtype=torch.long, device=cache.device)
+            view[1:].copy_(cache.index_select(0, src))
+        for binding in (cache, view):
+            plan["cache_views"][_key(binding)] = view
+            plan["kv_tables"][_key(binding)] = table
+        if kind != "ori":
+            for chain, pages in enumerate(private):
+                for src, dst in pages:
+                    plan["pending"][chain].append((cache, src, view, dst, kind))
+    return views, table
 
 
-def _emit_count(start: int, length: int, ratio: int) -> int:
-    if length <= 0 or start < 0 or ratio <= 1:
-        return 0
+def tree_cache_view(cache):
+    """Resolve the cache matching temporary compressor slot IDs/block tables."""
+    if cache is None or _LAYOUT is None:
+        return cache
+    if _PLAN is None or _key(cache) not in _PLAN["cache_views"]:
+        raise RuntimeError("Tree cache writer/reader has no private workspace")
+    return _PLAN["cache_views"][_key(cache)]
+
+
+def lookup_kv_table(cache):
+    if _LAYOUT is None:
+        return None
+    if _PLAN is None or _key(cache) not in _PLAN["kv_tables"]:
+        raise RuntimeError("Tree attention/indexer has no private block table")
+    return _PLAN["kv_tables"][_key(cache)]
+
+
+def _emit_count(start, length, ratio):
     return (start + length) // ratio - start // ratio
 
 
-def chain_compressor_batch(
-    hidden: torch.Tensor,
-    state_cache: torch.Tensor,
-    kv_block_table: torch.Tensor,
-    state_block_table: torch.Tensor,
-    storage_block_size: int,
-    ratio: int,
-    req_metadata,
-    slot_format: int,
-):
-    """Pack every chain and point the single compressor launch at scratch pages.
-
-    Returns ``None`` when this forward is not a tree verify.
-    """
-    if _LAYOUT is None or not _KV_STACK:
+def chain_compressor_batch(hidden, state_cache, kv_block_table, state_block_table,
+                           storage_block_size, ratio, req_metadata, slot_format):
+    if _LAYOUT is None:
         return None
-    caches = _KV_STACK[-1]
-    if not caches:
-        return None
+    if not _KV_STACK or not _KV_STACK[-1]:
+        raise RuntimeError("Tree compressor called without its output cache bindings")
     plan = _build_plan(int(hidden.shape[0]), hidden.device)
-    if plan is None:
-        return None
-    if int(kv_block_table.shape[0]) < 1:
-        return None
-    n = int(plan["n"])
-    prefixes = plan["prefixes"]
-    # Compressor sees the drafts that remain after accept, not the placeholder root.
-    lens = plan["cmp_lens"]
-    emits = [_emit_count(prefixes[i], lens[i], ratio) for i in range(n)]
-    n_out = sum(emits)
-    req_index = plan["req_index"]
-    used = _used_blocks(kv_block_table, req_index)
-    req_t = torch.tensor(req_index, dtype=torch.long, device=hidden.device)
-    kv_rows = kv_block_table.index_select(0, req_t).to(dtype=torch.int32).clone()
-    bs = int(storage_block_size)
-    chain_cols: list[list[int]] = []
-    for i, n_emit in enumerate(emits):
-        if n_emit <= 0:
-            chain_cols.append([])
-            continue
-        base = prefixes[i] // ratio
-        chain_cols.append(sorted({(base + step) // bs for step in range(n_emit)}))
-    if any(chain_cols):
-        if int(caches[0].shape[1]) != bs:
-            raise RuntimeError(
-                f"chain page {tuple(caches[0].shape)} != block {bs}"
-            )
-        need = sum(len(cols) for cols in chain_cols)
-        scratch = _reserve_scratch(plan, caches[0], need, used)
-        src_ids: list[int] = []
-        dst_ids: list[int] = []
-        real_rows = [
-            kv_block_table[req].tolist() if req < kv_block_table.shape[0] else []
-            for req in range(int(kv_block_table.shape[0]))
-        ]
-        slot = 0
-        for chain, cols in enumerate(chain_cols):
-            real_row = real_rows[req_index[chain]]
-            for col in cols:
-                if col >= len(real_row):
-                    continue
-                src = int(real_row[col])
-                dst = scratch[slot]
-                slot += 1
-                if src < 0:
-                    continue
-                src_ids.append(src)
-                dst_ids.append(dst)
-                kv_rows[chain, col] = dst
-                plan["records"][chain].append((caches[0], src, dst, "kv"))
-                for extra in caches[1:]:
-                    plan["records"][chain].append((extra, src, dst, "kv"))
-        if src_ids:
-            src_t = torch.tensor(src_ids, dtype=torch.long, device=hidden.device)
-            dst_t = torch.tensor(dst_ids, dtype=torch.long, device=hidden.device)
-            for cache in caches:
-                _copy_blocks(cache, src_t, dst_t)
-        for cache in caches:
-            plan["kv_tables"][cache.data_ptr()] = kv_rows
-    else:
-        for cache in caches:
-            plan["kv_tables"][cache.data_ptr()] = kv_rows
+    ratio, bs = int(ratio), int(storage_block_size)
+    if ratio not in (4, 128) or bs <= 0:
+        raise RuntimeError("Unsupported tree compression layout")
+    caches = _KV_STACK[-1]
+    if int(caches[0].shape[1]) != bs:
+        raise RuntimeError("Compressed cache page size differs from metadata")
+    writes, reads = [], []
+    for prefix, length in zip(plan["prefixes"], plan["lens"]):
+        begin, end = prefix // ratio, (prefix + length) // ratio
+        writes.append(sorted({position // bs for position in range(begin, end)}))
+        reads.append(list(range((end + bs - 1) // bs)))
+    _, kv_rows = _workspace(plan, caches, kv_block_table, writes, "kv", reads)
 
-    state_rows = _clone_state_rows(
-        state_cache, state_block_table, plan, hidden.device, int(ratio), int(plan["prefix"])
+    # State caches can reuse physical pages through circular/aliased tables.
+    # Copy all referenced state pages privately and preserve those aliases.
+    real_state = state_block_table.detach().cpu().tolist()
+    state_writes = [
+        [col for col, block in enumerate(real_state[req]) if int(block) > 0]
+        for req in plan["req_index"]
+    ]
+    state_views, state_rows = _workspace(
+        plan, [state_cache], state_block_table, state_writes, "state"
     )
-    full_cos = req_metadata.full_compress_cos
-    full_sin = req_metadata.full_compress_sin
+    full_cos, full_sin = req_metadata.full_compress_cos, req_metadata.full_compress_sin
     cos = full_cos.view(full_cos.shape[0], full_cos.shape[-1])
     sin = full_sin.view(full_sin.shape[0], full_sin.shape[-1])
-    token_size = sum(lens)
-    # Compressor checks rope rows against this, not the emitted window count.
-    n_rows = min(token_size, token_size // int(ratio) + n)
-    n_rows = max(n_rows, 1)
-    compress_cos, compress_sin, slot_mapping = torch.ops._C_ascend.compressor_metadata(
-        cos,
-        sin,
-        plan["cmp_cu"],
-        plan["start"],
-        kv_rows,
-        int(storage_block_size),
-        int(slot_format),
-        ratio,
-        n_rows,
-        n,
+    token_size = sum(plan["lens"])
+    n_rows = max(1, min(token_size, token_size // ratio + plan["n"]))
+    compress_cos, compress_sin, slots = torch.ops._C_ascend.compressor_metadata(
+        cos, sin, plan["cu"], plan["start"], kv_rows, bs, int(slot_format),
+        ratio, n_rows, plan["n"],
     )
-    if not plan["logged"]:
-        plan["logged"] = True
-        slot_info = {"ndim": int(slot_mapping.ndim), "rows": int(slot_mapping.shape[0])}
-        valid = slot_mapping >= 0
-        if slot_mapping.ndim == 2:
-            valid = slot_mapping[:, 0] >= 0
-            offs = slot_mapping[:, 1]
-        else:
-            offs = torch.remainder(slot_mapping, int(storage_block_size))
-        if int(valid.sum().item()) > 0:
-            used_off = offs[valid]
-            slot_info["valid"] = int(valid.sum().item())
-            slot_info["off_min"] = int(used_off.min().item())
-            slot_info["off_max"] = int(used_off.max().item())
-        else:
-            slot_info["valid"] = 0
-        _log(
-            {
-                "pack": 1,
-                "calls": 1,
-                "op_cu": "chain",
-                "n_req": int(plan["n_req"]),
-                "req_cu": plan["req_cu"],
-                "chain_cu": [int(x) for x in plan["cmp_cu"][:9].detach().to("cpu").tolist()],
-                "q_cu_last": n,
-                "prefix": int(plan["prefix"]),
-                "n": n,
-                "emit": n_out,
-                "rope_rows": n_rows,
-                "residual": int(plan["prefix"]) % ratio,
-                "mismatch": int(plan["chain_mismatch"]),
-                "lens": lens[:8],
-                "cols": (chain_cols[0][:4] if chain_cols else []),
-                "slots": slot_info,
-            }
-        )
-    if int(plan["cmp_rows"].numel()) == 0:
-        packed = hidden.new_empty((0, *hidden.shape[1:]))
-    else:
-        packed = hidden.index_select(0, plan["cmp_rows"])
     return {
-        "hidden": packed,
-        "cu": plan["cmp_cu"],
-        "start": plan["start"],
-        "kv_bt": kv_rows,
-        "state_bt": state_rows,
-        "state": state_cache,
-        "cos": compress_cos,
-        "sin": compress_sin,
-        "slot": slot_mapping,
+        "hidden": hidden.index_select(0, plan["rows"]),
+        "cu": plan["cu"], "start": plan["start"], "kv_bt": kv_rows,
+        "state_bt": state_rows, "state": state_views[0],
+        "cos": compress_cos, "sin": compress_sin, "slot": slots,
     }
 
 
-def _state_block_size(state_cache: torch.Tensor) -> int:
-    """Match the compressor kernel: block size is dim 1 after squeezing a unit axis."""
-    view = state_cache
-    if view.ndim >= 3 and int(view.shape[-2]) == 1:
-        view = view.squeeze(-2)
-    if view.ndim < 2:
-        return 1
-    return max(int(view.shape[1]), 1)
-
-
-def _clone_state_rows(state_cache, state_block_table, plan, device, ratio: int, prefix: int):
-    """One private state-page set per chain, taken from that chain's request.
-
-    Chains of different requests do not read each other's state blocks.
-    The winner's pages are copied back in full after accept.
-    """
-    del prefix
-    n = int(plan["n"])
-    width = int(state_block_table.shape[1])
-    rows = torch.zeros((n, width), dtype=torch.int32, device=state_block_table.device)
-    block_size = _state_block_size(state_cache)
-    window = (2 if ratio == 4 else 1) * ratio
-    by_req: dict[int, list[int]] = {}
-    for chain, req in enumerate(plan["req_index"]):
-        by_req.setdefault(int(req), []).append(chain)
-    dbg = plan.setdefault("state_dbg", [])
-    src_ids: list[int] = []
-    dst_ids: list[int] = []
-    for req, chains in by_req.items():
-        if req < 0 or req >= int(state_block_table.shape[0]):
-            continue
-        real = [int(x) for x in state_block_table[req].detach().to("cpu").tolist()]
-        for chain in chains:
-            for col, block in enumerate(real):
-                rows[chain, col] = block
-        req_prefix = int(plan["prefixes"][chains[0]])
-        max_len = max(int(plan["lens"][c]) for c in chains)
-        lo = max(0, req_prefix - window)
-        hi = req_prefix + max_len
-        write_col = req_prefix // block_size
-        col_blocks: list[tuple[int, int]] = []
-        seen_cols: set[int] = set()
-        for pos in range(lo, hi + 1):
-            col = pos // block_size
-            if col in seen_cols or col >= len(real):
-                continue
-            seen_cols.add(col)
-            block = int(real[col])
-            if block > 0:
-                col_blocks.append((col, block))
-        write_ids = {block for col, block in col_blocks if col >= write_col}
-        write_blocks = [b for b in dict.fromkeys(b for _, b in col_blocks if b in write_ids)]
-        read_blocks = [
-            b
-            for b in dict.fromkeys(b for col, b in col_blocks if col < write_col)
-            if b not in write_ids
-        ]
-        live = read_blocks + write_blocks
-        cursor = write_col
-        cursor_id = int(real[cursor]) if cursor < len(real) else -1
-        if len(dbg) < 6:
-            dbg.append(
-                {
-                    "req": req,
-                    "ratio": ratio,
-                    "bs": block_size,
-                    "shape": list(state_cache.shape),
-                    "width": len(real),
-                    "write_col": write_col,
-                    "cols": [c for c, _ in col_blocks][:8],
-                    "n_ro": len(read_blocks),
-                    "n_write": len(write_blocks),
-                    "live": live[:8],
-                    "cursor": cursor,
-                    "cursor_id": cursor_id,
-                    "cursor_in_live": cursor_id in write_ids,
-                }
-            )
-        if not live:
-            continue
-        scratch = _reserve_scratch(plan, state_cache, len(chains) * len(live), set(live))
-        index_of = {block: i for i, block in enumerate(live)}
-        for ci, chain in enumerate(chains):
-            base = ci * len(live)
-            for src in live:
-                dst = scratch[base + index_of[src]]
-                src_ids.append(src)
-                dst_ids.append(dst)
-                plan["records"][chain].append((state_cache, src, dst, "state"))
-            for col, block in enumerate(real):
-                if block in index_of:
-                    rows[chain, col] = scratch[base + index_of[block]]
-    if src_ids:
-        _copy_blocks(
-            state_cache,
-            torch.tensor(src_ids, dtype=torch.long, device=device),
-            torch.tensor(dst_ids, dtype=torch.long, device=device),
-        )
-    return rows
-
-
-def chain_length_cus(seqused: torch.Tensor, cmp_ratio: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inner cu_seqlens for one operator launch.
-
-    Segment ``k`` is tree chain ``k``. Ori length is ``seqused[k]``.
-    Compressed length is ``seqused[k] // cmp_ratio``. The outer request
-    boundary is not included.
-    """
-    n = int(seqused.shape[0])
-    ori = torch.empty(n + 1, dtype=torch.int32, device=seqused.device)
-    cmp = torch.empty(n + 1, dtype=torch.int32, device=seqused.device)
-    ori[0] = 0
-    cmp[0] = 0
-    ori[1:] = torch.cumsum(seqused.to(torch.int64), dim=0).to(torch.int32)
-    cmp_len = torch.div(seqused, int(cmp_ratio), rounding_mode="floor")
-    cmp[1:] = torch.cumsum(cmp_len.to(torch.int64), dim=0).to(torch.int32)
-    return ori, cmp
-
-
-def pack_chain_tokens(tensor: torch.Tensor | None) -> torch.Tensor | None:
-    """Repeat chain tokens into the one packed batch. Lengths may differ."""
-    plan = _PLAN
-    if tensor is None or plan is None or tensor.ndim == 0:
+def pack_chain_tokens(tensor):
+    if tensor is None or _PLAN is None:
         return tensor
-    if int(tensor.shape[0]) != int(plan["n"]):
-        return tensor
-    return tensor.index_select(0, plan["rows"])
+    return tensor.index_select(0, _PLAN["rows"])
 
 
-def unpack_chain_tokens(packed: torch.Tensor, n_tokens: int) -> torch.Tensor:
-    """Keep each chain's last token, the node that chain exists to score."""
-    plan = _PLAN
-    if plan is None:
+def unpack_chain_tokens(packed, n_tokens):
+    if _PLAN is None:
         return packed
-    last = (plan["cu"][1:] - 1).to(dtype=torch.long)
-    ends = packed.index_select(0, last)
+    ends = packed.index_select(0, (_PLAN["cu"][1:] - 1).to(torch.long))
     out = packed.new_zeros((n_tokens, *ends.shape[1:]))
-    out.index_copy_(0, plan["token_index"], ends)
+    out.index_copy_(0, _PLAN["token_index"], ends)
     return out
 
 
-def lookup_kv_table(cache: torch.Tensor):
-    if _PLAN is None or cache is None:
+def chain_length_cus(seqused, cmp_ratio):
+    ori = seqused.new_zeros(seqused.numel() + 1)
+    cmp = seqused.new_zeros(seqused.numel() + 1)
+    ori[1:] = torch.cumsum(seqused, dim=0)
+    cmp[1:] = torch.cumsum(torch.div(seqused, cmp_ratio, rounding_mode="floor"), dim=0)
+    return ori, cmp
+
+
+def chain_attention_view(ori_cache, ori_block_table, block_size, window_size):
+    if _LAYOUT is None:
         return None
-    return _PLAN["kv_tables"].get(cache.data_ptr())
-
-
-def chain_attention_view(ori_cache: torch.Tensor, ori_block_table: torch.Tensor, block_size: int):
-    """Per-token sequences: one query each, ori tail patched to that chain."""
     if _PLAN is None:
-        return None
+        raise RuntimeError("Tree attention ran before branch compression")
     plan = _PLAN
-    cached = plan["ori_views"].get(ori_cache.data_ptr())
-    if cached is not None:
-        return cached
-    n = int(plan["n"])
-    prefixes = plan["prefixes"]
-    req_index = plan["req_index"]
-    if ori_cache.ndim < 2 or int(ori_cache.shape[1]) != int(block_size):
-        raise RuntimeError(
-            f"ori page {tuple(ori_cache.shape)} != block {block_size}"
-        )
+    key = _key(ori_cache)
+    if key in plan["ori_views"]:
+        return plan["ori_views"][key]
     bs = int(block_size)
-    cols: set[int] = set()
-    for chain, nodes in enumerate(plan["chains"]):
-        prefix = int(prefixes[chain])
-        for depth in range(1, len(nodes) + 1):
-            cols.add((prefix + depth) // bs)
-    cols_l = sorted(cols)
-    req_t = torch.tensor(req_index, dtype=torch.long, device=ori_block_table.device)
-    rows = ori_block_table.index_select(0, req_t).to(dtype=torch.int32).clone()
-    if not cols_l:
-        view = {
-            "cu": plan["attn_cu"],
-            "seqused": plan["seqused"],
-            "ori_bt": rows,
-        }
-        plan["ori_views"][ori_cache.data_ptr()] = view
-        return view
-    used = _used_blocks(ori_block_table, req_index)
-    need_chains = [i for i, chain in enumerate(plan["chains"]) if chain]
-    scratch = _reserve_scratch(plan, ori_cache, len(need_chains) * len(cols_l), used)
-    real_rows = [ori_block_table[req].tolist() for req in range(int(ori_block_table.shape[0]))]
-    src_ids: list[int] = []
-    dst_ids: list[int] = []
-    slot = 0
-    chain_page: dict[int, dict[int, int]] = {}
-    for chain in need_chains:
-        chain_page[chain] = {}
-        real_row = real_rows[req_index[chain]]
-        for col in cols_l:
-            if col >= len(real_row):
-                continue
-            src = int(real_row[col])
-            dst = scratch[slot]
-            slot += 1
-            chain_page[chain][col] = dst
-            rows[chain, col] = dst
-            if src >= 0:
-                src_ids.append(src)
-                dst_ids.append(dst)
-    if src_ids:
-        _copy_blocks(
-            ori_cache,
-            torch.tensor(src_ids, dtype=torch.long, device=ori_cache.device),
-            torch.tensor(dst_ids, dtype=torch.long, device=ori_cache.device),
-        )
-    src_b: list[int] = []
-    src_o: list[int] = []
-    dst_b: list[int] = []
-    dst_o: list[int] = []
-    bs = int(block_size)
-    for chain in need_chains:
-        prefix = int(prefixes[chain])
-        real_row = real_rows[req_index[chain]]
-        for depth, node in enumerate(plan["chains"][chain], start=1):
-            src_pos = prefix + int(node)
-            dst_pos = prefix + depth
-            if src_pos == dst_pos:
-                continue
-            src_col = src_pos // bs
-            dst_col = dst_pos // bs
-            if src_col >= len(real_row) or dst_col not in chain_page[chain]:
-                continue
-            src_b.append(int(real_row[src_col]))
-            src_o.append(src_pos % bs)
-            dst_b.append(chain_page[chain][dst_col])
-            dst_o.append(dst_pos % bs)
-    if src_b:
-        sb = torch.tensor(src_b, dtype=torch.long, device=ori_cache.device)
-        so = torch.tensor(src_o, dtype=torch.long, device=ori_cache.device)
-        db = torch.tensor(dst_b, dtype=torch.long, device=ori_cache.device)
-        do = torch.tensor(dst_o, dtype=torch.long, device=ori_cache.device)
-        ori_cache[db, do] = ori_cache[sb, so]
-    view = {
-        "cu": plan["attn_cu"],
-        "seqused": plan["seqused"],
-        "ori_bt": rows,
-    }
-    plan["ori_views"][ori_cache.data_ptr()] = view
+    if int(ori_cache.shape[1]) != bs or int(window_size) <= 0:
+        raise RuntimeError("Invalid original-KV page/window size")
+    writes, reads = [], []
+    for prefix, chain in zip(plan["prefixes"], plan["chains"]):
+        writes.append(sorted({(prefix + depth) // bs
+                              for depth in range(1, len(chain) + 1)}))
+        lo, hi = max(0, prefix - int(window_size) + 1), prefix + len(chain)
+        reads.append(list(range(lo // bs, hi // bs + 1)))
+    views, table = _workspace(plan, [ori_cache], ori_block_table, writes, "ori", reads)
+    work = views[0]
+    real = ori_block_table.detach().cpu().tolist()
+    temporary = table.detach().cpu().tolist()
+    for endpoint, chain in enumerate(plan["chains"]):
+        prefix, req = plan["prefixes"][endpoint], plan["req_index"][endpoint]
+        for depth, node in enumerate(chain, 1):
+            source_pos, dest_pos = prefix + node, prefix + depth
+            source_col, dest_col = source_pos // bs, dest_pos // bs
+            if source_col >= len(real[req]):
+                raise RuntimeError("Tree source slot exceeds block-table capacity")
+            src, dst = int(real[req][source_col]), int(temporary[endpoint][dest_col])
+            if src <= 0 or dst <= 0:
+                raise RuntimeError("Tree original-KV copy references a null page")
+            work[dst, dest_pos % bs].copy_(ori_cache[src, source_pos % bs])
+    view = {"cu": plan["cu"], "seqused": plan["seqused"],
+            "ori_bt": table, "ori_cache": work}
+    plan["ori_views"][key] = view
     return view
 
 
-def note_read(kind: str, **fields) -> None:
-    """One record per kind per verify step."""
+def indexer_batch(key_cache):
+    if _LAYOUT is None:
+        return None
+    table = lookup_kv_table(key_cache)
     plan = _PLAN
-    if plan is None:
-        return
-    done = plan.setdefault("read_kinds", set())
-    if kind in done:
-        return
-    done.add(kind)
-    fields["read"] = kind
-    _log(fields)
+    seq = plan["seqused"]
+    return {"cu": plan["cu"], "seqused_k": torch.div(seq, 4, rounding_mode="floor"),
+            "residual": torch.remainder(seq, 4), "block_table": table,
+            "max_q": plan["max_q"], "max_k": int(seq.max().item()) // 4,
+            "batch": plan["n"]}
 
 
-def indexer_batch(key_cache: torch.Tensor):
+def cache_tree_topk(buffer, indices, offset=0):
+    if _PLAN is None or buffer is None or offset != 0:
+        raise RuntimeError("Invalid packed TopK cache write")
+    if int(indices.shape[0]) != sum(_PLAN["lens"]):
+        raise RuntimeError("TopK output does not use packed chain rows")
+    _PLAN["index_topk"][_key(buffer)] = indices.clone()
+
+
+def get_tree_topk(buffer, offset=0):
+    if _PLAN is None or buffer is None or offset != 0:
+        raise RuntimeError("Invalid packed TopK cache read")
+    indices = _PLAN["index_topk"].get(_key(buffer))
+    if indices is None:
+        raise RuntimeError("No TopK producer for this tree verification step")
+    return indices
+
+
+def finish_tree_layer() -> None:
+    """Retain only writable branch snapshots; release copied prefix pages."""
     if _PLAN is None:
-        return None
-    table = _PLAN["kv_tables"].get(key_cache.data_ptr())
-    if table is None:
-        note_read("indexer_miss", ptr=int(key_cache.data_ptr()))
-        return None
-    seqused = _PLAN["seqused"]
-    return {
-        "cu": _PLAN["attn_cu"],
-        "seqused_k": torch.div(seqused, 4, rounding_mode="floor"),
-        "residual": torch.remainder(seqused, 4),
-        "block_table": table,
-        "max_q": int(_PLAN["max_q"]),
-        "max_k": int(seqused.max().item()) // 4,
-        "batch": int(_PLAN["n"]),
-    }
-
-
-def _window_cases(plan, chain: list[int]) -> dict:
-    """Residual, just-closed, and close-at-branch for the accepted chain."""
-    prefix = int(plan["prefix"])
-    depth_nodes: dict[int, list[int]] = {}
-    for node, nodes in enumerate(plan["chains"]):
-        if nodes:
-            depth_nodes.setdefault(len(nodes), []).append(node)
-    cases = {}
-    for ratio in (4, 128):
-        closed = []
-        branch = []
-        for depth, node in enumerate(chain, start=1):
-            pos = prefix + depth
-            if (pos + 1) % ratio != 0:
+        return
+    if _KV_STACK:
+        raise RuntimeError("Tree layer finished inside a compressor scope")
+    for chain, pending in enumerate(_PLAN["pending"]):
+        for original, dst, workspace, src, kind in pending:
+            if kind == "state" and torch.equal(
+                original[dst].contiguous().view(torch.uint8),
+                workspace[src].contiguous().view(torch.uint8),
+            ):
+                # Full state tables can retain aliases/inactive columns. Do not
+                # commit untouched pages over another request's winning update.
                 continue
-            siblings = [n for n in depth_nodes.get(depth, []) if n != node]
-            closed.append(int(node))
-            if siblings:
-                branch.append({"node": int(node), "sib": len(siblings)})
-        cases["r" + str(ratio)] = {
-            "residual": prefix % ratio,
-            "partial": prefix % ratio != 0,
-            "closed": closed[:8],
-            "at_branch": branch[:4],
-        }
-    return cases
+            _PLAN["records"][chain].append((original, dst, workspace[src].clone(), kind))
+        pending.clear()
+    _PLAN["cache_views"].clear()
+    _PLAN["kv_tables"].clear()
+    _PLAN["ori_views"].clear()
 
 
-def commit_winner(path_node_ids) -> dict | None:
-    """Copy the accepted chain's scratch pages back onto the linear cache."""
+def commit_winner(path_node_ids, num_sampled=None, idx_mapping=None):
     if _PLAN is None or path_node_ids is None:
-        return None
+        raise RuntimeError("Missing tree verification plan/accepted path")
     plan = _PLAN
-    if path_node_ids.numel() == 0:
-        return None
-    row = [int(n) for n in path_node_ids[0].tolist()]
-    winner = 0
-    accepted = [n for n in row if n > 0]
-    if accepted:
-        winner = accepted[-1]
-    if winner >= len(plan["records"]):
-        return None
-    chain = list(plan["chains"][winner]) if winner < len(plan["chains"]) else []
-    copied = 0
-    n_state = 0
-    n_kv = 0
-    seen: set[tuple[int, int, int]] = set()
-    by_src: dict[tuple[int, int], list[int]] = {}
-    by_dst: dict[tuple[int, int], list[int]] = {}
-    src_sample: list[int] = []
-    for item in plan["records"][winner]:
-        cache, src, dst, kind = item
-        src_i, dst_i = int(src), int(dst)
-        key = (cache.data_ptr(), src_i, dst_i)
-        by_src.setdefault((cache.data_ptr(), src_i), []).append(dst_i)
-        by_dst.setdefault((cache.data_ptr(), dst_i), []).append(src_i)
-        if len(src_sample) < 8:
-            src_sample.append(src_i)
-        if key in seen:
+    if plan["committed"] or any(plan["pending"]):
+        raise RuntimeError("Tree state committed twice or a layer was not finalized")
+    paths = path_node_ids.detach().cpu().tolist()
+    if len(paths) != plan["n_req"]:
+        raise RuntimeError("Accepted-path batch differs from verification batch")
+    if plan["idx"] is not None:
+        if idx_mapping is None or idx_mapping[:plan["n_req"]].detach().cpu().tolist() != plan["idx"]:
+            raise RuntimeError("Request order changed before tree state commitment")
+    sampled = None if num_sampled is None else num_sampled.detach().cpu().tolist()
+    winners = []
+    for req, row in enumerate(paths):
+        if sampled is not None and int(sampled[req]) == 0:
             continue
-        seen.add(key)
-        cache[src_i].copy_(cache[dst_i])
-        copied += 1
-        if kind == "state":
-            n_state += 1
-        else:
-            n_kv += 1
-    src_stomp = sum(1 for dsts in by_src.values() if len(set(dsts)) > 1)
-    dst_stomp = sum(1 for srcs in by_dst.values() if len(set(srcs)) > 1)
-    info = {
-        "commit": 1,
-        "prefix": plan["prefix"],
-        "winner": winner,
-        "path": accepted[:8],
-        "chain": chain[:8],
-        "path_eq_chain": accepted == chain,
-        "pages": copied,
-        "state": n_state,
-        "kv": n_kv,
-        "src_stomp": src_stomp,
-        "dst_stomp": dst_stomp,
-        "src": src_sample,
-        "mismatch": int(plan.get("chain_mismatch", -1)),
-        "win": _window_cases(plan, chain),
-        "state_dbg": plan.get("state_dbg", []),
-    }
-    _log(info)
-    return info
+        accepted, ended = [], False
+        for value in row:
+            node = int(value)
+            if node == -1:
+                ended = True
+            elif ended or node <= 0:
+                raise RuntimeError("Invalid accepted-path padding/node ID")
+            else:
+                accepted.append(node)
+        if sampled is not None and int(sampled[req]) != len(accepted) + 1:
+            raise RuntimeError("Sample count does not match accepted path plus bonus")
+        winner = plan["req_cu"][req] + (accepted[-1] if accepted else 0)
+        if winner >= plan["req_cu"][req + 1] or plan["chains"][winner] != accepted:
+            raise RuntimeError("Accepted nodes are not a verified root-to-node path")
+        winners.append(winner)
+    # Validate shared destinations before mutating any persistent cache.
+    copies = {}
+    for winner in winners:
+        for cache, page, value, kind in plan["records"][winner]:
+            key = (_key(cache), page)
+            if key in copies and not torch.equal(copies[key][2], value):
+                raise RuntimeError("Two requests commit different data to one persistent page")
+            copies[key] = (cache, page, value)
+    for cache, page, value in copies.values():
+        cache[page].copy_(value)
+    plan["committed"] = True
+    # Release rejected branch snapshots before the next proposal.
+    for records in plan["records"]:
+        records.clear()
+    return {"commit": 1, "requests": len(winners), "pages": len(copies)}

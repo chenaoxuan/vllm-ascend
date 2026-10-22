@@ -93,7 +93,7 @@ class AscendUnquantizedLinearMethod(WeightSwitchMixin, UnquantizedLinearMethod):
         keep_nd_weight = _should_keep_nd_for_compatibility_weight(layer.weight.data)
         skip_weight_nz_conversion = getattr(layer, "skip_weight_nz_conversion", False)
         # must use fp32 to avoid accuracy degradation in dsv4.
-        if getattr(layer, "precast_fp32_weight", False):
+        if getattr(layer, "precast_fp32_weight", True):
             weight_fp32 = layer.weight.data.to(torch.float32)
             layer.weight_fp32 = (
                 weight_fp32 if keep_nd_weight or skip_weight_nz_conversion else maybe_trans_nz(weight_fp32)

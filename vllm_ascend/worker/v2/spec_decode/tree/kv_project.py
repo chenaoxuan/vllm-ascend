@@ -122,66 +122,115 @@ class TreeKvCompact:
                     exc,
                 )
 
-    def run(
-        self,
-        idx_mapping: torch.Tensor,
-        path_node_ids: torch.Tensor,
-        *,
-        dst_from_zero: bool = False,
-    ) -> None:
+    def run(self, idx_mapping, path_node_ids, *, dst_from_zero=False) -> None:
+        if dst_from_zero:
+            raise ValueError("Tree KV compaction must preserve the root at prefix P")
         num_reqs = path_node_ids.shape[0]
         self._idx[:num_reqs].copy_(idx_mapping[:num_reqs])
         self._path[:num_reqs].copy_(path_node_ids[:num_reqs])
-        self._dst_off = self._depth0 if dst_from_zero else self._depth
-        self._hold = dst_from_zero
-        graph = self._graphs.get(num_reqs)
-        if graph is not None and not dst_from_zero:
-            graph.replay()
+        self._dst_off = self._depth
+        self._hold = False
+        self._held = None
+        self._held_keep = None
+        self._bind_groups(num_reqs)
+        if self.runner.model_config.enforce_eager:
+            self._compact_eager(num_reqs)
             return
-        self._bind_groups()
-        self._compact(num_reqs)
+        graph = self._graphs.get(num_reqs)
+        if graph is not None:
+            graph.replay()
+        else:
+            self._compact(num_reqs)
 
-    def _bind_groups(self) -> None:
+    def _compact_eager(self, num_reqs: int) -> None:
+        indices = self._idx[:num_reqs].detach().cpu().tolist()
+        paths = self._path[:num_reqs].detach().cpu().tolist()
+        computed = self.runner.req_states.num_computed_tokens.gpu.detach().cpu().tolist()
+        request, source, destination = [], [], []
+        for req, row in zip(indices, paths):
+            req = int(req)
+            if req < 0:
+                continue
+            prefix = int(computed[req])
+            ended = False
+            for depth, value in enumerate(row, 1):
+                node = int(value)
+                if node == -1:
+                    ended = True
+                    continue
+                if ended or node <= 0:
+                    raise RuntimeError("Invalid accepted path in KV compaction")
+                src, dst = prefix + node, prefix + depth
+                if not 0 <= src < self.runner.max_model_len or not 0 <= dst < self.runner.max_model_len:
+                    raise RuntimeError("Accepted KV position exceeds model capacity")
+                request.append(req)
+                source.append(src)
+                destination.append(dst)
+        if not source:
+            return
+        req = torch.tensor(request, dtype=torch.long, device=self.device)
+        src = torch.tensor(source, dtype=torch.long, device=self.device)
+        dst = torch.tensor(destination, dtype=torch.long, device=self.device)
+        transfers = []
+        for caches, table, block_size, _ in self._groups:
+            src_col = torch.div(src, block_size, rounding_mode="floor")
+            dst_col = torch.div(dst, block_size, rounding_mode="floor")
+            if bool(((src_col >= table.shape[1]) | (dst_col >= table.shape[1])).any().item()):
+                raise RuntimeError("Accepted KV page exceeds block-table capacity")
+            src_block, dst_block = table[req, src_col], table[req, dst_col]
+            if bool(((src_block <= 0) | (dst_block <= 0)).any().item()):
+                raise RuntimeError("Accepted KV path references an unallocated/null page")
+            src_off, dst_off = src % block_size, dst % block_size
+            for cache in caches:
+                transfers.append((cache, dst_block, dst_off, cache[src_block, src_off].clone()))
+        # All gathers precede all writes, including when cache views alias.
+        for cache, block, offset, values in transfers:
+            cache[block, offset] = values
+
+    def _bind_groups(self, num_reqs=None) -> None:
+        # dspark-ori-binding-fix:v1
+        if getattr(self.runner.speculator, "packed_dsv4_verify", lambda: False)():
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_binding import bind_original_kv
+            self._groups = bind_original_kv(self, num_reqs)
+            return
         if self._groups is not None:
             return
         ctx = self.runner.compilation_config.static_forward_context
-        groups = []
-        seen: set[int] = set()
+        speculator = self.runner.speculator
+        draft_names = set(getattr(speculator, "draft_attn_layer_names", ()) or ())
+        groups, seen = [], set()
         for group_id, group in enumerate(self.runner.kv_cache_config.kv_cache_groups):
             if not _group_is_linear_token_cache(group):
                 continue
-            caches: list[torch.Tensor] = []
-            gathers: list[torch.Tensor] = []
+            caches, gathers = [], []
+            block_size = self.runner.block_tables.kernel_block_sizes[group_id]
             for layer_name in group.layer_names:
+                if layer_name in draft_names:
+                    continue
                 layer = ctx.get(layer_name)
                 if layer is None:
                     continue
-                for tensor in iter_unique_kv_cache_tensors(
-                    getattr(layer, "kv_cache", None)
-                ):
-                    ptr = tensor.untyped_storage().data_ptr()
-                    if ptr in seen:
+                for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
+                    key = (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+                    if key in seen:
                         continue
-                    seen.add(ptr)
+                    seen.add(key)
+                    if int(tensor.shape[1]) != int(block_size):
+                        raise RuntimeError("Target KV page size differs from block-table metadata")
                     caches.append(tensor)
-                    tail = tensor.shape[2:]
-                    gathers.append(
-                        torch.empty(
-                            (self.max_num_reqs * self.spec_len, *tail),
-                            dtype=tensor.dtype,
-                            device=tensor.device,
-                        )
-                    )
-            if not caches:
-                continue
-            groups.append(
-                (
+                    gathers.append(torch.empty(
+                        (self.max_num_reqs * self.spec_len, *tensor.shape[2:]),
+                        dtype=tensor.dtype, device=tensor.device,
+                    ))
+            if caches:
+                groups.append((
                     caches,
                     self.runner.block_tables.block_tables[group_id].gpu,
-                    self.runner.block_tables.kernel_block_sizes[group_id],
+                    block_size,
                     gathers,
-                )
-            )
+                ))
+        if getattr(speculator, "packed_dsv4_verify", lambda: False)() and not groups:
+            raise RuntimeError("No target original-KV cache was bound for V4 tree compaction")
         self._groups = groups
 
     def _compact(self, num_reqs: int) -> None:
@@ -195,23 +244,6 @@ class TreeKvCompact:
         nslot = num_reqs * self.spec_len
         safe_idx = idx.clamp(min=0)
         prefix = num_computed[safe_idx]
-        if num_reqs > 0:
-            try:
-                from debug_trace import cmp_log
-
-                path0 = path[0].detach().to("cpu").tolist()
-                accepted = [int(n) for n in path0 if int(n) >= 0]
-                cmp_log(
-                    {
-                        "ori_move": 1,
-                        "dst_from_zero": bool(self._hold),
-                        "prefix": int(prefix[0].item()),
-                        "src": accepted[:8],
-                        "dst_off": [int(x) for x in self._dst_off[: len(accepted)].tolist()],
-                    }
-                )
-            except Exception:
-                pass
         dst_pos = prefix.unsqueeze(1) + self._dst_off
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
         valid = (path >= 0) & (idx >= 0).unsqueeze(1)
@@ -251,216 +283,16 @@ class TreeKvCompact:
         self._held_keep = valid.reshape(-1) if hold else None
 
 
-def _cmp_case_log(prefix, path_nodes, parents, depths, num_nodes, moves) -> None:
-    """Classify CSA/HCA windows for request 0. Host-side, last rank only."""
-    try:
-        from debug_trace import cmp_log
-    except Exception:
-        import importlib.util
-        import sys
-
-        spec = importlib.util.spec_from_file_location(
-            "debug_trace", "/home/specdec/spec260922/debug_trace.py"
-        )
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        cmp_log = mod.cmp_log
-    p0 = int(prefix[0].item()) if hasattr(prefix, "numel") else int(prefix)
-    nodes = [int(x) for x in path_nodes[:16]]
-    n = int(num_nodes)
-    dep = [int(x) for x in depths[:n]]
-    par = [int(x) for x in parents[:n]]
-    by_ratio = {}
-    for ratio in (4, 128):
-        residual = p0 % ratio
-        groups: dict[int, list[int]] = {}
-        rope_groups: dict[int, list[int]] = {}
-        for i in range(n):
-            nid = i + 1
-            slot_c = (p0 + nid) // ratio
-            rope_c = (p0 + dep[i]) // ratio
-            groups.setdefault(slot_c, []).append(nid)
-            rope_groups.setdefault(rope_c, []).append(nid)
-        slot_stomp = []
-        chain_mix = 0
-        for ids in groups.values():
-            if len(ids) < 2:
-                continue
-            slot_stomp.append(ids[:8])
-            # A real window is one parent chain. Mixed ids are siblings or
-            # unrelated nodes written into the same compressed slot.
-            idset = set(ids)
-            linked = 0
-            for nid in ids:
-                parent = par[nid - 1] if nid - 1 < len(par) else -1
-                if parent in idset or parent == 0:
-                    linked += 1
-            if linked < len(ids):
-                chain_mix += 1
-            if len(slot_stomp) >= 6:
-                break
-        # Siblings share a RoPE depth, so they fall in one compressed window.
-        branch = []
-        for ids in rope_groups.values():
-            if len(ids) < 2:
-                continue
-            d0 = dep[ids[0] - 1]
-            if any(dep[j - 1] == d0 for j in ids[1:]):
-                branch.append(ids[:8])
-            if len(branch) >= 4:
-                break
-        by_ratio["r" + str(ratio)] = {
-            "residual": residual,
-            "partial": residual != 0,
-            "n_slot": len(groups),
-            "slot_stomp": slot_stomp,
-            "rope_branch": branch,
-        }
-    cmp_log(
-        {
-            "prefix": p0,
-            "path": nodes,
-            "moves": moves,
-            "cmp": by_ratio,
-        }
-    )
-
-
 def move_accepted_compress_slots(
-    runner, idx_mapping, path_node_ids, num_sampled, tree=None
-) -> dict:
-    """Move accepted-path compressed windows onto the linear prefix.
-
-    Verify writes each tree query at ``prefix + node_id``. After accept, draft
-    ``i`` belongs at ``prefix + i``. When that position closes a ratio-4 or
-    ratio-128 window, copy the compressed slot from the tree position.
-    """
-    groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None)
-    if (
-        not groups
-        or path_node_ids is None
-        or num_sampled is None
-        or int(num_sampled.shape[0]) == 0
-    ):
-        return {"groups": 0, "copies": 0}
+    runner, idx_mapping, path_node_ids, num_sampled, tree=None,
+):
     from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import commit_winner
 
-    committed = commit_winner(path_node_ids)
-    if committed is not None:
-        return committed
-    num_reqs = int(num_sampled.shape[0])
-    idx = idx_mapping[:num_reqs].clamp(min=0)
-    prefix = runner.req_states.num_computed_tokens.gpu[idx]
-    spec = int(path_node_ids.shape[1])
-    node = path_node_ids[:num_reqs].to(dtype=torch.long)
-    valid = node >= 0
-    offs = torch.arange(spec, device=prefix.device)
-    ctx = runner.compilation_config.static_forward_context
-    n_groups = 0
-    n_copies = 0
-    move_rows = []
-    for gid, group in enumerate(groups):
-        if _group_is_linear_token_cache(group):
-            continue
-        spec = group.kv_cache_spec
-        inner = getattr(spec, "kv_cache_specs", None)
-        items = list(inner.values()) if inner else [spec]
-        ratio = 0
-        for item in items:
-            ratio = int(
-                getattr(item, "compress_ratio", 0)
-                or getattr(item, "tokens_per_state", 0)
-                or 0
-            )
-            if ratio > 1:
-                break
-        if ratio not in (4, 128):
-            continue
-        block_size = int(runner.block_tables.kernel_block_sizes[gid])
-        if block_size % ratio != 0:
-            continue
-        page = block_size // ratio
-        block_table = runner.block_tables.block_tables[gid].gpu
-        tensors: list[torch.Tensor] = []
-        seen: set[int] = set()
-        for name in group.layer_names:
-            layer = ctx.get(name)
-            if layer is None:
-                continue
-            for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
-                ptr = tensor.untyped_storage().data_ptr()
-                if ptr in seen:
-                    continue
-                seen.add(ptr)
-                tensors.append(tensor)
-        if not tensors:
-            continue
-        pos = prefix.unsqueeze(1) + offs
-        src_pos = prefix.unsqueeze(1) + node.clamp(min=0)
-        boundary = valid & torch.remainder(pos + 1, ratio).eq(0)
-        dst_cpos = torch.div(pos, ratio, rounding_mode="floor")
-        src_cpos = torch.div(src_pos, ratio, rounding_mode="floor")
-        take = boundary & src_cpos.ne(dst_cpos)
-        if ratio in (4, 128) and len(move_rows) < 4:
-            taken = take[0].tolist()
-            src_l = src_cpos[0].tolist()
-            dst_l = dst_cpos[0].tolist()
-            pairs = [
-                [int(s), int(d)]
-                for s, d, ok in zip(src_l, dst_l, taken)
-                if ok
-            ]
-            dst_count: dict[int, int] = {}
-            for _, d in pairs:
-                dst_count[d] = dst_count.get(d, 0) + 1
-            move_rows.append(
-                {
-                    "ratio": ratio,
-                    "closed": len(pairs),
-                    "dst_stomp": [d for d, c in dst_count.items() if c > 1][:4],
-                    "pairs": pairs[:8],
-                }
-            )
-        if not bool(take.any().item()):
-            continue
-        req = idx.unsqueeze(1).expand_as(pos)
-        max_block = block_table.shape[1] - 1
-
-        def _flat(cpos: torch.Tensor) -> torch.Tensor:
-            bi = torch.div(cpos, page, rounding_mode="floor").clamp(0, max_block)
-            bo = torch.remainder(cpos, page)
-            blocks = block_table[req, bi]
-            return (blocks * page + bo).to(dtype=torch.long)
-
-        src_flat = _flat(src_cpos.clamp(min=0))[take]
-        dst_flat = _flat(dst_cpos)[take]
-        ranked = [t for t in tensors if t.ndim >= 3]
-        if not ranked:
-            continue
-        n_groups += 1
-        limit = min(int(t.shape[0] * t.shape[1]) for t in ranked)
-        in_range = (src_flat >= 0) & (dst_flat >= 0) & (src_flat < limit) & (dst_flat < limit)
-        src_flat = src_flat[in_range]
-        dst_flat = dst_flat[in_range]
-        if src_flat.numel() == 0:
-            continue
-        n_copies += int(src_flat.numel())
-        for tensor in ranked:
-            tail = tensor.shape[2:]
-            flat = tensor.reshape(tensor.shape[0] * tensor.shape[1], *tail)
-            flat.index_copy_(0, dst_flat, flat.index_select(0, src_flat))
-    try:
-        if tree is not None:
-            n_nodes = int(tree.num_nodes[0].item())
-            _cmp_case_log(
-                prefix,
-                node[0].tolist(),
-                tree.parents[0, :n_nodes].tolist(),
-                tree.depths[0, :n_nodes].tolist(),
-                n_nodes,
-                move_rows,
-            )
-    except Exception:
-        pass
-    return {"groups": n_groups, "copies": n_copies}
+    if path_node_ids is None or num_sampled is None:
+        raise RuntimeError("Missing V4 tree verification result")
+    return commit_winner(
+        path_node_ids,
+        num_sampled=num_sampled,
+        idx_mapping=idx_mapping,
+    )
 

@@ -99,3 +99,16 @@ class AscendRequestState(RequestState):
                     dtype=torch.float32,
                     device=device,
                 )
+    def add_request(self, req_id, *args, **kwargs):
+        result = super().add_request(req_id, *args, **kwargs)
+        if hasattr(self, "tree_num_nodes"):
+            idx = self.req_id_to_index[req_id]
+            self.tree_num_nodes[idx] = 0
+            self.tree_depths[idx].zero_()
+            self.tree_parents[idx].fill_(-1)
+            self.tree_visibility[idx].zero_()
+            self.tree_first_child[idx].fill_(-1)
+            self.tree_next_sibling[idx].fill_(-1)
+            if self.tree_proposal_logits is not None:
+                self.tree_proposal_logits[idx].fill_(float("-inf"))
+        return result

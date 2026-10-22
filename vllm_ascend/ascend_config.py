@@ -21,7 +21,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, model_validator
+from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -416,6 +416,14 @@ class AscendConfig:
                 "method": null,
                 "method_params": {}
             },
+            "tree_spec_config": {
+                "enabled": false,
+                "method": null,
+                "budget": null,
+                "topk": null,
+                "enable_triton": true,
+                "params": {}
+            },
             "sparse_kv_offload_config": {
                 "enabled": false,
                 "topk_buffer_size": 4096,
@@ -502,6 +510,7 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    tree_spec_config: TreeSpecConfig = dataclasses.field(default_factory=lambda: TreeSpecConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1021,6 +1030,131 @@ class AscendConfig:
         ):
             return "fullmesh_v1"
         return self.mc2_comm_alg
+
+
+@config
+class TreeSpecConfig:
+    """Draft-tree construction from ``additional_config.tree_spec_config``.
+
+    When ``enabled`` is true, the v2 parallel-draft tree host expands shared
+    depth logits into a draft tree instead of a single linear draft chain, and
+    ``method`` / ``budget`` / ``topk`` are required. Target verification
+    compares token IDs.
+
+    ``method`` selects the topology builder and must match
+    ``speculative_config.method`` (draft backend):
+
+    - ``beam`` → ``dspark`` (level-wise beam / PCTree; Markov on Qwen3 DSpark)
+    - ``prefix`` → ``dflash`` (uniform-width supertree + Top-B prune; Domino
+      ``embed_proj`` / ``prefix_gru`` when ``projector_type=domino``;
+      ``shift_label=true`` samples the bonus hidden as draft slot 0)
+
+    There is no default; ``method`` must be set when enabled. Pairing is
+    checked in ``init_ascend_config`` (when ``speculative_config`` is set)
+    and again when the tree builder is created.
+
+    ``budget`` is the per-request node budget excluding the already-accepted
+    root; it must be >= ``num_speculative_tokens``.
+
+    ``topk`` is the per-depth expansion width **k**: how many children each
+    parent keeps. It is independent of ``budget``.
+
+    ``params`` is an open dict for method-specific knobs. Unknown keys are
+    kept (builders ignore what they do not recognize). Prefix reads:
+
+    - ``candidate_size`` (C): Domino shortlist size. Missing/None → ``C = k``
+      (same as the old ``candidate_count = k``). Otherwise
+      ``C = min(int(candidate_size), vocab)``, then clamp ``C >= k``.
+      Expansion width is always ``k`` (aligned with ``topk``); the
+      supertree is then Top-B pruned to ``budget``.
+
+    ``enable_triton`` (default True) runs tree hot-path Triton kernels when
+    Triton is available; set False to force torch fallbacks.
+
+    Usage::
+
+        llm = LLM(
+            model,
+            additional_config={
+                "tree_spec_config": {
+                    "enabled": True,
+                    "method": "prefix",
+                    "budget": 16,
+                    "topk": 4,
+                    "enable_triton": True,
+                    "params": {
+                        "candidate_size": 8,
+                    },
+                }
+            },
+        )
+    """
+
+    SUPPORTED_METHODS: ClassVar[tuple[str, ...]] = ("beam", "prefix")
+    PREFIX_PARAM_KEYS: ClassVar[frozenset[str]] = frozenset({"candidate_size"})
+
+    enabled: bool = False
+    method: str | None = None
+    budget: int | None = None
+    topk: int | None = None
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # When true, print segment timings at process exit.
+    enable_timer: bool = False
+    enable_triton: bool = True
+
+    @field_validator("params", mode="before")
+    @classmethod
+    def _params_must_be_dict(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError(
+                f"tree_spec_config.params must be a dict, got {type(value).__name__}."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.method is not None and self.method not in self.SUPPORTED_METHODS:
+            raise ValueError(
+                f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "
+                f"got {self.method!r}"
+            )
+        if self.enabled and self.method is None:
+            raise ValueError(
+                "tree_spec_config.method is required when enabled "
+                f"(one of {self.SUPPORTED_METHODS})"
+            )
+        if self.enabled and (self.budget is None or self.topk is None):
+            raise ValueError(
+                "tree_spec_config.budget and tree_spec_config.topk are required when enabled"
+            )
+        if self.budget is not None and self.budget < 0:
+            raise ValueError(f"tree_spec_config.budget must be >= 0, got {self.budget}")
+        if self.topk is not None and self.topk < 1:
+            raise ValueError(f"tree_spec_config.topk must be >= 1, got {self.topk}")
+        unknown = set(self.params) - self.PREFIX_PARAM_KEYS
+        if unknown:
+            logger.warning_once(
+                "tree_spec_config.params has unrecognized keys %s; "
+                "current builders ignore them.",
+                sorted(unknown),
+            )
+        return self
+
+    def _validate_method_backend(self, vllm_config) -> None:
+        """Raise if ``method`` does not match ``speculative_config`` draft backend."""
+        if not self.enabled or self.method is None:
+            return
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None:
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.builder import (
+            validate_tree_method_backend,
+        )
+
+        draft_backend = (
+            "dspark" if speculative_config.use_dspark() else "dflash"
+        )
+        validate_tree_method_backend(self.method, draft_backend)
 
 
 @config
@@ -1568,6 +1702,7 @@ def init_ascend_config(vllm_config):
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config.tree_spec_config._validate_method_backend(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config

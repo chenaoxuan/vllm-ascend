@@ -40,8 +40,13 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+from vllm_ascend.attention.attention_mask import (
+    AttentionMaskBuilder,
+    align_up,
+    tree_fia_bsnd_shape,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     PagedAttentionGraphParam,
@@ -64,6 +69,7 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 if vllm_version_is("0.28.0"):
     from vllm.model_executor.layers.attention.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
@@ -247,20 +253,30 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         self.speculative_config = vllm_config.speculative_config
         self.decode_threshold = 1
+        self.tree_spec_enabled = dflash_tree_spec_enabled()
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
-                f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
-                got {self.decode_threshold}"
-            )
+            if self.tree_spec_enabled:
+                self.decode_threshold = 1 + get_ascend_config().tree_spec_config.budget
+            else:
+                self.decode_threshold = 1 + spec_token_num
+                assert self.decode_threshold <= 16, (
+                    f"decode_threshold exceeded \
+                    npu_fused_infer_attention_score TND layout's limit of 16, \
+                    got {self.decode_threshold}"
+                )
 
         self.reorder_batch_threshold = self.decode_threshold
 
         scheduler_config = vllm_config.scheduler_config
         self.chunked_prefill_enabled = scheduler_config.enable_chunked_prefill
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
+        if self.tree_spec_enabled:
+            self.attn_mask_builder.configure_tree_mask(
+                max_num_decode=int(scheduler_config.max_num_seqs),
+                query_len=self.decode_threshold,
+                kv_len=align_up(int(self.model_config.max_model_len), 128),
+            )
 
     @classmethod
     def get_cudagraph_support(
@@ -279,10 +295,18 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self,
         common_attn_metadata: AscendCommonAttentionMetadata,
     ) -> tuple[int, int, int, int]:
+        # Tree decode_threshold is 1+budget. A first prefill shorter than that
+        # (e.g. "what is your name" with budget=4) must stay a prefill, or FIA
+        # tree-decode BSND runs without page attention.
+        # Draft propose does not populate is_prefilling; keep the default
+        # short-extend-as-decode path there so split does not assert.
         return split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
-            treat_short_extends_as_decodes=not self.pcp_enabled,
+            treat_short_extends_as_decodes=(
+                (not self.tree_spec_enabled or common_attn_metadata.is_prefilling is None)
+                and not self.pcp_enabled
+            ),
         )
 
     def _build_backend_metadata(
@@ -322,12 +346,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Prefer _seq_lens_cpu (always available, updated during draft
         # iterations) over seq_lens_cpu (None in async spec decode mode).
         if common_attn_metadata._seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
+            seq_lens_host = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+            seq_lens_host = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
-            seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+            seq_lens_host = common_attn_metadata.seq_lens[:num_reqs].to("cpu")  # D2H
 
+        seq_lens = seq_lens_host
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
@@ -339,13 +364,27 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
 
         attn_state = common_attn_metadata.attn_state
 
-        # Get attn_mask from singleton AttentionMaskBuilder
-        attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
+        # Tree mask builder reads seq_lens on host. parallel_drafting / cross-attn
+        # keep device ``seq_lens`` for FIA actual_seq_kvlen.
+        attn_mask = self.attn_mask_builder.get_attention_mask(
+            common_attn_metadata.causal,
+            self.model_config,
+            tree_visibility=common_attn_metadata.tree_visibility,
+            seq_lens=seq_lens_host,
+            num_decode=num_decodes,
+            num_tokens=common_attn_metadata.num_actual_tokens,
+            for_capture=common_attn_metadata.for_cudagraph_capture,
+        )
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+        # TND: last actual_seq_q must equal the padded hidden length (queryT).
+        # A short prefill can miss the dummy qsl entry; append the graph size.
+        num_input_tokens = common_attn_metadata.num_input_tokens
+        if actual_seq_lengths_q and num_input_tokens > actual_seq_lengths_q[-1]:
+            actual_seq_lengths_q = actual_seq_lengths_q + [num_input_tokens]
         seq_lens_list = seq_lens.tolist()
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
@@ -808,6 +847,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_keys = [attn_keys[index % num_layers] for index in range(graph_param_count)]
             attn_count = 0
             layer_count = 0
+            tree_kv_lens = None
+            tree_attn_mask = None
+            tree_block_tables = None
             with torch.npu.stream(update_stream):
                 for key, param, handle, event in zip(
                     attn_keys,
@@ -883,11 +925,54 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         # block_tables from attn_metadata.
                         if not sliding_window:
                             block_tables = attn_metadata[metadata_key].block_tables
+                        metadata = attn_metadata[metadata_key]
                     layer_count += 1
 
-                    torch.npu.graph_task_update_begin(update_stream, handle)
                     input_layout = "TND"
                     extra_args = {}
+                    if getattr(query, "ndim", 0) == 4 and c8_k_aq_scale is None:
+                        # Tree decode capture used BSND + sparse_mode=0.
+                        # Pad to captured B before graph_task_update_begin:
+                        # ZerosLike/cat inside the update region aborts the task.
+                        input_layout = "BSND"
+                        sparse_mode = 0
+                        q_len = query.shape[1]
+                        n_dec = query.shape[0]
+                        actual_seq_lengths_q = [q_len] * n_dec
+                        if tree_kv_lens is None:
+                            seq_lens = list(seq_lens[:n_dec])
+                            if len(seq_lens) < n_dec:
+                                seq_lens = seq_lens + [1] * (n_dec - len(seq_lens))
+                            tree_kv_lens = seq_lens
+                            if metadata.attn_mask is not None:
+                                tree_attn_mask = (
+                                    AscendAttentionBackendImpl._bsnd_tree_attn_mask(
+                                        metadata.attn_mask, n_dec, q_len
+                                    )
+                                )
+                            if metadata.block_tables is not None:
+                                block_tables = metadata.block_tables
+                                if block_tables.shape[0] < n_dec:
+                                    block_tables = torch.cat(
+                                        (
+                                            block_tables,
+                                            block_tables.new_zeros(
+                                                (
+                                                    n_dec - block_tables.shape[0],
+                                                    block_tables.shape[1],
+                                                )
+                                            ),
+                                        ),
+                                        dim=0,
+                                    )
+                                else:
+                                    block_tables = block_tables[:n_dec]
+                                tree_block_tables = block_tables
+                        seq_lens = tree_kv_lens
+                        if tree_attn_mask is not None:
+                            attn_mask = tree_attn_mask
+                        if tree_block_tables is not None:
+                            block_tables = tree_block_tables
                     if c8_k_aq_scale is not None:
                         extra_args = {
                             "key_antiquant_scale": c8_k_aq_scale,
@@ -898,6 +983,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         }
                         input_layout = "BNSD"
                         sparse_mode = 0
+                    torch.npu.graph_task_update_begin(update_stream, handle)
                     torch_npu.npu_fused_infer_attention_score.out(
                         query=query,
                         key=key_cache,
@@ -951,6 +1037,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         sparse_mode = 4 if self.sliding_window else 3 if attn_metadata.causal else 0
         pre_tokens = self.sliding_window or SWA_INT_MAX
         next_tokens = 0 if self.sliding_window else SWA_INT_MAX
+        if sparse_mode in (3, 4):
+            attn_mask = self._tnd_sparse34_mask(attn_mask, query.device)
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
@@ -1097,6 +1185,187 @@ class AscendAttentionBackendImpl(AttentionImpl):
         graph_params.handles[num_tokens].append(handle)
         return output, num_tokens
 
+    @staticmethod
+    def _tnd_sparse34_mask(attn_mask: torch.Tensor | None, device: torch.device):
+        """TND sparse 3/4 is splitfuse; 4D tree mask (Q!=2048) is invalid there."""
+        if (
+            attn_mask is not None
+            and attn_mask.ndim == 4
+            and attn_mask.shape[-2] != 2048
+        ):
+            return AttentionMaskBuilder(device).get_splitfuse_attn_mask()
+        return attn_mask
+
+    @staticmethod
+    def _bsnd_tree_attn_mask(
+        attn_mask: torch.Tensor | None, batch_size: int, q_len: int | None = None
+    ) -> torch.Tensor | None:
+        """FIA BSND + sparse_mode=0 wants contiguous [B or 1, Q, KV].
+
+        Return the 3D buffer filled in prepare_attn. 2D splitfuse is ignored
+        so replay does not keep the capture dummy identity mask.
+        """
+        if q_len is None:
+            if attn_mask is None or attn_mask.ndim < 3:
+                return None
+            q_len = attn_mask.shape[-2]
+        device = attn_mask.device if attn_mask is not None else torch.device("cpu")
+        return AttentionMaskBuilder(device).as_bsnd_fia_mask(
+            attn_mask, batch_size, q_len
+        )
+
+    @staticmethod
+    def _tree_fia_bsnd_shape(
+        num_tokens: int, num_decodes: int
+    ) -> tuple[int, int] | None:
+        """BSND only when tokens are ``k * (1+budget)`` matching ``num_decodes``.
+
+        Other capture gears keep TND + 2D splitfuse; a 4D tree mask with
+        sparse 3 is invalid.
+        """
+        bsnd = tree_fia_bsnd_shape(num_tokens)
+        if bsnd is None:
+            return None
+        n_dec, _q_len = bsnd
+        if num_decodes > 0 and n_dec != num_decodes:
+            return None
+        return bsnd
+
+    def _tree_decode_fia_eligible(self, attn_metadata: AscendMetadata) -> bool:
+        mask = attn_metadata.attn_mask
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        return (
+            dflash_tree_spec_enabled()
+            and not _EXTRA_CTX.is_draft_model
+            and mask is not None
+            and mask.ndim == 4
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+            and attn_metadata.block_tables is not None
+            and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
+            and self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes)
+            is not None
+        )
+
+    def full_graph_tree_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        """Capture tree decode FIA (BSND + custom mask), same topology as eager."""
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
+            key, value, attn_metadata
+        )
+        num_tokens = attn_metadata.actual_seq_lengths_q[-1]
+        bsnd = self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes)
+        if bsnd is None:
+            return self.full_graph_fia(query, key, value, attn_metadata, output)
+        num_decodes, q_len = bsnd
+        fia_query = query[: num_decodes * q_len].view(
+            num_decodes, q_len, self.num_heads, self.head_size
+        )
+        fia_output = output[: num_decodes * q_len].view(
+            num_decodes, q_len, self.num_heads, self.head_size
+        )
+        actual_seq_lengths_q = [q_len] * num_decodes
+        if isinstance(actual_seq_lengths_kv, torch.Tensor):
+            actual_seq_lengths_kv = actual_seq_lengths_kv[:num_decodes]
+        else:
+            actual_seq_lengths_kv = list(actual_seq_lengths_kv[:num_decodes])
+        bt = block_table[:num_decodes] if block_table is not None else None
+        attn_mask = self._bsnd_tree_attn_mask(
+            attn_metadata.attn_mask, num_decodes, q_len
+        )
+        graph_params = get_draft_graph_params() if _EXTRA_CTX.is_draft_model else get_graph_params()
+        softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        input_layout = "BSND"
+        sparse_mode = 0
+        pre_tokens = SWA_INT_MAX
+        next_tokens = SWA_INT_MAX
+        workspace = graph_params.workspaces.get(num_tokens)
+        if workspace is None:
+            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                query=fia_query,
+                key=key,
+                value=value,
+                atten_mask=attn_mask,
+                block_table=bt,
+                input_layout=input_layout,
+                block_size=block_size,
+                actual_seq_lengths=actual_seq_lengths_q,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                num_key_value_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                sparse_mode=sparse_mode,
+                pre_tokens=pre_tokens,
+                next_tokens=next_tokens,
+                scale=self.scale,
+            )
+            if _EXTRA_CTX.is_draft_model:
+                update_draft_graph_params_workspaces(num_tokens, workspace)
+            else:
+                update_graph_params_workspaces(num_tokens, workspace)
+
+        stream = torch_npu.npu.current_stream()
+        event = torch.npu.ExternalEvent()
+        event.wait(stream)
+        event.reset(stream)
+        graph_params.events[num_tokens].append(event)
+        attn_params = (
+            weak_ref_tensors(fia_query),
+            weak_ref_tensors(key),
+            weak_ref_tensors(value),
+            weak_ref_tensors(bt) if bt is not None else None,
+            weak_ref_tensors(attn_mask) if attn_mask is not None else None,
+            block_size,
+            actual_seq_lengths_kv,
+            actual_seq_lengths_q,
+            self.num_kv_heads,
+            self.num_heads,
+            self.scale,
+            weak_ref_tensors(fia_output),
+            weak_ref_tensors(softmax_lse),
+            sparse_mode,
+            pre_tokens,
+            next_tokens,
+            self.sliding_window,
+            None,
+            None,
+            None,
+            None,
+            self._graph_metadata_layer_name(None)
+            if self._use_layer_aware_fia_graph_replay
+            else None,
+        )
+        graph_params.attn_params[num_tokens].append(attn_params)
+
+        torch.npu.graph_task_group_begin(stream)
+        torch_npu.npu_fused_infer_attention_score.out(
+            query=fia_query,
+            key=key,
+            value=value,
+            atten_mask=attn_mask,
+            block_table=bt,
+            input_layout=input_layout,
+            block_size=block_size,
+            actual_seq_lengths=actual_seq_lengths_q,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            sparse_mode=sparse_mode,
+            pre_tokens=pre_tokens,
+            next_tokens=next_tokens,
+            workspace=workspace,
+            out=[fia_output, softmax_lse],
+        )
+        handle = torch.npu.graph_task_group_end(stream)
+        graph_params.handles[num_tokens].append(handle)
+        return output.view(num_tokens, self.num_heads, self.head_size), num_tokens
+
     def full_graph_fia_v2(
         self,
         query: torch.Tensor,
@@ -1115,6 +1384,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
 
         actual_seq_lengths_q = attn_metadata.actual_seq_lengths_q
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+        attn_mask = self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device)
         use_max_workspace = self._use_max_workspace_for_fia_graph
         workspace = graph_params.workspaces.get(num_tokens)
         should_update_workspace_cache = False
@@ -1125,7 +1395,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query=query,
                 key=key,
                 value=value,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=attn_mask,
                 block_table=block_table,
                 input_layout="TND",
                 block_size=block_size,
@@ -1151,7 +1421,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 query=query,
                 key=key,
                 value=value,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=attn_mask,
                 block_table=block_table,
                 input_layout="TND",
                 block_size=block_size,
@@ -1185,7 +1455,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 weak_ref_tensors(key),
                 weak_ref_tensors(value),
                 weak_ref_tensors(block_table),
-                weak_ref_tensors(attn_metadata.attn_mask),
+                weak_ref_tensors(attn_mask) if attn_mask is not None else None,
                 block_size,
                 actual_seq_lengths_kv,
                 self.num_kv_heads,
@@ -1203,7 +1473,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             query=query,
             key=key,
             value=value,
-            atten_mask=attn_metadata.attn_mask,
+            atten_mask=attn_mask,
             block_table=block_table,
             input_layout="TND",
             block_size=block_size,
@@ -1366,10 +1636,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia_v2(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
-            else:
-                attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
+            if self._tree_decode_fia_eligible(attn_metadata):
+                attn_output, num_tokens = self.full_graph_tree_fia(
+                    query, key, value, attn_metadata, output
+                )
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+            attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
+            output[:num_tokens] = attn_output[:num_tokens]
+            return output
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
@@ -1400,7 +1675,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout="TND",
                 pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
                 next_tokens=0,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=self._tnd_sparse34_mask(
+                    attn_metadata.attn_mask, query.device
+                ),
                 sparse_mode=sparse_mode,
                 softmax_scale=self.scale,
                 block_table=block_table,
@@ -1430,7 +1707,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     query=query,
                     key=key,
                     value=value,
-                    atten_mask=attn_metadata.attn_mask,
+                    atten_mask=self._tnd_sparse34_mask(
+                        attn_metadata.attn_mask, query.device
+                    ),
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
@@ -1444,6 +1723,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
+                tree_spec = dflash_tree_spec_enabled()
                 # ChunkedPrefill mixing prefill+decode: split into a per-phase
                 # FIA call each (A5 only).
                 # NOTE: Batch-invariant execution also requires prefill and
@@ -1457,6 +1737,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             get_current_hardware_profile().supports(HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT)
                             and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
                         )
+                        or (
+                            tree_spec
+                            and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
+                        )
                     )
                     and attn_metadata.num_decodes > 0
                     and attn_metadata.num_prefills > 0
@@ -1464,32 +1748,153 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     return self._forward_fia_chunked_prefill_split(
                         query, key, value, key, passed_value, block_size, block_table, attn_metadata, output
                     )
-                attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
-                    query=query,
-                    key=key,
-                    value=value,
-                    atten_mask=attn_metadata.attn_mask,
-                    block_table=block_table,
-                    input_layout="TND",
-                    block_size=block_size,
-                    actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv=actual_seq_lengths_kv,
-                    num_key_value_heads=self.num_kv_heads,
-                    num_heads=self.num_heads,
-                    head_size=self.head_size,
-                    scale=self.scale,
-                    key_cache=self.key_cache,
-                    value_cache=self.value_cache,
-                    current_key=key,
-                    current_value=passed_value,
-                    attn_metadata=attn_metadata,
-                    is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
-                    sparse_mode=3,
-                )
+
+                # FIA enables page attention only when block_table is set.
+                # PrefillNoCache keeps 3D dense K/V; BSND 4D query then hits
+                # "value'dim should equal to query's dim".
+                if self._tree_decode_fia_eligible(attn_metadata):
+                    attn_output = self._forward_tree_decode_fia(
+                        query,
+                        key,
+                        value,
+                        passed_value,
+                        block_size,
+                        block_table,
+                        attn_metadata,
+                        actual_seq_lengths_kv,
+                        num_tokens,
+                        attn_metadata.num_decodes,
+                    )
+                else:
+                    attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+                        query=query,
+                        key=key,
+                        value=value,
+                        atten_mask=self._tnd_sparse34_mask(
+                            attn_metadata.attn_mask, query.device
+                        ),
+                        block_table=block_table,
+                        input_layout="TND",
+                        block_size=block_size,
+                        actual_seq_lengths=attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        num_key_value_heads=self.num_kv_heads,
+                        num_heads=self.num_heads,
+                        head_size=self.head_size,
+                        scale=self.scale,
+                        key_cache=self.key_cache,
+                        value_cache=self.value_cache,
+                        current_key=key,
+                        current_value=passed_value,
+                        attn_metadata=attn_metadata,
+                        is_prefill_no_cache=attn_metadata.attn_state
+                        == AscendAttentionState.PrefillNoCache,
+                        sparse_mode=3,
+                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
         return output
+
+    def _forward_tree_decode_fia(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        current_value: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        attn_metadata: AscendMetadata,
+        actual_seq_lengths_kv,
+        num_tokens: int,
+        num_decodes: int,
+    ) -> torch.Tensor:
+        """Tree decode FIA with a per-request mask.
+
+        TND + sparse_mode=1 does not honor batched custom masks (FIA TND only
+        documents sparse 0/3). DCP spec decode uses BSND for the same reason.
+        """
+        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+        with tree_time("target_fia_forward"):
+            return self._forward_tree_decode_fia_impl(
+                query,
+                key,
+                value,
+                current_value,
+                block_size,
+                block_table,
+                attn_metadata,
+                actual_seq_lengths_kv,
+                num_tokens,
+                num_decodes,
+            )
+
+    def _forward_tree_decode_fia_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        current_value: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        attn_metadata: AscendMetadata,
+        actual_seq_lengths_kv,
+        num_tokens: int,
+        num_decodes: int,
+    ) -> torch.Tensor:
+        bsnd = self._tree_fia_bsnd_shape(num_tokens, num_decodes)
+        use_bsnd = block_table is not None and bsnd is not None
+        if use_bsnd:
+            num_decodes, q_len = bsnd
+            fia_query = query[: num_decodes * q_len].view(
+                num_decodes, q_len, self.num_heads, self.head_size
+            )
+            input_layout = "BSND"
+            actual_seq_q = [q_len] * num_decodes
+            sparse_mode = 0
+        else:
+            fia_query = query[:num_tokens]
+            input_layout = "TND"
+            actual_seq_q = attn_metadata.actual_seq_lengths_q[:num_decodes]
+            q_len = None
+            # TND + custom mask is splitfuse; FIA requires sparse 3/4.
+            sparse_mode = 3
+            attn_mask = AttentionMaskBuilder(fia_query.device).get_splitfuse_attn_mask()
+        if isinstance(actual_seq_lengths_kv, torch.Tensor):
+            kv_lens = actual_seq_lengths_kv[:num_decodes].tolist()
+        else:
+            kv_lens = list(actual_seq_lengths_kv[:num_decodes])
+        bt = block_table[:num_decodes] if block_table is not None else None
+        if use_bsnd:
+            attn_mask = self._bsnd_tree_attn_mask(
+                attn_metadata.attn_mask,
+                num_decodes,
+                q_len,
+            )
+        attn_output, _ = DeviceOperator.npu_fused_infer_attention_score(
+            query=fia_query,
+            key=key,
+            value=value,
+            atten_mask=attn_mask,
+            block_table=bt,
+            input_layout=input_layout,
+            block_size=block_size,
+            actual_seq_lengths=actual_seq_q,
+            actual_seq_lengths_kv=kv_lens,
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            head_size=self.head_size,
+            scale=self.scale,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            current_key=key,
+            current_value=current_value,
+            attn_metadata=attn_metadata,
+            is_prefill_no_cache=False,
+            sparse_mode=sparse_mode,
+        )
+        return attn_output.reshape(num_tokens, self.num_heads, self.head_size)
 
     def _forward_fia_chunked_prefill_split(
         self,
@@ -1512,33 +1917,53 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         seq_lens_list = attn_metadata.seq_lens_list
         num_tokens = int(actual_seq_qlen[-1])
+        tree_spec = dflash_tree_spec_enabled()
 
         # decode part
         if num_decode_tokens > 0:
-            decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
-                query=query[:num_decode_tokens],
-                key=key,
-                value=value,
-                atten_mask=attn_metadata.attn_mask,
-                block_table=block_table[:num_decodes],
-                input_layout="TND",
-                block_size=block_size,
-                # cumulative offset from 0; leading num_decodes entries used as-is
-                actual_seq_lengths=actual_seq_qlen[:num_decodes],
-                actual_seq_lengths_kv=seq_lens_list[:num_decodes],
-                num_key_value_heads=self.num_kv_heads,
-                num_heads=self.num_heads,
-                head_size=self.head_size,
-                scale=self.scale,
-                key_cache=self.key_cache,
-                value_cache=self.value_cache,
-                current_key=key,
-                current_value=value,
-                attn_metadata=attn_metadata,
-                is_prefill_no_cache=False,
-                sparse_mode=3,
-            )
-            output[:num_decode_tokens] = decode_out.view(num_decode_tokens, self.num_heads, self.head_size)
+            if tree_spec:
+                decode_out = self._forward_tree_decode_fia(
+                    query[:num_decode_tokens],
+                    key,
+                    value,
+                    value,
+                    block_size,
+                    block_table[:num_decodes],
+                    attn_metadata,
+                    seq_lens_list[:num_decodes],
+                    num_decode_tokens,
+                    num_decodes,
+                )
+                output[:num_decode_tokens] = decode_out
+            else:
+                decode_out, _ = DeviceOperator.npu_fused_infer_attention_score(
+                    query=query[:num_decode_tokens],
+                    key=key,
+                    value=value,
+                    atten_mask=self._tnd_sparse34_mask(
+                        attn_metadata.attn_mask, query.device
+                    ),
+                    block_table=block_table[:num_decodes],
+                    input_layout="TND",
+                    block_size=block_size,
+                    # cumulative offset from 0; leading num_decodes entries used as-is
+                    actual_seq_lengths=actual_seq_qlen[:num_decodes],
+                    actual_seq_lengths_kv=seq_lens_list[:num_decodes],
+                    num_key_value_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    head_size=self.head_size,
+                    scale=self.scale,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    current_key=key,
+                    current_value=value,
+                    attn_metadata=attn_metadata,
+                    is_prefill_no_cache=False,
+                    sparse_mode=3,
+                )
+                output[:num_decode_tokens] = decode_out.view(
+                    num_decode_tokens, self.num_heads, self.head_size
+                )
 
         # prefill part
         if attn_metadata.num_prefills > 0:
@@ -1546,11 +1971,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
             prefill_seq_qlen = [
                 actual_seq_qlen[i] - num_decode_tokens for i in range(num_decodes, len(actual_seq_qlen))
             ]
+            if tree_spec:
+                prefill_mask = AttentionMaskBuilder(attn_metadata.attn_mask.device).get_splitfuse_attn_mask()
+            else:
+                prefill_mask = attn_metadata.attn_mask
             prefill_out, _ = DeviceOperator.npu_fused_infer_attention_score(
                 query=query[num_decode_tokens:num_tokens],
                 key=key,
                 value=value,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=prefill_mask,
                 block_table=block_table[num_decodes:],
                 input_layout="TND",
                 block_size=block_size,
@@ -2141,7 +2570,9 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
                 query=prefill_q,
                 key=prefill_k,
                 value=prefill_v,
-                atten_mask=attn_metadata.attn_mask,
+                atten_mask=self._tnd_sparse34_mask(
+                    attn_metadata.attn_mask, prefill_q.device
+                ),
                 block_table=None,
                 input_layout="TND",
                 block_size=cache_block_size,
@@ -2202,7 +2633,7 @@ class AscendC8AttentionBackendImpl(AscendAttentionBackendImpl):
             query=query,
             key=key,
             value=value,
-            atten_mask=attn_metadata.attn_mask,
+            atten_mask=self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device),
             block_table=block_table,
             input_layout="TND",
             block_size=block_size,

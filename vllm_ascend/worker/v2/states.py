@@ -19,6 +19,8 @@
 
 import torch
 from vllm.v1.worker.gpu.states import RequestState
+from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 
 class AscendRequestState(RequestState):
@@ -44,3 +46,48 @@ class AscendRequestState(RequestState):
         # Ascend attention needs a torch CPU view of the upstream NumPy state.
         # Sharing storage keeps both APIs coherent without duplicate writes.
         self.num_computed_tokens_cpu: torch.Tensor = torch.from_numpy(self.num_computed_tokens_np)
+
+        if dflash_tree_spec_enabled():
+            max_nodes = get_ascend_config().tree_spec_config.budget
+            self.draft_tokens: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=self.draft_tokens.dtype,
+                device=device,
+            )
+            self.tree_depths: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_parents: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_num_nodes: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_visibility: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                max_nodes,
+                dtype=torch.bool,
+                device=device,
+            )
+            self.tree_first_child: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_next_sibling: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )

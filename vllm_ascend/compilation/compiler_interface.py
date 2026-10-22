@@ -69,8 +69,16 @@ def fusion_pass_compile(
 
 
 def _compute_decode_cudagraph_batch_sizes(vllm_config: VllmConfig) -> list[int]:
-    num_spec_tokens = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
-    uniform_decode_query_len = num_spec_tokens + 1
+    speculative_config = vllm_config.speculative_config
+    if speculative_config:
+        from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+        if dflash_tree_spec_enabled(vllm_config):
+            uniform_decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
+        else:
+            uniform_decode_query_len = 1 + speculative_config.num_speculative_tokens
+    else:
+        uniform_decode_query_len = 1
     max_num_tokens = vllm_config.scheduler_config.max_num_seqs * uniform_decode_query_len
     return [
         x

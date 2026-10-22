@@ -27,7 +27,10 @@ def init_speculator(
     device: torch.device,
 ):
     """Override GPU init_speculator for Ascend NPUs.
-    Use AscendEagleSpeculator when eagle is used.
+
+    DFlash (``prefix``) and Qwen3 DSpark (``beam``) use
+    ``AscendTreeSpeculator`` when ``tree_spec_config.enabled`` is true.
+    Method/backend pairing is validated inside the tree host.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -44,12 +47,26 @@ def init_speculator(
 
         return ExtractHiddenStatesSpeculator(vllm_config, device)
     if speculative_config.use_dspark():
+        if dflash_tree_spec_enabled(vllm_config) and _is_qwen3_dspark(
+            speculative_config
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
         )
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
+        if dflash_tree_spec_enabled(vllm_config):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
                 AscendDFlash2Speculator,
@@ -76,3 +93,29 @@ def init_speculator(
 
         return AscendEagleSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
+
+
+def _is_qwen3_dspark(speculative_config) -> bool:
+    draft = getattr(speculative_config, "draft_model_config", None)
+    arches = getattr(draft, "architectures", None) or ()
+    return "Qwen3DSparkModel" in arches
+
+
+def tree_target_query_len(vllm_config: VllmConfig | None = None) -> int | None:
+    """Return the packed tree verification width per request."""
+    if not dflash_tree_spec_enabled(vllm_config):
+        return None
+    from vllm_ascend.ascend_config import get_ascend_config
+
+    return 1 + int(get_ascend_config().tree_spec_config.budget)
+
+
+def dflash_tree_spec_enabled(vllm_config: VllmConfig=None) -> bool:
+    try:
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        return bool(get_ascend_config().tree_spec_config.enabled)
+    except RuntimeError:
+        additional_config = getattr(vllm_config, "additional_config", {})
+        tree_cfg = additional_config.get("tree_spec_config") or {}
+        return bool(tree_cfg.get("enabled", False))

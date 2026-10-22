@@ -549,7 +549,27 @@
 #       profiling startup and per-step timing callbacks without monkey-patching
 #       `EngineCore` and the multiprocess entry point.
 #
-# ** 18. File: platform/patch_speculative_config.py**
+# ** 18. File: platform/patch_spec_decode_stats.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.spec_decode.metrics.SpecDecodingStats.observe_draft`
+#    Why:
+#       Tree spec decode schedules ``budget`` draft nodes, which can exceed
+#       ``num_speculative_tokens`` (tree depth). Upstream ``observe_draft``
+#       indexes per-position lists of length ``num_speculative_tokens``, so
+#       ``budget > num_speculative_tokens`` raises IndexError in
+#       ``Scheduler.make_spec_decoding_stats``.
+#    How：
+#       Replace ``observe_draft`` so scalar draft/accepted totals still count
+#       every node, while per-position updates clamp to the existing list
+#       length (chain-depth logging / Prometheus counters stay aligned).
+#    Related PR (if no, explain why):
+#       No, vllm-ascend tree spec; upstream stats assume chain drafts.
+#    Future Plan:
+#       Remove this patch when upstream ``observe_draft`` accepts
+#       ``num_draft_tokens > num_spec_tokens`` without growing per-pos
+#       vectors, or when tree spec is upstreamed with matching metrics.
+#
+# ** 19. File: platform/patch_speculative_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.speculative.SpeculativeConfig.hf_config_override`
 #    Why:
@@ -558,19 +578,36 @@
 #       loaded as the target model's MTP layer rather than a standalone model.
 #       Upstream `SpeculativeConfig.hf_config_override` does not remap these
 #       target model_types/architectures to their MTP variants, so spec decoding
-#       cannot locate the drafter.
+#       cannot locate the drafter. Legacy Qwen3 DSpark checkpoints also ship as
+#       ``DSparkDraftModel`` and need remapping to ``Qwen3DSparkModel``.
 #    How：
 #       Replace `SpeculativeConfig.hf_config_override` to detect the supported
 #       target model_type/architecture, derive `n_predict` from
 #       `num_nextn_predict_layers` (or `mtp_num_hidden_layers`), and rewrite
 #       `model_type`/`architectures` to the corresponding MTP model. Also remaps
-#       MistralLarge3 to its Eagle variant.
+#       MistralLarge3 to its Eagle variant, and Qwen3 ``DSparkDraftModel`` to
+#       ``Qwen3DSparkModel``.
 #    Related PR (if no, explain why):
-#       No, vllm-ascend-specific MTP model type remapping.
+#       No, vllm-ascend-specific MTP / DSpark model type remapping.
 #    Future Plan:
 #       Remove this patch once upstream vLLM supports loading these MTP draft
 #       models without a custom `hf_config_override`, or exposes a plugin hook
 #       for MTP model_type/architecture remapping.
+#   2. `vllm.config.speculative.SpeculativeConfig.__post_init__`
+#    Why:
+#       Huang2020/Qwen3-8B-Domino-b16 is a DFlash draft (``DFlashDraftModel``,
+#       ``projector_type=domino``) whose repo name does not contain ``dflash``.
+#       Upstream then leaves ``method=draft_model`` and never wraps EAGLEConfig
+#       or selects the DFlash speculator.
+#    How:
+#       If method is unset and the draft path contains ``domino`` / ``dflash``,
+#       set ``method=dflash`` before upstream post_init. After post_init, if
+#       method is still ``draft_model`` but the architecture is ``DFlash*`` or
+#       ``projector_type=domino``, promote to dflash and wrap EAGLEConfig.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend tree / Domino draft; upstream only name-matches dflash.
+#    Future Plan:
+#       Remove when upstream auto-detects ``DFlashDraftModel`` / Domino.
 #
 #   2. `vllm.config.speculative.SpeculativeConfig.__post_init__`
 #    Why:
@@ -654,7 +691,7 @@
 #       Remove this patch once `torch.accelerator` correctly routes to the NPU
 #       backend for these memory APIs.
 #
-# ** 21. File: platform/patch_tool_choice_none_content.py**
+# ** 22. File: platform/patch_tool_choice_none_content.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionResponse`
 #      `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionStreamResponse`
@@ -670,7 +707,7 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains PR #44105.
 #
-# ** 22. File: platform/patch_use_v2_model_runner.py**
+# ** 23. File: platform/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.vllm.VllmConfig.use_v2_model_runner`
 #    Why:
@@ -1229,6 +1266,26 @@
 #    Future Plan:
 #       Remove this patch once vLLM selects the Triton libdevice through a
 #       backend-dispatch mechanism.
+#
+#   3. `vllm.v1.worker.gpu.spec_decode.dflash.speculator._prepare_dflash_inputs_kernel`,
+#      `vllm.v1.worker.gpu.spec_decode.dflash.speculator.prepare_dflash_inputs`
+#    Why:
+#       The Ascend scalar rewrite of ``_prepare_dflash_inputs_kernel`` used to
+#       write real draft-KV slots for the whole ``num_ctx`` span. Upstream
+#       Triton uses ``is_valid_ctx`` so the rejected suffix is ``PAD_SLOT_ID``.
+#       After tree compact, leftover siblings can still share RoPE with the
+#       accepted prefix; writing them clobbers the just-accepted draft KV.
+#    How:
+#       The Ascend kernel PADs ``j >= num_valid_ctx`` (slot ``PAD_SLOT_ID``,
+#       position 0). ``prepare_dflash_inputs`` is wrapped to apply
+#       ``mask_rejected_dflash_context_slots`` on the same suffix (idempotent).
+#    Test:
+#       None (tree spec CPU UTs removed).
+#    Related PR (if no, explain why):
+#       No. Plugin-side tree + DFlash slot layout; upstream already PADs.
+#    Future Plan:
+#       Drop the wrap once the Ascend kernel is the only writer and stays
+#       aligned with upstream ``is_valid_ctx``.
 #
 # ** 29. File: worker/patch_v2/patch_use_v2_model_runner.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

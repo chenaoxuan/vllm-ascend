@@ -61,7 +61,7 @@ from vllm_ascend.worker.utils import disable_compilation
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_utils import (
@@ -69,7 +69,11 @@ from vllm_ascend.worker.v2.pp_utils import (
     resolve_spec_pp_support,
     restore_pp_after_upstream_init,
 )
-from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode import (
+    dflash_tree_spec_enabled,
+    init_speculator,
+)
+from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
@@ -126,6 +130,7 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.tree_kv_compact = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -182,8 +187,12 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm.
-        self.decode_query_len = self.num_speculative_steps + 1
+        # +1 is hardcoded here but not in vllm. Tree spec packs ``budget`` draft
+        # nodes, so the verify query is budget+1 rather than spec_depth+1.
+        if dflash_tree_spec_enabled(vllm_config):
+            self.decode_query_len = 1 + get_ascend_config().tree_spec_config.budget
+        else:
+            self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
@@ -239,7 +248,27 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_version_is("0.28.0") and self.use_spec_pp and self.is_last_pp_rank:
             assert self.pp_handler is not None
             self.pp_handler.broadcast_draft_tokens()
+        if self.is_last_pp_rank and isinstance(self.speculator, AscendTreeSpeculator):
+            tree = self.speculator.tree
+            input_batch = self.speculator.input_batch
+            idx = input_batch.idx_mapping
+            self.req_states.tree_depths[idx] = tree.depths
+            self.req_states.tree_parents[idx] = tree.parents
+            self.req_states.tree_visibility[idx] = tree.visibility
+            self.req_states.tree_num_nodes[idx] = tree.num_nodes
+            self.req_states.tree_first_child[idx] = tree.first_child
+            self.req_states.tree_next_sibling[idx] = tree.next_sibling
         return output
+
+    def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        super().load_model(load_dummy_weights, *args, **kwargs)
+        if dflash_tree_spec_enabled(self.vllm_config) and isinstance(
+            self.speculator, AscendTreeSpeculator
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
+
+            self.tree_kv_compact = TreeKvCompact(self)
+            self.speculator.tree_kv_compact = self.tree_kv_compact
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):
@@ -430,14 +459,31 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
-        )
+        tree_depths = getattr(self.req_states, "tree_depths", None)
+        if tree_depths is not None:
+            is_prefilling = async_copy_to_gpu(
+                torch.from_numpy(batch_req_state.is_prefilling_np),
+                device=self.device,
+            )
+            prepare_tree_spec_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                is_prefilling,
+                self.req_states.num_computed_tokens.gpu,
+                tree_depths,
+                self.input_buffers.positions,
+                self.input_buffers.slot_positions,
+                self.input_buffers.seq_lens,
+            )
+        else:
+            # Prepare positions and seq_lens.
+            prepare_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+            )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
         # Pad for full CUDA graph mode.
@@ -530,6 +576,16 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=attn_state,
         )
 
+        if tree_depths is not None:
+            input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
+            input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
+            input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
+            input_batch.tree_depths = tree_depths[idx_mapping]
+            input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
+            input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
+            input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+            input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
+
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
         if vllm_version_is("0.28.0"):
@@ -563,6 +619,25 @@ class NPUModelRunner(GPUModelRunner):
             for block_table in block_tables:
                 state_slots = torch.arange(1, block_table.shape[0] + 1, dtype=torch.int32, device=block_table.device)
                 block_table[:, 0].copy_(state_slots)
+        return block_tables, slot_mappings
+
+    def prepare_attn(self, input_batch):
+        """Use unique slot_positions for tree spec KV mapping; RoPE stays on positions."""
+        if self.pcp_manager is not None:
+            return self.pcp_manager.prepare_attn(input_batch)
+
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        slot_pos = getattr(input_batch, "slot_positions", None)
+        positions = slot_pos if slot_pos is not None else input_batch.positions
+        slot_mappings = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
         return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
@@ -678,6 +753,15 @@ class NPUModelRunner(GPUModelRunner):
         npu attention backends need seq_lens_cpu to work.
         so we need to copy num_computed_tokens back to cpu here.
         """
+        sampler = getattr(self, "rejection_sampler", None)
+        path_node_ids = getattr(sampler, "path_node_ids", None) if sampler is not None else None
+        if path_node_ids is not None and self.tree_kv_compact is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+
+            with tree_time("compact_kv_path"):
+                self.tree_kv_compact.run(idx_mapping, path_node_ids)
+            sampler.path_node_ids = None
+
         super().postprocess_sampled(
             idx_mapping,
             sampled_tokens,
@@ -761,19 +845,20 @@ class NPUModelRunner(GPUModelRunner):
             # topology between capture and replay.
             num_reqs_padded = descriptor_num_reqs
 
-        if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * self.decode_query_len:
-            # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
-            assert num_reqs <= num_reqs_padded
-
-            last_loc = query_start_loc_np[num_reqs]
+        # Host numpy. ``last_loc`` is the real scheduled token count.
+        last_loc = int(query_start_loc_np[num_reqs])
+        uniform_padded = num_tokens_padded == num_reqs_padded * self.decode_query_len
+        if has_uniform_decode_query_lens and uniform_padded:
+            # Each real request has decode_query_len tokens; pad extra dummy
+            # requests at that same width (e.g. 2×17 → 3×17).
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
-                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len + last_loc
+                np.arange(1, num_reqs_padded + 1 - num_reqs) * self.decode_query_len
+                + last_loc
             )
-        else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
-            assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
+        elif last_loc < num_tokens_padded:
+            # Short prefill (or mixed) padded to a decode-sized graph, e.g.
+            # 16 tokens → 17-token FULL gear. Treating that as uniform decode
+            # leaves actual_seq_q[-1]==16 while queryT==17 and FIA tiling dies.
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 

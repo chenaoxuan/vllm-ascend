@@ -200,20 +200,50 @@ class Compressor(nn.Module):
         state_metadata = metadata.state.req_metadata
         assert compressor_metadata is not None
         assert state_metadata is not None
-        compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
-        compressed_kv = torch.ops._C_ascend.compressor(
+        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+            chain_compressor_batch,
+        )
+
+        packed = chain_compressor_batch(
             hidden_states,
+            state_cache,
+            compressor_metadata.block_table,
+            state_metadata.block_table,
+            compressor_metadata.storage_block_size,
+            self.compress_ratio,
+            compressor_metadata,
+            get_dsa_attn_kv_plan(self.vllm_config).get_dsa_compressor_slot_mapping_format(),
+        )
+        if packed is None:
+            compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
+            hidden = hidden_states
+            state_bt = state_metadata.block_table
+            cu = compressor_metadata.query_start_loc
+            start = compressor_metadata.start_pos
+            state = state_cache
+        else:
+            compress_cos = packed["cos"]
+            compress_sin = packed["sin"]
+            slot_mapping = packed["slot"]
+            hidden = packed["hidden"]
+            state_bt = packed["state_bt"]
+            cu = packed["cu"]
+            start = packed["start"]
+            state = packed["state"]
+        compressed_kv = torch.ops._C_ascend.compressor(
+            hidden,
             self.wkv.weight,
             self.wgate.weight,
-            state_cache.squeeze(-2),
+            state.squeeze(-2),
             self.ape,
             self.norm.weight,
             compress_sin.view(-1, compress_sin.shape[-1]),
             compress_cos.view(-1, compress_cos.shape[-1]),
-            state_block_table=state_metadata.block_table,
-            cu_seqlens=compressor_metadata.query_start_loc,
+            state_block_table=state_bt,
+            cu_seqlens=cu,
             seqused=None,
-            start_pos=compressor_metadata.start_pos,
+            start_pos=start,
             rope_head_dim=self.rope_head_dim,
             cmp_ratio=self.compress_ratio,
             coff=2 if self.overlap else 1,

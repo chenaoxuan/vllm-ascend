@@ -552,22 +552,30 @@
 # ** 18. File: platform/patch_spec_decode_stats.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.spec_decode.metrics.SpecDecodingStats.observe_draft`
+#      `vllm.v1.core.sched.scheduler.Scheduler.schedule`
+#      vLLM-Ascend custom scheduler `schedule` overrides
 #    Why:
 #       Tree spec decode schedules ``budget`` draft nodes, which can exceed
 #       ``num_speculative_tokens`` (tree depth). Upstream ``observe_draft``
 #       indexes per-position lists of length ``num_speculative_tokens``, so
 #       ``budget > num_speculative_tokens`` raises IndexError in
-#       ``Scheduler.make_spec_decoding_stats``.
+#       ``Scheduler.make_spec_decoding_stats``. The scheduler also reserves
+#       ``1 + num_speculative_tokens`` query rows while the DSV4 beam worker
+#       verifies ``1 + budget`` rows, which desynchronizes scheduler output
+#       from worker input when the two widths differ.
 #    How：
 #       Replace ``observe_draft`` so scalar draft/accepted totals still count
 #       every node, while per-position updates clamp to the existing list
 #       length (chain-depth logging / Prometheus counters stay aligned).
+#       In eager mode, wrap each supported scheduler ``schedule`` entry so only
+#       new-request verify padding observes the DSV4 DSpark beam budget. Restore
+#       ``num_spec_tokens`` immediately, keep ``num_spec_tokens_to_schedule`` and
+#       async next-step placeholders at draft depth, and leave metrics unchanged.
 #    Related PR (if no, explain why):
 #       No, vllm-ascend tree spec; upstream stats assume chain drafts.
 #    Future Plan:
-#       Remove this patch when upstream ``observe_draft`` accepts
-#       ``num_draft_tokens > num_spec_tokens`` without growing per-pos
-#       vectors, or when tree spec is upstreamed with matching metrics.
+#       Remove this patch when upstream tree spec owns both scheduler query
+#       width and metrics for ``budget > num_speculative_tokens``.
 #
 # ** 19. File: platform/patch_speculative_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

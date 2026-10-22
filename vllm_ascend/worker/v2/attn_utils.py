@@ -214,7 +214,8 @@ def build_attn_metadata(
     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
     for_cudagraph_capture: bool = False,
     causal: bool | Mapping[int, bool] = True,
-    tree_visibility: torch.Tensor | None = None
+    tree_visibility: torch.Tensor | None = None,
+    slot_positions: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     # TODO(Ronald1995): optimize AscendCommonAttentionMetadata.
@@ -281,6 +282,7 @@ def build_attn_metadata(
             causal=group_causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
             tree_visibility=tree_visibility,
+            slot_positions=slot_positions,
             for_cudagraph_capture=for_cudagraph_capture,
             **common_attn_metadata_extra_kwargs,
         )
@@ -1194,19 +1196,23 @@ def build_attn_metadata_wrapper():
 
 
 @contextmanager
-def build_draft_attn_metadata_factory(positions, pad, is_prefilling):
+def build_draft_attn_metadata_factory(positions, pad, is_prefilling, seq_lens_np=None):
     """Wrap build_attn_metadata to forward rotary positions for the draft block.
 
     The generic (Ascend) ``build_attn_metadata`` reads ``positions`` inside the
     DSA/MLA ``build_decode_metadata`` for cos/sin, but the flat upstream
     speculator path does not forward them. Must run inside
-    ``build_attn_metadata_wrapper()``.
+    ``build_attn_metadata_wrapper()``. ``seq_lens_np`` overrides the
+    max_seq_len CPU fallback used by DSA when the upstream draft path
+    does not pass a host seq-len vector.
     """
     raw = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata  # cache
 
     def build_attn_metadata(*args, **kwargs):
         kwargs["positions"] = positions[:pad]
         kwargs["is_prefilling"] = is_prefilling
+        if seq_lens_np is not None:
+            kwargs["seq_lens_np"] = seq_lens_np
         return raw(*args, **kwargs)
 
     try:

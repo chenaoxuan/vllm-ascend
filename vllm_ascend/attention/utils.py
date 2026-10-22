@@ -325,6 +325,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
     tree_visibility: torch.Tensor | None = None
+    slot_positions: torch.Tensor | None = None
     for_cudagraph_capture: bool = False
 
     # TODO: Remove it when vLLM no longer uses this function.
@@ -383,6 +384,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             group_key_cache_idx=self.group_key_cache_idx,
             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
+            tree_visibility=_slice_reqs(self.tree_visibility),
+            slot_positions=self.slot_positions,
         )
 
 

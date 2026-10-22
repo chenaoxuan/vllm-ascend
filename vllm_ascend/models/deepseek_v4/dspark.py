@@ -215,30 +215,67 @@ class DeepseekV4DSparkModel(nn.Module):
         k_pe = _apply_dsv4_rope(attn.rotary_emb, positions, k_pe.unsqueeze(1)).squeeze(1)
         return torch.cat([k_nope, k_pe], dim=-1).view(-1, 1, attn.head_dim).contiguous()
 
+    def _iter_kv_cache_tensors(self, cache) -> typing.Iterator[torch.Tensor]:
+        if cache is None:
+            return
+        if torch.is_tensor(cache):
+            if cache.numel() > 0:
+                yield cache
+            return
+        if isinstance(cache, (list, tuple)):
+            for item in cache:
+                yield from self._iter_kv_cache_tensors(item)
+
+    def _store_paged_kv(
+        self,
+        shared_kv: torch.Tensor,
+        slot_mapping: torch.Tensor | None,
+        cache_module: nn.Module | None,
+    ) -> bool:
+        """Scatter projected KV into matching uncompressed paged cache tensors.
+
+        Skips compressor state (wrong layout) and caches whose per-token
+        numel does not match ``shared_kv``. Indexer modules may hold a tuple;
+        only tensors with the same per-token numel as ``shared_kv`` are written.
+        """
+        if slot_mapping is None or slot_mapping.numel() == 0 or cache_module is None:
+            return False
+        prefix = str(
+            getattr(cache_module, "prefix", "") or getattr(cache_module, "layer_name", "") or ""
+        )
+        cls_name = type(cache_module).__name__
+        if "state_cache" in prefix or cls_name.endswith("StateCache"):
+            return False
+        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
+
+        plan = get_dsa_attn_kv_plan(self.vllm_config)
+        wrote = False
+        src_numel = int(shared_kv[0].numel())
+        for cache in self._iter_kv_cache_tensors(getattr(cache_module, "kv_cache", None)):
+            if cache.ndim < 3:
+                continue
+            token_numel = 1
+            for dim in cache.shape[2:]:
+                token_numel *= int(dim)
+            if token_numel != src_numel:
+                continue
+            block_size = int(getattr(cache_module, "block_size", 0) or cache.shape[1])
+            slots = slot_mapping
+            if slots.ndim == 1:
+                slots = plan.format_dsa_slot_mapping(slots, block_size)
+            plan.dsa_kv_compress_scatter(cache, shared_kv, slots)
+            wrote = True
+        return wrote
+
     def _store_standard_swa_kv(
         self,
         shared_kv: torch.Tensor,
         slot_mapping: torch.Tensor | None,
         attn: type[nn.Module] | None = None,
-    ) -> None:
-        if slot_mapping is None or slot_mapping.numel() == 0:
-            return
-
-        assert attn is not None
-        swa_cache_layer = attn.dsa_attn.swa_cache_layer
-        swa_kv_cache = getattr(swa_cache_layer, "kv_cache", None)
-        if swa_kv_cache is None:
-            return
-        while isinstance(swa_kv_cache, (list, tuple)) and len(swa_kv_cache) == 1:
-            swa_kv_cache = swa_kv_cache[0]
-
-        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
-
-        if slot_mapping.ndim == 1:
-            slot_mapping = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
-                slot_mapping, swa_cache_layer.block_size
-            )
-        get_dsa_attn_kv_plan(self.vllm_config).dsa_kv_compress_scatter(swa_kv_cache, shared_kv, slot_mapping)
+    ) -> bool:
+        if attn is None:
+            return False
+        return self._store_paged_kv(shared_kv, slot_mapping, attn.dsa_attn.swa_cache_layer)
 
     def precompute_and_store_context_kv(
         self,
@@ -248,13 +285,39 @@ class DeepseekV4DSparkModel(nn.Module):
     ) -> None:
         if context_states.numel() == 0 or context_slot_mapping is None:
             return
-        for layer_idx, layer in enumerate(self.layers.values()):
-            layer_context_slot_mapping = None if context_slot_mapping is None else context_slot_mapping[layer_idx]
-            if context_positions.numel() == 0:
-                return
+        if context_positions.numel() == 0:
+            return
+        # DFlash builds this list in ``get_draft_kv_cache_layer_names`` order,
+        # which may not match ``layers.values()``. Pair by SWA prefix.
+        override = getattr(self, "_draft_kv_slots_by_name", None)
+        if override is not None:
+            slots_by_name = override
+        else:
+            slots_by_name = {
+                name: slots
+                for name, slots in zip(
+                    self.get_draft_kv_cache_layer_names(), context_slot_mapping
+                )
+            }
+        written_ptrs: set[int] = set()
+        for layer in self.layers.values():
+            prefix = str(layer.self_attn.dsa_attn.swa_cache_layer.prefix)
+            slots = slots_by_name.get(prefix)
             attn = layer.self_attn
-            shared_kv = self._project_shared_kv(context_states, context_positions, attn)
-            self._store_standard_swa_kv(shared_kv, layer_context_slot_mapping, attn)
+            ptr = -1
+            swa = attn.dsa_attn.swa_cache_layer
+            for cache in self._iter_kv_cache_tensors(getattr(swa, "kv_cache", None)):
+                if cache.numel() > 0:
+                    ptr = int(cache.data_ptr())
+                    break
+            skip_dup = ptr != -1 and ptr in written_ptrs
+            if slots is not None and not skip_dup:
+                shared_kv = self._project_shared_kv(
+                    context_states, context_positions, attn
+                )
+                wrote = self._store_standard_swa_kv(shared_kv, slots, attn)
+                if wrote and ptr != -1:
+                    written_ptrs.add(ptr)
 
     def forward(
         self,

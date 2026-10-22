@@ -1409,9 +1409,23 @@ def _get_default_max_cudagraph_capture_size(vllm_config: VllmConfig) -> int | No
         from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
         if dflash_tree_spec_enabled(vllm_config):
-            # apply_config_platform_defaults runs before init_ascend_config.
-            tree_cfg = getattr(vllm_config, "additional_config", None) or {}
-            decode_query_len = 1 + (tree_cfg.get("tree_spec_config") or {})["budget"]
+            from vllm_ascend.worker.v2.spec_decode import (
+                dsv4_dspark_draft,
+            )
+
+            if dsv4_dspark_draft(vllm_config):
+                tree_cfg = getattr(vllm_config, "additional_config", None) or {}
+                tree_spec = tree_cfg.get("tree_spec_config") or {}
+                spec_n = speculative_config.num_speculative_tokens
+                topk = int(tree_spec.get("topk") or 1)
+                if topk <= 1:
+                    decode_query_len = 1 + spec_n
+                else:
+                    decode_query_len = 1 + int(tree_spec.get("budget") or spec_n)
+            else:
+                # apply_config_platform_defaults runs before init_ascend_config.
+                tree_cfg = getattr(vllm_config, "additional_config", None) or {}
+                decode_query_len = 1 + (tree_cfg.get("tree_spec_config") or {})["budget"]
         else:
             decode_query_len = 1 + speculative_config.num_speculative_tokens
 

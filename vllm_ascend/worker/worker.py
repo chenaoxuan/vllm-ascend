@@ -507,8 +507,38 @@ class NPUWorker(WorkerBase):
             from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
 
             self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
+            runner_name = "v2"
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+            runner_name = "v1"
+        # #region agent log
+        try:
+            import importlib.util
+            import sys
+
+            mod = sys.modules.get("_agent_debug_trace")
+            if mod is None:
+                spec = importlib.util.spec_from_file_location(
+                    "_agent_debug_trace",
+                    "/home/specdec/spec260922/debug_trace.py",
+                )
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["_agent_debug_trace"] = mod
+                spec.loader.exec_module(mod)
+            mod.dbg(
+                "worker.py:init_device",
+                "runner",
+                {
+                    "runner": runner_name,
+                    "worker_rank": self.rank,
+                    "cls": type(self.model_runner).__name__,
+                },
+                "H1",
+                limit=4,
+            )
+        except Exception:
+            pass
+        # #endregion
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

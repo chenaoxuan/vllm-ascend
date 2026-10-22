@@ -5,6 +5,7 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout
 
 _PAD_TOKEN_ID = -1
@@ -177,6 +178,37 @@ def _pack_tree_target_logits(
         packed[i, :n] = logits[start : start + n]
     return packed
 
+def _limit_tree_to_verified_nodes(tree, input_batch):
+    """Rebuild links so rejection cannot walk into unscheduled node logits."""
+    n_req = input_batch.num_reqs
+    logits_cu = input_batch.cu_num_logits[:n_req + 1].detach().cpu().tolist()
+    query_cu = input_batch.query_start_loc[:n_req + 1].detach().cpu().tolist()
+    proposed = tree.num_nodes[:n_req].detach().cpu().tolist()
+    parents = tree.parents[:n_req].detach().cpu().tolist()
+    first = torch.full_like(tree.first_child, -1)
+    sibling = torch.full_like(tree.next_sibling, -1)
+    counts = []
+    for req in range(n_req):
+        n_logits = int(logits_cu[req + 1] - logits_cu[req])
+        n_query = int(query_cu[req + 1] - query_cu[req])
+        if n_logits != n_query or n_logits < 1:
+            raise RuntimeError("Tree verify must return one logit row per scheduled query")
+        count = min(int(proposed[req]), n_logits - 1)
+        counts.append(count)
+        children = [-1] * first.shape[1]
+        siblings = [-1] * sibling.shape[1]
+        for node in range(1, count + 1):
+            parent = int(parents[req][node - 1])
+            if not 0 <= parent < node:
+                raise RuntimeError("Scheduled tree prefix is not topologically ordered")
+            siblings[node] = children[parent]
+            children[parent] = node
+        first[req] = torch.tensor(children, dtype=first.dtype, device=first.device)
+        sibling[req] = torch.tensor(siblings, dtype=sibling.dtype, device=sibling.device)
+    tree.first_child = first
+    tree.next_sibling = sibling
+    tree.num_nodes = torch.tensor(counts, dtype=tree.num_nodes.dtype, device=tree.num_nodes.device)
+    return tree
 
 class TreeRejectionSampler(RejectionSampler):
     """Verify draft-tree tokens against target argmax token IDs."""
@@ -224,6 +256,12 @@ class TreeRejectionSampler(RejectionSampler):
         input_batch: InputBatch,
         draft_logits: torch.Tensor | None = None,
     ) -> SamplerOutput:
+        # topk=1 is a chain: verify against packed input_ids like DSpark,
+        # not first_child / greedy_tree_reject.
+        if get_ascend_config().tree_spec_config.topk <= 1:
+            self.path_node_ids = None
+            return super().__call__(logits, input_batch, draft_logits)
+
         tree = TreeLayout(
             tokens=input_batch.tree_tokens,
             depths=input_batch.tree_depths,
@@ -233,7 +271,10 @@ class TreeRejectionSampler(RejectionSampler):
             first_child=input_batch.tree_first_child,
             next_sibling=input_batch.tree_next_sibling,
         )
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
 
+        if chain_layout_active():
+            tree = _limit_tree_to_verified_nodes(tree, input_batch)
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
         num_reqs = input_batch.num_reqs
         node_dim = tree.tokens.shape[1] + 1

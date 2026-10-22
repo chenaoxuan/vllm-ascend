@@ -805,3 +805,10 @@ class ProfilingChunkScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
+
+_patch_tree_verify_width(ProfilingChunkScheduler)

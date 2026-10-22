@@ -89,6 +89,7 @@ class AscendInputBatch(InputBatch):
     tree_first_child: torch.Tensor | None = None
     tree_next_sibling: torch.Tensor | None = None
     slot_positions: torch.Tensor | None = None
+    path_node_ids: torch.Tensor | None = None
     # attn_state is used to build attention metadata.
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False

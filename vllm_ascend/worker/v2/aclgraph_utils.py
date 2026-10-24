@@ -135,6 +135,8 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.tree_full_graph_manager = None
+        self.tree_batch_shape = None
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
@@ -203,8 +205,47 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
 
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor:
+        if (
+            self._graphs_captured
+            and self.tree_full_graph_manager is not None
+            and self.tree_batch_shape == (num_reqs, num_tokens)
+            and num_active_loras == 0
+            and num_ubatches == 1
+        ):
+            # The final decode round can contain a truncated tree. Capture its
+            # exact shape lazily rather than silently dropping it into eager.
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                uniform_token_count=uniform_token_count,
+                max_query_len=max_query_len,
+            )
+        return super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len=max_query_len,
+            num_ubatches=num_ubatches,
+        )
+
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        if self.tree_full_graph_manager is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
+
+            if chain_layout_active():
+                return self.tree_full_graph_manager.run(desc)
         num_tokens = desc.num_tokens
         logger.info_once("run_fullgraph with num_tokens=%s", num_tokens)
         assert self.update_stream is not None
@@ -262,6 +303,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
+        from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
+
+        speculator = self.model_runner.speculator
+        if isinstance(speculator, AscendTreeSpeculator) and speculator.packed_dsv4_verify():
+            from vllm_ascend.worker.v2.spec_decode.tree.full_graph import TreeFullGraphManager
+
+            self.tree_full_graph_manager = TreeFullGraphManager(self.model_runner)
         model = ModelWithContext(model)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)
         if pcp_manager is not None:

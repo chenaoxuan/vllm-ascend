@@ -42,10 +42,21 @@ class NodeWorkspace:
 
 
 def node_workspace(module, plan):
+    from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
     owners = plan.setdefault("node_workspace_owners", set())
     if id(module) in owners:
         return NodeWorkspace()
     owners.add(id(module))
+    graph_workspaces = (cp._LAYOUT or {}).get("graph_workspaces")
+    if graph_workspaces is not None:
+        # Graph gears must retain their own addresses, including when an eager
+        # prefill or a different graph gear runs between two replays.
+        workspace = graph_workspaces.get(id(module))
+        if workspace is None:
+            workspace = graph_workspaces[id(module)] = NodeWorkspace()
+        workspace.buffers.reset()
+        return workspace
     workspace = module.__dict__.get("_tree_node_workspace")
     if workspace is None:
         workspace = NodeWorkspace()

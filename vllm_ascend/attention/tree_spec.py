@@ -203,7 +203,7 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
         if num_tokens <= 0:
             return None
         window = int(builder.model_config.hf_config.sliding_window)
-        return build_tree_ori_sparse_indices(
+        arguments = dict(
             block_table=builder.block_table,
             seq_lens=builder.seq_lens,
             query_start_loc=common_attn_metadata.query_start_loc[: common_attn_metadata.num_reqs + 1],
@@ -214,6 +214,16 @@ class DsaTreeSpecAdapter(TreeSpecAttnAdapter):
             storage_block_size=int(builder.storage_block_size),
             buffer=builder.tree_ori_indices_buffer,
         )
+        from vllm_ascend.worker.v2.spec_decode.tree import chain_pack
+
+        layout = chain_pack._LAYOUT
+        if layout is not None and layout.get("graph_requested", False):
+            # DSV4 FULL target capture records visibility/index construction
+            # before attention; host metadata preparation only binds inputs.
+            arguments["buffer"] = builder.tree_ori_indices_buffer[:num_tokens]
+            layout.setdefault("graph_tree_indices", []).append(arguments)
+            return arguments["buffer"]
+        return build_tree_ori_sparse_indices(**arguments)
 
 
 def _positions_to_slots(positions, block_table, req_ids, block_size):

@@ -121,7 +121,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._dsv4_dspark_draft = dsv4_dspark_draft(vllm_config)
         if self._dsv4_dspark_draft and self.topk > 1:
             if not vllm_config.model_config.enforce_eager:
-                raise ValueError("This V4 tree correctness patch requires --enforce-eager")
+                if not tree_cfg.node_pool or vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL:
+                    raise ValueError("DSV4 tree graph execution requires node_pool=True and FULL mode")
             parallel = vllm_config.parallel_config
             for name in (
                 "pipeline_parallel_size",
@@ -510,10 +511,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         is_profile: bool = False,
         dp_sync: Any = None,
     ) -> torch.Tensor:
+        from vllm_ascend.worker.v2.spec_decode.tree import chain_pack
         from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
             clear_tree_chain_layout,
         )
 
+        full_graph = (chain_pack._LAYOUT or {}).get("full_graph")
         clear_tree_chain_layout()
         try:
             path_node_ids = input_batch.path_node_ids
@@ -526,13 +529,19 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     self.packed_dsv4_verify()
                     or last_hidden_states.shape[0] >= path_node_ids.shape[0] * tree_q
                 ):
-                    compact_tree_query_along_path(
-                        tensors,
-                        input_batch.query_start_loc,
-                        path_node_ids,
-                        linearize_positions=input_batch.positions,
-                        num_sampled=num_sampled,
-                    )
+                    if full_graph is not None:
+                        full_graph.compact_queries(
+                            tensors, input_batch.query_start_loc, path_node_ids,
+                            input_batch.positions, num_sampled,
+                        )
+                    else:
+                        compact_tree_query_along_path(
+                            tensors,
+                            input_batch.query_start_loc,
+                            path_node_ids,
+                            linearize_positions=input_batch.positions,
+                            num_sampled=num_sampled,
+                        )
             self._tree_finalized = False
             # DSV4's HC inputs need width alignment. Qwen's combine_hidden_states
             # already projects target features to the fixed draft hidden width;
@@ -645,7 +654,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
         self._capture_tree_graphs()
-        if self.tree_kv_compact is not None:
+        if self.tree_kv_compact is not None and not self.packed_dsv4_verify():
             self.tree_kv_compact.capture(self._draft_capture_num_reqs())
 
     def _draft_capture_num_reqs(self) -> list[int]:
@@ -694,9 +703,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
 
     def _capture_tree_graphs(self) -> None:
-        # DSV4 retains its sequential chain and eager branching paths. This
-        # gate affects only tree construction, not draft-forward capture.
-        if self._dsv4_dspark_draft or self.tree_builder is None:
+        if (self._dsv4_dspark_draft and self.topk == 1) or self.tree_builder is None:
             return
         manager = self.query_cudagraph_manager
         if manager is None or not manager.needs_capture():
@@ -714,7 +721,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
 
         tree_vocab_size = (
             self.model.config.draft_vocab_size
-            if self.draft_backend == "dspark"
+            if self.draft_backend == "dspark" and not self._dsv4_dspark_draft
             else self.vocab_size
         )
         self.tree_builder.prepare_for_capture(
@@ -738,6 +745,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     "Captured tree ACLGraph method=%s num_reqs=%s", self.method, num_reqs
                 )
             except Exception as exc:
+                if self.packed_dsv4_verify():
+                    raise RuntimeError(f"DSV4 FULL tree construction capture failed for batch {num_reqs}") from exc
                 logger.warning(
                     "Tree ACLGraph capture failed for method=%s num_reqs=%s; "
                     "eager fallback for this size. %s",

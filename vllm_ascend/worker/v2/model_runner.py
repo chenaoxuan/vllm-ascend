@@ -384,6 +384,23 @@ class NPUModelRunner(GPUModelRunner):
                     self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
             super().profile_run()
 
+    def gather_batch_req_state(self, scheduler_output, dummy_run):
+        result = super().gather_batch_req_state(scheduler_output, dummy_run)
+        if not isinstance(self.speculator, AscendTreeSpeculator) or not self.speculator.packed_dsv4_verify():
+            return result
+        manager = self.cudagraph_manager
+        if manager is not None:
+            manager.tree_batch_shape = None
+            state, _ = result
+            if (
+                manager.tree_full_graph_manager is not None
+                and state is not None
+                and not state.has_prefill
+                and any(scheduler_output.scheduled_spec_decode_tokens.values())
+            ):
+                manager.tree_batch_shape = (len(state.req_ids), state.num_tokens)
+        return result
+
     def prepare_inputs(  # type: ignore[misc]
         self,
         scheduler_output: SchedulerOutput,
@@ -681,6 +698,7 @@ class NPUModelRunner(GPUModelRunner):
                     input_batch.req_ids, self.block_tables, self.kv_cache_config,
                 ),
             )
+            self.tree_verification_plan["graph_requested"] = batch_desc.cg_mode == CUDAGraphMode.FULL
         else:
             if is_v4_tree and input_batch.num_draft_tokens == 0:
                 # Ordinary sampling bypasses the tree rejection sampler. Let the
@@ -864,16 +882,21 @@ class NPUModelRunner(GPUModelRunner):
                     isinstance(spec, AscendTreeSpeculator)
                     and spec.packed_dsv4_verify()
                 ):
+                    from vllm_ascend.worker.v2.spec_decode.tree import chain_pack
                     from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
                         commit_winner,
                         prepare_winner,
                     )
 
-                    prepared = prepare_winner(path_node_ids, num_sampled)
-                    self.tree_kv_compact.run(idx_mapping, path_node_ids)
-                    commit_winner(
-                        path_node_ids, num_sampled, prepared=prepared,
-                    )
+                    full_graph = chain_pack._LAYOUT.get("full_graph")
+                    if full_graph is not None:
+                        full_graph.commit(idx_mapping, path_node_ids, num_sampled)
+                    else:
+                        prepared = prepare_winner(path_node_ids, num_sampled)
+                        self.tree_kv_compact.run(idx_mapping, path_node_ids)
+                        commit_winner(
+                            path_node_ids, num_sampled, prepared=prepared,
+                        )
                 else:
                     self.tree_kv_compact.run(idx_mapping, path_node_ids)
                 sampler.path_node_ids = None

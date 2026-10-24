@@ -210,14 +210,16 @@ def _build_plan(num_tokens: int, device) -> dict | None:
     destinations = torch.where(valid, cu[:-1].unsqueeze(1) + steps, padding).long()
     rows = torch.zeros(2 * capacity, dtype=torch.long, device=device)
     rows.scatter_(0, destinations.reshape(-1), torch.where(valid, ancestor_ids, 0).reshape(-1))
-    start = start.index_select(0, req_ids)
+    # FULL tree graphs read the current device prefixes on every replay.
+    start = layout.get("graph_prefixes", start).index_select(0, req_ids)
     _PLAN = {
         "n": n, "n_req": n_req, "req_cu": qsl, "max_depth": depth_limit,
         "req_ids": req_ids, "req_index": req_index, "prefixes": prefix_of,
         "depths": depths, "lens": lens, "ancestors": ancestor_ids,
         "parent_ids": parent_ids, "visibility": valid,
         "hidden_ids": hidden_ids,
-        "max_q": depth_limit + 1, "max_kv": max(prefixes) + depth_limit + 1,
+        "max_q": depth_limit + 1,
+        "max_kv": layout.get("graph_capacity", max(prefixes) + depth_limit + 1),
         "token_count": capacity, "rows": rows[:capacity], "cu": cu,
         "query_cu": torch.arange(n + 1, dtype=torch.int32, device=device),
         "end_rows": (cu[1:] - 1).long(), "start": start, "seqused": start + lens,

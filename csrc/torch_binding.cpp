@@ -3698,3 +3698,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_fused_sparse_attention_overlap);
 }
 #endif
+
+// Independent tree operator; shares the ACLNN adapter in this translation unit.
+#include "attention/sparse_attn_sharedkv_tree/torch_binding.h"

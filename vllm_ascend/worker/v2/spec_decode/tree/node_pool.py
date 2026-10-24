@@ -148,8 +148,13 @@ def compress_nodes(module, hidden, state, metadata):
 
 
 def attend_nodes(query, original, compressed, metadata, topk, sinks, ratio, window, scale):
-    from vllm_ascend.ops.triton.spec_decode.tree.node_attention import node_attention
+    from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
+    if get_ascend_config().tree_spec_config.attention_backend == "native":
+        from vllm_ascend.ops.triton.spec_decode.tree.native_attention import native_attention as node_attention
+    else:
+        from vllm_ascend.ops.triton.spec_decode.tree.node_attention import node_attention
 
     plan = cp._PLAN
     binding = plan["node_kv"][cp._key(compressed)]

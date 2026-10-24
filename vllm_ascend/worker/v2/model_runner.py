@@ -137,6 +137,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.update_stream = None
         self.tree_kv_compact = None
+        self.tree_verification_plan = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -160,6 +161,11 @@ class NPUModelRunner(GPUModelRunner):
             and self.speculator._dsv4_dspark_draft
             and self.speculator.topk == 1
             )
+        self.tree_host_metadata = None
+        if isinstance(self.speculator, AscendTreeSpeculator) and self.speculator.packed_dsv4_verify():
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import TreeHostMetadata
+
+            self.tree_host_metadata = TreeHostMetadata()
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
         self.req_states: AscendRequestState = AscendRequestState(
@@ -279,6 +285,18 @@ class NPUModelRunner(GPUModelRunner):
             self.req_states.tree_first_child[idx] = tree.first_child
             self.req_states.tree_next_sibling[idx] = tree.next_sibling
         return output
+
+    def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().add_requests(scheduler_output)
+        if self.tree_host_metadata is not None:
+            self.tree_host_metadata.add_requests(scheduler_output.scheduled_new_reqs)
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().update_requests(scheduler_output)
+        if self.tree_host_metadata is not None:
+            self.tree_host_metadata.update_requests(
+                scheduler_output.scheduled_cached_reqs, self.req_states.req_id_to_index,
+            )
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         super().load_model(load_dummy_weights, *args, **kwargs)
@@ -651,14 +669,17 @@ class NPUModelRunner(GPUModelRunner):
             and not batch_req_state.has_prefill
             and input_batch.num_draft_tokens > 0
         ):
-            active_idx = idx_mapping[:n_req]
-            set_tree_chain_layout(
+            self.tree_verification_plan = set_tree_chain_layout(
                 input_batch.tree_parents[:n_req],
                 input_batch.tree_num_nodes[:n_req],
                 input_batch.tree_depths[:n_req],
                 input_batch.query_start_loc[:n_req + 1],
-                self.req_states.num_computed_tokens.gpu[active_idx],
-                idx_mapping=active_idx,
+                query_start_loc_cpu=input_batch.query_start_loc_np[:n_req + 1],
+                start_pos_cpu=self.req_states.num_computed_tokens_np[idx_mapping_np[:n_req]],
+                max_depth=self.speculator.num_speculative_steps,
+                host_tables=self.tree_host_metadata.snapshot(
+                    input_batch.req_ids, self.block_tables, self.kv_cache_config,
+                ),
             )
         else:
             if is_v4_tree and input_batch.num_draft_tokens == 0:
@@ -666,6 +687,7 @@ class NPUModelRunner(GPUModelRunner):
                 # ordinary target path update root/prefill caches directly.
                 input_batch.tree_visibility = None
             clear_tree_chain_layout()
+            self.tree_verification_plan = None
 
         # vLLM #53515 / #15196 pass padded_num_tokens into PCP partition on main;
         # v0.28.0 maybe_partition_pcp_batch does not accept that kwarg.
@@ -837,29 +859,23 @@ class NPUModelRunner(GPUModelRunner):
             sampler = self.rejection_sampler
             path_node_ids = sampler.path_node_ids
             if path_node_ids is not None:
-                from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
+                spec = self.speculator
+                if (
+                    isinstance(spec, AscendTreeSpeculator)
+                    and spec.packed_dsv4_verify()
+                ):
+                    from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+                        commit_winner,
+                        prepare_winner,
+                    )
 
-                with tree_time("compact_kv_path"):
-                    spec = self.speculator
-                    if (
-                        isinstance(spec, AscendTreeSpeculator)
-                        and spec.packed_dsv4_verify()
-                    ):
-                        # Root is computed at P; accepted drafts continue at P+1.
-                        self.tree_kv_compact.run(idx_mapping, path_node_ids)
-                        from vllm_ascend.worker.v2.spec_decode.tree.kv_project import (
-                            move_accepted_compress_slots,
-                        )
-
-                        move_accepted_compress_slots(
-                            self,
-                            idx_mapping,
-                            path_node_ids,
-                            num_sampled,
-                            tree=getattr(self.speculator, "tree", None),
-                        )
-                    else:
-                        self.tree_kv_compact.run(idx_mapping, path_node_ids)
+                    prepared = prepare_winner(path_node_ids, num_sampled)
+                    self.tree_kv_compact.run(idx_mapping, path_node_ids)
+                    commit_winner(
+                        path_node_ids, num_sampled, prepared=prepared,
+                    )
+                else:
+                    self.tree_kv_compact.run(idx_mapping, path_node_ids)
                 sampler.path_node_ids = None
 
         super().postprocess_sampled(

@@ -27,6 +27,7 @@ import typing
 from dataclasses import dataclass
 
 import torch
+import torch_npu
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.config import CacheConfig, VllmConfig
@@ -214,6 +215,7 @@ class Compressor(nn.Module):
             self.compress_ratio,
             compressor_metadata,
             get_dsa_attn_kv_plan(self.vllm_config).get_dsa_compressor_slot_mapping_format(),
+            state_metadata=state_metadata,
         )
         if packed is None:
             compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
@@ -231,7 +233,55 @@ class Compressor(nn.Module):
             cu = packed["cu"]
             start = packed["start"]
             state = packed["state"]
-        compressed_kv = torch.ops._C_ascend.compressor(
+            depth_plan = packed["depth_batches"]
+            if depth_plan["batches"] is not None:
+                outputs = []
+                tokens = hidden.index_select(0, depth_plan["batches"][0]["tokens"])
+                for batch in depth_plan["batches"]:
+                    source, offsets = batch["copy_source"]
+                    if source.numel():
+                        # Device-only inheritance. Parents have finished on the
+                        # same stream. Negative indices skip inactive writes.
+                        torch_npu.npu_scatter_nd_update_(
+                            state, batch["copy_indices"], state[source, offsets]
+                        )
+                    outputs.append(
+                        self._compress(
+                            torch.where(batch["active"].unsqueeze(1), tokens, 0),
+                            state,
+                            batch["state_bt"],
+                            batch["cu"],
+                            batch["start"],
+                            batch["cos"],
+                            batch["sin"],
+                        )
+                    )
+                outputs.append(outputs[0].new_zeros((1, self.head_dim)))
+                compressed_kv = torch.cat(outputs).index_select(0, depth_plan["output_ids"])
+            else:
+                compressed_kv = self._compress(
+                    hidden.index_select(0, depth_plan["tokens"]),
+                    state, state_bt, depth_plan["cu"], start, compress_cos, compress_sin,
+                    seqused=depth_plan["seqused"],
+                )
+                compressed_kv = torch.where(depth_plan["output_valid"].unsqueeze(1), compressed_kv, 0)
+            return compressed_kv, slot_mapping
+        compressed_kv = self._compress(hidden, state, state_bt, cu, start, compress_cos, compress_sin)
+        return compressed_kv, slot_mapping
+
+    def _compress(
+        self,
+        hidden: torch.Tensor,
+        state: torch.Tensor,
+        state_bt: torch.Tensor,
+        cu: torch.Tensor,
+        start: torch.Tensor,
+        compress_cos: torch.Tensor,
+        compress_sin: torch.Tensor,
+        *,
+        seqused: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.ops._C_ascend.compressor(
             hidden,
             self.wkv.weight,
             self.wgate.weight,
@@ -242,7 +292,7 @@ class Compressor(nn.Module):
             compress_cos.view(-1, compress_cos.shape[-1]),
             state_block_table=state_bt,
             cu_seqlens=cu,
-            seqused=None,
+            seqused=seqused,
             start_pos=start,
             rope_head_dim=self.rope_head_dim,
             cmp_ratio=self.compress_ratio,
@@ -251,4 +301,3 @@ class Compressor(nn.Module):
             rotary_mode=2,
             cache_mode=1,
         )
-        return compressed_kv, slot_mapping

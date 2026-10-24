@@ -1,4 +1,3 @@
-from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -158,22 +157,19 @@ def expand_prefix_layer(
         from vllm_ascend.ops.triton.spec_decode.tree.prefix_expand import (
             expand_prefix_layer_triton,
         )
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
-
-        with tree_time_accum("build_expand_select"):
-            expand_prefix_layer_triton(
-                top_scores,
-                cand_ids,
-                path_scores,
-                frontier,
-                tokens,
-                depths,
-                parents,
-                selection_scratch,
-                live,
-                num_nodes,
-                child_depth,
-            )
+        expand_prefix_layer_triton(
+            top_scores,
+            cand_ids,
+            path_scores,
+            frontier,
+            tokens,
+            depths,
+            parents,
+            selection_scratch,
+            live,
+            num_nodes,
+            child_depth,
+        )
     else:
         _expand_prefix_layer_torch(
             top_scores,
@@ -186,7 +182,6 @@ def expand_prefix_layer(
             live=live,
             num_nodes=num_nodes,
             child_depth=child_depth,
-            timed=not force_torch,
         )
 
 
@@ -202,36 +197,31 @@ def _expand_prefix_layer_torch(
     live: int,
     num_nodes: int,
     child_depth: int,
-    timed: bool = True,
 ) -> None:
-    from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
-
-    ctx = tree_time_accum("build_expand_select") if timed else nullcontext()
-    with ctx:
-        num_reqs, width, _ = top_scores.shape
-        if live < width:
-            valid_parent = torch.arange(width, device=top_scores.device) < live
-            top_scores = torch.where(
-                valid_parent[None, :, None],
-                top_scores,
-                torch.full_like(top_scores, float("-inf")),
-            )
-        parent_scores = torch.gather(path_scores, 1, frontier)
-        cand_scores = parent_scores.unsqueeze(-1) + top_scores
-        flat = cand_scores.reshape(num_reqs, -1)
-        # Match Triton's score-descending, flat-index-ascending selection.
-        # torch.topk does not preserve index order on ties, which can change
-        # the retained parents (and Domino GRU states) between eager and replay.
-        sel = torch.argsort(flat, dim=-1, descending=True, stable=True)[:, :width]
-        vals = torch.gather(flat, 1, sel)
-        pos = sel // width
-        sel_tokens = torch.gather(cand_ids.reshape(num_reqs, -1), 1, sel)
-        sel_parents = torch.gather(frontier, 1, pos)
-        start = num_nodes + 1
-        tokens[:, num_nodes : num_nodes + width] = sel_tokens
-        depths[:, num_nodes : num_nodes + width] = child_depth
-        parents[:, start : start + width] = sel_parents
-        path_scores[:, start : start + width] = vals
+    num_reqs, width, _ = top_scores.shape
+    if live < width:
+        valid_parent = torch.arange(width, device=top_scores.device) < live
+        top_scores = torch.where(
+            valid_parent[None, :, None],
+            top_scores,
+            torch.full_like(top_scores, float("-inf")),
+        )
+    parent_scores = torch.gather(path_scores, 1, frontier)
+    cand_scores = parent_scores.unsqueeze(-1) + top_scores
+    flat = cand_scores.reshape(num_reqs, -1)
+    # Match Triton's score-descending, flat-index-ascending selection.
+    # torch.topk does not preserve index order on ties, which can change
+    # the retained parents (and Domino GRU states) between eager and replay.
+    sel = torch.argsort(flat, dim=-1, descending=True, stable=True)[:, :width]
+    vals = torch.gather(flat, 1, sel)
+    pos = sel // width
+    sel_tokens = torch.gather(cand_ids.reshape(num_reqs, -1), 1, sel)
+    sel_parents = torch.gather(frontier, 1, pos)
+    start = num_nodes + 1
+    tokens[:, num_nodes : num_nodes + width] = sel_tokens
+    depths[:, num_nodes : num_nodes + width] = child_depth
+    parents[:, start : start + width] = sel_parents
+    path_scores[:, start : start + width] = vals
 
 
 @dataclass
@@ -445,23 +435,20 @@ class PrefixTreeBuilder(TreeBuilder[PrefixScoreContext]):
     ) -> None:
         if isinstance(ctx, DFlashScoreContext):
             return
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time_accum
-
-        with nullcontext() if graph_safe else tree_time_accum("build_expand_gru"):
-            start = state.num_nodes + 1
-            # Selected parent IDs also cover layers before prefix correction
-            # starts, so every retained branch advances its GRU state.
-            selected_parents = state.parents[:, start : start + n_add]
-            parent_hidden = torch.gather(
-                ctx.hidden_states,
-                1,
-                selected_parents.unsqueeze(-1).expand(-1, -1, self.gru_hidden_dim),
-            )
-            child_hidden = ctx.scorer.update_hidden(
-                state.tokens[:, state.num_nodes : state.num_nodes + n_add].reshape(-1),
-                parent_hidden.reshape(-1, self.gru_hidden_dim),
-            ).reshape(state.tokens.shape[0], n_add, self.gru_hidden_dim)
-            ctx.hidden_states[:, start : start + n_add] = child_hidden
+        start = state.num_nodes + 1
+        # Selected parent IDs also cover layers before prefix correction
+        # starts, so every retained branch advances its GRU state.
+        selected_parents = state.parents[:, start : start + n_add]
+        parent_hidden = torch.gather(
+            ctx.hidden_states,
+            1,
+            selected_parents.unsqueeze(-1).expand(-1, -1, self.gru_hidden_dim),
+        )
+        child_hidden = ctx.scorer.update_hidden(
+            state.tokens[:, state.num_nodes : state.num_nodes + n_add].reshape(-1),
+            parent_hidden.reshape(-1, self.gru_hidden_dim),
+        ).reshape(state.tokens.shape[0], n_add, self.gru_hidden_dim)
+        ctx.hidden_states[:, start : start + n_add] = child_hidden
 
     def _select_nodes(
         self, state: TreeBuildState, ctx: PrefixScoreContext

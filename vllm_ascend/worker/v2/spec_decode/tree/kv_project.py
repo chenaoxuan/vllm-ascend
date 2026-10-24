@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 from vllm.logger import init_logger
 
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import (
@@ -55,8 +56,8 @@ def needs_causal_kv_repair(runner) -> bool:
 class TreeKvCompact:
     """Move accepted-path target KV from tree slots onto the linear prefix.
 
-    Verify wrote ori KV at packed ``prefix+node``. DSV4 sampled tokens
-    start at ``prefix+0`` (``dst_from_zero``). C4/indexer/state are
+    Verify wrote ori KV at packed ``prefix+node``. Accepted drafts
+    start at ``prefix+1``; the root remains at P. C4/indexer/state are
     compacted separately by the winning chain.
 
     Single-stream: ``run`` after target+reject and before
@@ -75,9 +76,7 @@ class TreeKvCompact:
         self.max_num_reqs = runner.max_num_reqs
         self._graphs: dict[int, object] = {}
         self._groups = None
-        self._held = None
-        self._held_keep = None
-        self._hold = False
+        self._binding_scratch = {}
         self._idx = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=self.device)
         self._path = torch.full(
             (self.max_num_reqs, self.spec_len),
@@ -88,8 +87,6 @@ class TreeKvCompact:
         self._depth = (
             torch.arange(self.spec_len, device=self.device, dtype=torch.int32) + 1
         )
-        self._depth0 = torch.arange(self.spec_len, device=self.device, dtype=torch.int32)
-        self._dst_off = self._depth
 
     def capture(self, sizes: list[int]) -> None:
         if not sizes or self.runner.model_config.enforce_eager:
@@ -102,7 +99,6 @@ class TreeKvCompact:
         self._bind_groups()
         self._idx.fill_(0)
         self._path.fill_(-1)
-        self._hold = False
         pool = current_platform.get_global_graph_pool()
         for num_reqs in sizes:
             try:
@@ -126,66 +122,18 @@ class TreeKvCompact:
         if dst_from_zero:
             raise ValueError("Tree KV compaction must preserve the root at prefix P")
         num_reqs = path_node_ids.shape[0]
+        if num_reqs > self.max_num_reqs or path_node_ids.shape[1] != self.spec_len:
+            raise RuntimeError("Accepted path exceeds KV compaction capacity")
         self._idx[:num_reqs].copy_(idx_mapping[:num_reqs])
         self._path[:num_reqs].copy_(path_node_ids[:num_reqs])
-        self._dst_off = self._depth
-        self._hold = False
-        self._held = None
-        self._held_keep = None
-        self._bind_groups(num_reqs)
-        if self.runner.model_config.enforce_eager:
-            self._compact_eager(num_reqs)
+        if num_reqs == 0:
             return
+        self._bind_groups(num_reqs)
         graph = self._graphs.get(num_reqs)
         if graph is not None:
             graph.replay()
         else:
             self._compact(num_reqs)
-
-    def _compact_eager(self, num_reqs: int) -> None:
-        indices = self._idx[:num_reqs].detach().cpu().tolist()
-        paths = self._path[:num_reqs].detach().cpu().tolist()
-        computed = self.runner.req_states.num_computed_tokens.gpu.detach().cpu().tolist()
-        request, source, destination = [], [], []
-        for req, row in zip(indices, paths):
-            req = int(req)
-            if req < 0:
-                continue
-            prefix = int(computed[req])
-            ended = False
-            for depth, value in enumerate(row, 1):
-                node = int(value)
-                if node == -1:
-                    ended = True
-                    continue
-                if ended or node <= 0:
-                    raise RuntimeError("Invalid accepted path in KV compaction")
-                src, dst = prefix + node, prefix + depth
-                if not 0 <= src < self.runner.max_model_len or not 0 <= dst < self.runner.max_model_len:
-                    raise RuntimeError("Accepted KV position exceeds model capacity")
-                request.append(req)
-                source.append(src)
-                destination.append(dst)
-        if not source:
-            return
-        req = torch.tensor(request, dtype=torch.long, device=self.device)
-        src = torch.tensor(source, dtype=torch.long, device=self.device)
-        dst = torch.tensor(destination, dtype=torch.long, device=self.device)
-        transfers = []
-        for caches, table, block_size, _ in self._groups:
-            src_col = torch.div(src, block_size, rounding_mode="floor")
-            dst_col = torch.div(dst, block_size, rounding_mode="floor")
-            if bool(((src_col >= table.shape[1]) | (dst_col >= table.shape[1])).any().item()):
-                raise RuntimeError("Accepted KV page exceeds block-table capacity")
-            src_block, dst_block = table[req, src_col], table[req, dst_col]
-            if bool(((src_block <= 0) | (dst_block <= 0)).any().item()):
-                raise RuntimeError("Accepted KV path references an unallocated/null page")
-            src_off, dst_off = src % block_size, dst % block_size
-            for cache in caches:
-                transfers.append((cache, dst_block, dst_off, cache[src_block, src_off].clone()))
-        # All gathers precede all writes, including when cache views alias.
-        for cache, block, offset, values in transfers:
-            cache[block, offset] = values
 
     def _bind_groups(self, num_reqs=None) -> None:
         # dspark-ori-binding-fix:v1
@@ -211,7 +159,7 @@ class TreeKvCompact:
                 if layer is None:
                     continue
                 for tensor in iter_unique_kv_cache_tensors(getattr(layer, "kv_cache", None)):
-                    key = (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
+                    key = (group_id, tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -229,70 +177,75 @@ class TreeKvCompact:
                     block_size,
                     gathers,
                 ))
-        if getattr(speculator, "packed_dsv4_verify", lambda: False)() and not groups:
-            raise RuntimeError("No target original-KV cache was bound for V4 tree compaction")
         self._groups = groups
 
     def _compact(self, num_reqs: int) -> None:
         if not self._groups:
-            self._held = None
-            self._held_keep = None
             return
         idx = self._idx[:num_reqs]
         path = self._path[:num_reqs]
         num_computed = self.runner.req_states.num_computed_tokens.gpu
         nslot = num_reqs * self.spec_len
-        safe_idx = idx.clamp(min=0)
+        live_req = (idx >= 0) & (idx < num_computed.shape[0])
+        safe_idx = idx.clamp(0, num_computed.shape[0] - 1).long()
         prefix = num_computed[safe_idx]
-        dst_pos = prefix.unsqueeze(1) + self._dst_off
+        dst_pos = prefix.unsqueeze(1) + self._depth
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
-        valid = (path >= 0) & (idx >= 0).unsqueeze(1)
-        src_pos = torch.where(valid, src_pos, dst_pos)
+        present = path != -1
+        valid = present & live_req.unsqueeze(1)
         max_pos = self.runner.max_model_len - 1
-        dst_pos = dst_pos.clamp(max=max_pos)
-        src_pos = src_pos.clamp(max=max_pos)
+        in_range = (src_pos >= 0) & (src_pos <= max_pos) & (dst_pos >= 0) & (dst_pos <= max_pos)
+        valid &= in_range
+        dst_pos = dst_pos.clamp(0, max_pos)
+        src_pos = src_pos.clamp(0, max_pos)
         req_f = safe_idx.unsqueeze(1).expand(num_reqs, self.spec_len)
-        hold = self._hold
-        held = []
+        transfers = {}
         for caches, block_table, block_size, gathers in self._groups:
             max_block = block_table.shape[1] - 1
-            src_bi = torch.div(src_pos, block_size, rounding_mode="floor").clamp(
-                min=0, max=max_block
-            )
-            dst_bi = torch.div(dst_pos, block_size, rounding_mode="floor").clamp(
-                min=0, max=max_block
-            )
-            src_block = block_table[req_f, src_bi]
-            dst_block = block_table[req_f, dst_bi]
+            src_bi = torch.div(src_pos, block_size, rounding_mode="floor")
+            dst_bi = torch.div(dst_pos, block_size, rounding_mode="floor")
+            columns_valid = (src_bi <= max_block) & (dst_bi <= max_block)
+            src_block = block_table[req_f, src_bi.clamp(max=max_block)]
+            dst_block = block_table[req_f, dst_bi.clamp(max=max_block)]
             src_flat = (src_block * block_size + src_pos % block_size).to(
                 dtype=torch.long
             ).reshape(-1)
             dst_flat = (dst_block * block_size + dst_pos % block_size).to(
                 dtype=torch.long
             ).reshape(-1)
-            dst_keep = dst_flat.clone() if hold else None
             for cache, gather in zip(caches, gathers):
-                tail = cache.shape[2:]
-                flat = cache.reshape(cache.shape[0] * cache.shape[1], *tail)
-                scratch = gather[:nslot]
-                torch.index_select(flat, 0, src_flat, out=scratch)
-                flat.index_copy_(0, dst_flat, scratch)
-                if hold:
-                    held.append((cache, scratch, dst_keep))
-        self._held = held if hold else None
-        self._held_keep = valid.reshape(-1) if hold else None
+                pages_valid = (
+                    (src_block > 0) & (dst_block > 0)
+                    & (src_block < cache.shape[0]) & (dst_block < cache.shape[0])
+                )
+                keep = (valid & columns_valid & pages_valid).reshape(-1)
+                # Gather every cache/view before any target write, including
+                # different live mappings of the same physical storage.
+                scratch = gather[:nslot].view(torch.int8)
+                safe_src = src_flat.clamp(0, cache.shape[0] * block_size - 1)
+                scratch.copy_(cache.view(torch.int8)[safe_src // block_size, safe_src % block_size])
+                key = (cache.data_ptr(), tuple(cache.shape), tuple(cache.stride()), cache.dtype)
+                transfer = transfers.setdefault(key, (cache, [], [], []))
+                transfer[1].append(dst_flat)
+                transfer[2].append(scratch)
+                transfer[3].append(keep)
 
+        writes = []
+        for cache, destinations, values, masks in transfers.values():
+            dest = torch.cat(destinations)
+            keep = torch.cat(masks)
+            # Invalid rows sort after real slots. Keep one writer per live slot.
+            dest = torch.where(keep, dest, cache.shape[0] * cache.shape[1])
+            dest, order = dest.sort()
+            keep = keep[order]
+            data = torch.cat(values).contiguous().view(torch.int8).index_select(0, order)
+            duplicate = torch.zeros_like(keep)
+            duplicate[1:] = keep[1:] & keep[:-1] & (dest[1:] == dest[:-1])
+            writes.append((cache, dest, data, keep & ~duplicate))
 
-def move_accepted_compress_slots(
-    runner, idx_mapping, path_node_ids, num_sampled, tree=None,
-):
-    from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import commit_winner
-
-    if path_node_ids is None or num_sampled is None:
-        raise RuntimeError("Missing V4 tree verification result")
-    return commit_winner(
-        path_node_ids,
-        num_sampled=num_sampled,
-        idx_mapping=idx_mapping,
-    )
-
+        for cache, dest, data, keep in writes:
+            indices = torch.stack((dest // cache.shape[1], dest % cache.shape[1]), dim=1)
+            indices = torch.where(keep.unsqueeze(1), indices, -1)
+            # Same fixed [-1, -1] padding contract used by DSA cache scatter.
+            # Byte transport retains FP8 payloads and signed zero exactly.
+            torch_npu.npu_scatter_nd_update_(cache.view(torch.int8), indices, data)

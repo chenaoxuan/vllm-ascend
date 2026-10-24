@@ -179,35 +179,29 @@ def _pack_tree_target_logits(
     return packed
 
 def _limit_tree_to_verified_nodes(tree, input_batch):
-    """Rebuild links so rejection cannot walk into unscheduled node logits."""
+    """Clip each topological prefix on device, preserving reverse sibling order."""
     n_req = input_batch.num_reqs
-    logits_cu = input_batch.cu_num_logits[:n_req + 1].detach().cpu().tolist()
-    query_cu = input_batch.query_start_loc[:n_req + 1].detach().cpu().tolist()
-    proposed = tree.num_nodes[:n_req].detach().cpu().tolist()
-    parents = tree.parents[:n_req].detach().cpu().tolist()
+    logits_cu = input_batch.cu_num_logits[:n_req + 1]
+    query_cu = input_batch.query_start_loc[:n_req + 1]
+    n_logits = logits_cu[1:] - logits_cu[:-1]
+    n_query = query_cu[1:] - query_cu[:-1]
+    counts = torch.minimum(tree.num_nodes[:n_req], torch.minimum(n_logits, n_query) - 1).clamp(min=0)
     first = torch.full_like(tree.first_child, -1)
     sibling = torch.full_like(tree.next_sibling, -1)
-    counts = []
-    for req in range(n_req):
-        n_logits = int(logits_cu[req + 1] - logits_cu[req])
-        n_query = int(query_cu[req + 1] - query_cu[req])
-        if n_logits != n_query or n_logits < 1:
-            raise RuntimeError("Tree verify must return one logit row per scheduled query")
-        count = min(int(proposed[req]), n_logits - 1)
-        counts.append(count)
-        children = [-1] * first.shape[1]
-        siblings = [-1] * sibling.shape[1]
-        for node in range(1, count + 1):
-            parent = int(parents[req][node - 1])
-            if not 0 <= parent < node:
-                raise RuntimeError("Scheduled tree prefix is not topologically ordered")
-            siblings[node] = children[parent]
-            children[parent] = node
-        first[req] = torch.tensor(children, dtype=first.dtype, device=first.device)
-        sibling[req] = torch.tensor(siblings, dtype=sibling.dtype, device=sibling.device)
+    for slot in range(tree.parents.shape[1]):
+        node = slot + 1
+        parent = tree.parents[:n_req, slot].long()
+        valid = node <= counts
+        ordered = (parent >= 0) & (parent < node)
+        # Clamp the gather index and keep invalid nodes out of the links.
+        parent = parent.clamp(0, slot).unsqueeze(1)
+        previous = first[:n_req].gather(1, parent)
+        active = (valid & ordered).unsqueeze(1)
+        sibling[:n_req, node] = torch.where(active[:, 0], previous[:, 0], -1)
+        first[:n_req].scatter_(1, parent, torch.where(active, node, previous))
     tree.first_child = first
     tree.next_sibling = sibling
-    tree.num_nodes = torch.tensor(counts, dtype=tree.num_nodes.dtype, device=tree.num_nodes.device)
+    tree.num_nodes = counts.to(tree.num_nodes.dtype)
     return tree
 
 class TreeRejectionSampler(RejectionSampler):
@@ -289,16 +283,13 @@ class TreeRejectionSampler(RejectionSampler):
         path_node_ids = self._path_node_ids_buf[:num_reqs]
         path_node_ids.fill_(-1)
         sampled_buf = self._sampled_buf[:num_reqs]
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
-
-        with tree_time("rejection_sample"):
-            sampled = greedy_tree_reject(
-                tree,
-                target_logits,
-                self.num_speculative_steps,
-                path_node_ids=path_node_ids,
-                sampled_token_ids=sampled_buf,
-            )
+        sampled = greedy_tree_reject(
+            tree,
+            target_logits,
+            self.num_speculative_steps,
+            path_node_ids=path_node_ids,
+            sampled_token_ids=sampled_buf,
+        )
         num_sampled = (sampled != _PAD_TOKEN_ID).sum(dim=-1).to(dtype=torch.int32)
         cu = input_batch.cu_num_logits[: num_reqs + 1]
         num_logits = (cu[1:] - cu[:-1]).to(dtype=num_sampled.dtype)
@@ -307,8 +298,9 @@ class TreeRejectionSampler(RejectionSampler):
             < self.sampler.req_states.prefill_len.gpu[input_batch.idx_mapping[:num_reqs]]
         )
         zero = num_sampled.new_zeros(())
-        num_sampled = torch.where(is_chunked, zero, num_sampled)
-        num_rejected = torch.where(is_chunked, zero, num_logits - num_sampled)
+        no_sample = is_chunked | (num_logits == 0)
+        num_sampled = torch.where(no_sample, zero, num_sampled)
+        num_rejected = torch.where(no_sample, zero, num_logits - num_sampled)
         # Chunked prefills zero num_sampled; keep those path rows at -1 so
         # KV compact / propose() do not scramble linear prefill state.
         path_node_ids = path_node_ids.masked_fill(

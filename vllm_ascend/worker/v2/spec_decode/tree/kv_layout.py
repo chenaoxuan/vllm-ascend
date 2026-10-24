@@ -1,4 +1,5 @@
 import torch
+import torch_npu
 
 
 # Cached arange / column buffers keyed by device (grow on demand).
@@ -56,6 +57,8 @@ def compact_tree_query_along_path(
     query_start_loc: torch.Tensor,
     path_node_ids: torch.Tensor,
     linearize_positions: torch.Tensor,
+    *,
+    num_sampled: torch.Tensor | None = None,
 ) -> None:
     """Move accepted-path query rows onto the linear prefix of each request.
 
@@ -63,8 +66,8 @@ def compact_tree_query_along_path(
     ``query_start_loc`` is ``[num_reqs + 1]`` (device). Each tensor in
     ``tensors`` is token-major ``[num_tokens, ...]`` (hidden / aux). Root is
     query offset 0; draft node ``node_id`` is offset ``node_id``. Invalid path
-    slots are no-ops (src = dst). Gather clones before scatter so overlapping
-    src/dst rows stay correct.
+    slots use negative scatter indices. Gather every view before scatter so
+    overlapping src/dst rows and aliased hidden-state views stay correct.
 
     ``linearize_positions`` is ``[num_tokens]`` (device). Destination rows
     become ``root_pos + 0..k`` rather than packed RoPE (siblings may share a
@@ -86,65 +89,32 @@ def compact_tree_query_along_path(
         _valid_root_col, num_reqs, node.device, torch.bool, True
     )
     valid = torch.cat([valid_root, node >= 0], dim=1)
+    if num_sampled is not None:
+        valid &= (num_sampled[:num_reqs] > 0).unsqueeze(1)
     src_off = torch.where(valid, src_off, dst_off)
     src_idx = qsl.unsqueeze(1) + src_off
     dst_idx = qsl.unsqueeze(1) + dst_off
-    # Truncated near max_seq_len can be 16 tokens on a 17-token graph while
-    # path_node_ids still hold full-tree ids (e.g. 19). Stay in-bounds.
+    # Each request can have fewer scheduled rows near its output limit.
     n_tok = tensors[0].shape[0]
     last = n_tok - 1
-    in_bound = (src_idx >= 0) & (src_idx <= last) & (dst_idx >= 0) & (dst_idx <= last)
+    end = query_start_loc[1:num_reqs + 1].to(torch.long).unsqueeze(1)
+    in_bound = ((src_idx >= qsl.unsqueeze(1)) & (src_idx < end)
+                & (dst_idx >= qsl.unsqueeze(1)) & (dst_idx < end)
+                & (src_idx <= last) & (dst_idx <= last))
     valid = valid & in_bound
-    safe_dst = dst_idx.clamp(min=0, max=last)
-    src_idx = torch.where(valid, src_idx, safe_dst)
-    dst_idx = safe_dst
+    src_idx = src_idx.clamp(0, last).reshape(-1)
+    # Valid destinations occupy disjoint request intervals. Padding cannot
+    # overwrite another request's root or share a writable sentinel row.
+    destination = torch.where(valid, dst_idx, -1).reshape(-1, 1)
+    updates = []
     for tensor in tensors:
-        gathered = tensor[src_idx].clone()
-        tensor[dst_idx] = gathered
+        view = tensor.view(torch.int8)
+        updates.append((view, view.index_select(0, src_idx)))
     base = linearize_positions[qsl.clamp(min=0, max=last)].unsqueeze(1)
-    new_pos = base + dst_off.to(dtype=linearize_positions.dtype)
-    cur = linearize_positions[dst_idx]
-    linearize_positions[dst_idx] = torch.where(valid, new_pos, cur)
-
-def compact_tree_query_along_path_eager(
-    tensors, query_start_loc, path_node_ids, linearize_positions,
-):
-    """Compact only real accepted rows; supports unequal request query lengths."""
-    paths = path_node_ids.detach().cpu().tolist()
-    qsl = query_start_loc[:len(paths) + 1].detach().cpu().tolist()
-    source, destination, roots, depths = [], [], [], []
-    for req, row in enumerate(paths):
-        begin, end = int(qsl[req]), int(qsl[req + 1])
-        accepted, ended = [], False
-        for value in row:
-            node = int(value)
-            if node == -1:
-                ended = True
-            elif ended or node <= 0:
-                raise RuntimeError("Invalid accepted-path padding/node ID")
-            else:
-                accepted.append(node)
-        for depth, node in enumerate([0] + accepted):
-            src, dst = begin + node, begin + depth
-            if not begin <= src < end or not begin <= dst < end:
-                raise RuntimeError("Accepted path exceeds this request's query rows")
-            source.append(src)
-            destination.append(dst)
-            roots.append(begin)
-            depths.append(depth)
-    if not source:
-        return
-    device = path_node_ids.device
-    src = torch.tensor(source, dtype=torch.long, device=device)
-    dst = torch.tensor(destination, dtype=torch.long, device=device)
-    root = torch.tensor(roots, dtype=torch.long, device=device)
-    depth = torch.tensor(depths, dtype=linearize_positions.dtype, device=device)
-    # Gather every tensor first: last_hidden_states and auxiliary states may alias.
-    updates = [(tensor, tensor.index_select(0, src)) for tensor in tensors]
-    positions = linearize_positions.index_select(0, root) + depth
-    for tensor, gathered in updates:
-        tensor.index_copy_(0, dst, gathered)
-    linearize_positions.index_copy_(0, dst, positions)
+    positions = (base + dst_off.to(linearize_positions.dtype)).reshape(-1)
+    for view, gathered in updates:
+        torch_npu.npu_scatter_nd_update_(view, destination, gathered)
+    torch_npu.npu_scatter_nd_update_(linearize_positions, destination, positions)
 
 
 def mask_rejected_dflash_context_slots(

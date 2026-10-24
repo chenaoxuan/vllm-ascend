@@ -1098,7 +1098,7 @@ class TreeSpecConfig:
     budget: int | None = None
     topk: int | None = None
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # When true, print segment timings at process exit.
+    # Legacy configuration key; the synchronizing tree timer has been removed.
     enable_timer: bool = False
     enable_triton: bool = True
 

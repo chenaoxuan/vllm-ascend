@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import ClassVar, Generic, TypeVar
 
@@ -174,7 +173,7 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
 
         ``frontier`` already identifies the next layer; ``num_nodes`` still
         marks the start of the appended slice. The shared loop increments it
-        after this hook. Graph-safe updates must not introduce timer syncs.
+        after this hook. Updates must remain on device for graph capture.
         """
 
     @abstractmethod
@@ -198,72 +197,60 @@ class TreeBuilder(ABC, Generic[ScoreContextT]):
         """Expand logits below the supplied roots into ``out``.
 
         ``root_token_ids`` contains one target-vocabulary token per request.
-        Graph-safe builds skip timers and Triton; Domino also needs the draft
+        Graph-safe builds skip Triton; Domino also needs the draft
         hidden states used to produce these logits.
         """
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import (
-            tree_time,
-            tree_time_accum,
-            tree_time_accum_flush,
-        )
-
         num_reqs, spec_num, vocab = draft_logits.shape
         width = self._beam_width(vocab)
         capacity = self._pool_capacity(width, spec_num)
-        with nullcontext() if graph_safe else tree_time("build_precompute"):
-            self._ensure_scratch(
-                num_reqs,
-                vocab,
-                spec_num,
-                draft_logits.device,
-            )
-            state = TreeBuildState(
-                tokens=self._tokens_buf[:num_reqs, :capacity],
-                depths=self._depths_buf[:num_reqs, :capacity],
-                parents=self._parents_buf[:num_reqs, : capacity + 1],
-                path_scores=self._path_scores_buf[:num_reqs, : capacity + 1],
-                frontier=self._frontier_buf[:num_reqs, :width],
-                width=width,
-            )
-            state.tokens.fill_(-1)
-            state.depths.zero_()
-            state.parents.zero_()
-            state.path_scores.zero_()
-            state.frontier.zero_()
-            ctx = self._prepare_scores(state, draft_logits, root_token_ids, draft_hidden)
+        self._ensure_scratch(
+            num_reqs,
+            vocab,
+            spec_num,
+            draft_logits.device,
+        )
+        state = TreeBuildState(
+            tokens=self._tokens_buf[:num_reqs, :capacity],
+            depths=self._depths_buf[:num_reqs, :capacity],
+            parents=self._parents_buf[:num_reqs, : capacity + 1],
+            path_scores=self._path_scores_buf[:num_reqs, : capacity + 1],
+            frontier=self._frontier_buf[:num_reqs, :width],
+            width=width,
+        )
+        state.tokens.fill_(-1)
+        state.depths.zero_()
+        state.parents.zero_()
+        state.path_scores.zero_()
+        state.frontier.zero_()
+        ctx = self._prepare_scores(state, draft_logits, root_token_ids, draft_hidden)
 
         for depth_slot in range(spec_num):
-            with nullcontext() if graph_safe else tree_time_accum("build_expand_score"):
-                top_scores, cand_ids = self._score_layer(state, ctx, depth_slot)
+            top_scores, cand_ids = self._score_layer(state, ctx, depth_slot)
             state.frontier, num_added = self._expand_layer(
                 state, ctx, top_scores, cand_ids, depth_slot + 1, graph_safe
             )
             self._update_state(state, ctx, num_added, graph_safe=graph_safe)
             state.num_nodes += num_added
 
-        if not graph_safe:
-            tree_time_accum_flush()
-        with nullcontext() if graph_safe else tree_time("build_prune"):
-            kept_ids = self._select_nodes(state, ctx)
-            num_nodes = state.num_nodes
-            if kept_ids is None:
-                tokens = state.tokens[:, :num_nodes]
-                depths = state.depths[:, :num_nodes]
-                parent_ids = state.parents[:, 1 : num_nodes + 1]
-            else:
-                tokens = torch.gather(state.tokens, 1, kept_ids - 1)
-                depths = torch.gather(state.depths, 1, kept_ids - 1)
-                old_parents = torch.gather(state.parents, 1, kept_ids)
-                old_to_new = self._old_to_new_buf[:num_reqs, : num_nodes + 1]
-                old_to_new.zero_()
-                num_nodes = kept_ids.shape[1]
-                new_ids = self._budget_ids[:num_nodes].unsqueeze(0)
-                old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, -1))
-                parent_ids = torch.gather(old_to_new, 1, old_parents)
-        with nullcontext() if graph_safe else tree_time("build_finalize_layout"):
-            return finalize_tree_layout(
-                out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe
-            )
+        kept_ids = self._select_nodes(state, ctx)
+        num_nodes = state.num_nodes
+        if kept_ids is None:
+            tokens = state.tokens[:, :num_nodes]
+            depths = state.depths[:, :num_nodes]
+            parent_ids = state.parents[:, 1 : num_nodes + 1]
+        else:
+            tokens = torch.gather(state.tokens, 1, kept_ids - 1)
+            depths = torch.gather(state.depths, 1, kept_ids - 1)
+            old_parents = torch.gather(state.parents, 1, kept_ids)
+            old_to_new = self._old_to_new_buf[:num_reqs, : num_nodes + 1]
+            old_to_new.zero_()
+            num_nodes = kept_ids.shape[1]
+            new_ids = self._budget_ids[:num_nodes].unsqueeze(0)
+            old_to_new.scatter_(1, kept_ids, new_ids.expand(num_reqs, -1))
+            parent_ids = torch.gather(old_to_new, 1, old_parents)
+        return finalize_tree_layout(
+            out, tokens, depths, parent_ids, num_nodes, force_torch=graph_safe
+        )
 
 
 def validate_tree_method_backend(method: str, draft_backend: str) -> None:

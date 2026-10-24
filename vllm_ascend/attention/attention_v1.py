@@ -1815,35 +1815,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         TND + sparse_mode=1 does not honor batched custom masks (FIA TND only
         documents sparse 0/3). DCP spec decode uses BSND for the same reason.
         """
-        from vllm_ascend.worker.v2.spec_decode.tree.timer import tree_time
-
-        with tree_time("target_fia_forward"):
-            return self._forward_tree_decode_fia_impl(
-                query,
-                key,
-                value,
-                current_value,
-                block_size,
-                block_table,
-                attn_metadata,
-                actual_seq_lengths_kv,
-                num_tokens,
-                num_decodes,
-            )
-
-    def _forward_tree_decode_fia_impl(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        current_value: torch.Tensor,
-        block_size: int,
-        block_table: torch.Tensor | None,
-        attn_metadata: AscendMetadata,
-        actual_seq_lengths_kv,
-        num_tokens: int,
-        num_decodes: int,
-    ) -> torch.Tensor:
         bsnd = self._tree_fia_bsnd_shape(num_tokens, num_decodes)
         use_bsnd = block_table is not None and bsnd is not None
         if use_bsnd:

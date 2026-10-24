@@ -2312,8 +2312,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         # dspark-ori-binding-fix:v1
         if chain_layout_active():
             from vllm_ascend.worker.v2.spec_decode.tree.kv_binding import record_original_kv
-            record_original_kv(
-                layer_name, swa_kv_cache, swa_req_metadata, hidden_states.shape[0])
+            record_original_kv(layer_name, swa_kv_cache, swa_req_metadata)
         has_prefill = common_attn_metadata.num_prefills > 0
         num_tokens = hidden_states.shape[0]
         cos = common_metadata.cos[layer_name][:num_tokens]
@@ -2439,6 +2438,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 chain_attention_view,
                 chain_length_cus,
                 lookup_kv_table,
+                select_tree_queries,
+                tree_query_metadata,
             )
             chain_packed = False
             n_orig = int(q.shape[0])
@@ -2448,12 +2449,13 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     swa_req_metadata.block_table,
                     int(swa_req_metadata.storage_block_size),
                     int(self.window_size),
+                    req_metadata=swa_req_metadata,
                 )
                 cmp_bt = lookup_kv_table(compress_kv_cache)
                 if view is not None and cmp_bt is not None:
-                    # One launch. Operators see only the inner cu: segment k is chain k.
-                    # Query lengths are cu_seqlens_q. KV lengths are seqused_kv and the
-                    # matching ori/cmp cu. Every tree node is in this batch.
+                    # Each segment has the terminal query and its complete branch KV.
+                    # Right-aligned causal/window masks therefore retain the same
+                    # logical position as the last query of the original chain.
                     win_left = int(self.window_size) - 1
                     cmp_ratio = 4 if self.compress_ratio == 4 else 128
                     cmp_topk = (
@@ -2463,41 +2465,46 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     )
                     seqused = view["seqused"]
                     ori_cu, cmp_cu = chain_length_cus(seqused, cmp_ratio)
-                    segs = view["cu"][1:] - view["cu"][:-1]
-                    max_q = int(segs.max().item()) if segs.numel() else 1
-                    max_kv = int(seqused.max().item())
+                    max_q = view["max_q"]
+                    max_kv = view["max_kv"]
                     n_q = int(seqused.shape[0])
                     n_orig = int(q.shape[0])
-                    from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import pack_chain_tokens
-
-                    q = pack_chain_tokens(q)
+                    q = select_tree_queries(q)
                     chain_packed = True
                     metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
                     metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(q.device)
-                    sas = metadata_op(
-                        **metadata_kwargs,
-                        num_heads_q=self.n_local_heads,
-                        num_heads_kv=1,
-                        head_dim=self.head_dim,
-                        cu_seqlens_q=view["cu"],
-                        cu_seqlens_ori_kv=ori_cu,
-                        cu_seqlens_cmp_kv=cmp_cu,
-                        seqused_q=view["cu"].new_empty(0),
-                        seqused_kv=seqused,
-                        max_seqlen_q=max_q,
-                        max_seqlen_kv=max_kv,
-                        batch_size=n_q,
-                        ori_topk=0,
-                        cmp_topk=cmp_topk,
-                        cmp_ratio=cmp_ratio,
-                        ori_mask_mode=4,
-                        cmp_mask_mode=3,
-                        ori_win_left=win_left,
-                        ori_win_right=0,
-                        layout_q="TND",
-                        layout_kv=_dsa_layout_kv(self.vllm_config),
-                        has_ori_kv=True,
-                        has_cmp_kv=True,
+                    metadata_key = (
+                        "attention", metadata_op, tuple(sorted(metadata_kwargs.items())),
+                        self.n_local_heads, self.head_dim, cmp_topk, cmp_ratio,
+                        win_left, _dsa_layout_kv(self.vllm_config), str(q.device),
+                    )
+                    sas = tree_query_metadata(
+                        metadata_key,
+                        lambda: metadata_op(
+                            **metadata_kwargs,
+                            num_heads_q=self.n_local_heads,
+                            num_heads_kv=1,
+                            head_dim=self.head_dim,
+                            cu_seqlens_q=view["cu"],
+                            cu_seqlens_ori_kv=ori_cu,
+                            cu_seqlens_cmp_kv=cmp_cu,
+                            seqused_q=view["cu"].new_empty(0),
+                            seqused_kv=seqused,
+                            max_seqlen_q=max_q,
+                            max_seqlen_kv=max_kv,
+                            batch_size=n_q,
+                            ori_topk=0,
+                            cmp_topk=cmp_topk,
+                            cmp_ratio=cmp_ratio,
+                            ori_mask_mode=4,
+                            cmp_mask_mode=3,
+                            ori_win_left=win_left,
+                            ori_win_right=0,
+                            layout_q="TND",
+                            layout_kv=_dsa_layout_kv(self.vllm_config),
+                            has_ori_kv=True,
+                            has_cmp_kv=True,
+                        ),
                     )
                     attn_kwargs.update(
                         cu_seqlens_q=view["cu"],
@@ -2518,8 +2525,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         attn_out = attn_op(q, **attn_kwargs)[0]
         if self.compress_ratio > 1 and chain_packed:
-            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import unpack_chain_tokens
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import restore_tree_queries
 
-            attn_out = unpack_chain_tokens(attn_out, n_orig)
+            attn_out = restore_tree_queries(attn_out, n_orig)
             finish_tree_layer()
         return attn_out

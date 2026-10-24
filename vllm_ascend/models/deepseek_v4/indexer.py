@@ -235,28 +235,39 @@ class AscendIndexerOps:
         if batch is not None:
             key_cache = tree_cache_view(key_cache)
             scale_cache = tree_cache_view(scale_cache)
-            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import pack_chain_tokens
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+                select_tree_queries,
+                tree_query_metadata,
+            )
 
-            query = pack_chain_tokens(query)
-            weights = pack_chain_tokens(weights)
-            query_scale = pack_chain_tokens(query_scale)
-            qli = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
-                num_heads_q=self.index_n_heads,
-                num_heads_k=1,
-                head_dim=self.index_head_dim,
-                topk=self.index_topk,
-                quant_mode=self.device_operator.get_dsa_indexer_quant_mode(),
-                cu_seqlens_q=batch["cu"],
-                seqused_k=batch["seqused_k"],
-                cmp_residual_k=batch["residual"],
-                batch_size=batch["batch"],
-                max_seqlen_q=batch["max_q"],
-                max_seqlen_k=max(batch["max_k"], 1),
-                layout_q="TND",
-                layout_k="PA_BBND",
-                mask_mode=3,
-                cmp_ratio=4,
-                device=str(key_cache.device),
+            query = select_tree_queries(query)
+            weights = select_tree_queries(weights)
+            query_scale = select_tree_queries(query_scale)
+            quant_mode = self.device_operator.get_dsa_indexer_quant_mode()
+            metadata_key = (
+                "indexer", self.index_n_heads, self.index_head_dim,
+                self.index_topk, quant_mode, str(key_cache.device),
+            )
+            qli = tree_query_metadata(
+                metadata_key,
+                lambda: torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+                    num_heads_q=self.index_n_heads,
+                    num_heads_k=1,
+                    head_dim=self.index_head_dim,
+                    topk=self.index_topk,
+                    quant_mode=quant_mode,
+                    cu_seqlens_q=batch["cu"],
+                    seqused_k=batch["seqused_k"],
+                    cmp_residual_k=batch["residual"],
+                    batch_size=batch["batch"],
+                    max_seqlen_q=batch["max_q"],
+                    max_seqlen_k=max(batch["max_k"], 1),
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                    mask_mode=3,
+                    cmp_ratio=4,
+                    device=str(key_cache.device),
+                ),
             )
             topk_idxs, _ = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
                 query=query,

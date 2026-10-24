@@ -1101,6 +1101,8 @@ class TreeSpecConfig:
     # Legacy configuration key; the synchronizing tree timer has been removed.
     enable_timer: bool = False
     enable_triton: bool = True
+    # Experimental DSV4 shared node state and sparse ancestor execution.
+    node_pool: bool = False
 
     @field_validator("params", mode="before")
     @classmethod

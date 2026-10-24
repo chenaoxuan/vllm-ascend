@@ -206,6 +206,14 @@ class Compressor(nn.Module):
             chain_compressor_batch,
         )
 
+        from vllm_ascend.ascend_config import get_ascend_config
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
+
+        if chain_layout_active() and get_ascend_config().tree_spec_config.node_pool:
+            from vllm_ascend.worker.v2.spec_decode.tree.node_pool import compress_nodes
+
+            return compress_nodes(self, hidden_states, state_cache, metadata)
+
         packed = chain_compressor_batch(
             hidden_states,
             state_cache,

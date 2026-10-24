@@ -809,6 +809,10 @@ def prepare_winner(path_node_ids, num_sampled=None):
     endpoint = torch.where(present, path, 0).amax(dim=1)
     winner = qsl[:-1] + endpoint
     selected = active[plan["req_ids"]] & (plan["token_index"] == winner[plan["req_ids"]])
+    if plan.get("node_records"):
+        from vllm_ascend.worker.v2.spec_decode.tree.node_pool import prepare_nodes
+
+        plan["prepared_nodes"] = prepare_nodes(plan, winner, active)
     return _prepare_state_pages(plan, selected)
 
 
@@ -901,6 +905,11 @@ def commit_winner(path_node_ids, num_sampled=None, *, prepared=None):
             PREPARE=False, WORD_COPY=word_copy, BLOCK=256,
         )
         start += count
+    if "prepared_nodes" in _PLAN:
+        from vllm_ascend.worker.v2.spec_decode.tree.node_pool import commit_nodes
+
+        commit_nodes(_PLAN.pop("prepared_nodes"))
+        _PLAN["node_records"].clear()
     _PLAN["committed"] = True
     _PLAN["records"].clear()
     _PLAN["workspace_layouts"].clear()

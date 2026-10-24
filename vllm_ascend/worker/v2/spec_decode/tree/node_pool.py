@@ -66,46 +66,73 @@ def node_workspace(module, plan):
 
 
 def compress_nodes(module, hidden, state, metadata):
+    from vllm_ascend.ascend_config import get_ascend_config
     from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
 
+    aggregate = aggregate_nodes
+    native = get_ascend_config().tree_spec_config.compressor_backend == "native"
+    if native:
+        from vllm_ascend.ops.triton.spec_decode.tree.native_compressor import aggregate_native_nodes
+
+        aggregate = aggregate_native_nodes
     plan = cp._build_plan(hidden.shape[0], hidden.device)
     workspace = node_workspace(module, plan)
     cache_meta = metadata.cache.req_metadata
     state_meta = metadata.state.req_metadata
     ratio, head = module.compress_ratio, module.head_dim
     n, device = plan["n"], hidden.device
-    key = ("projection", ratio)
-    saved = plan["query_metadata"].get(key)
-    if saved is None:
-        # Projection uses one independent row per node. Its logical residue
-        # preserves APE exactly; the disposable native aggregation sees only
-        # null history. Triton performs the real branch aggregation afterwards.
-        residue = ((plan["start"] + plan["depths"]) % ratio).to(torch.int32)
-        table = torch.zeros((n, ratio), dtype=torch.int32, device=device)
-        table.scatter_(1, residue.long().unsqueeze(1), (plan["token_index"] + 1).int().unsqueeze(1))
-        saved = (
-            residue,
-            table,
-            torch.ones((n, module.rope_head_dim), device=device),
-            torch.zeros((n, module.rope_head_dim), device=device),
-        )
-        plan["query_metadata"][key] = saved
-    residue, projection_table, dummy_cos, dummy_sin = saved
     nodes = workspace.buffers.acquire("nodes", (n + 1, 1, 1, 2 * module.coff * head), state.dtype, device)
-    nodes.zero_()
-    module._compress(
-        hidden.index_select(0, plan["hidden_ids"]),
-        nodes,
-        projection_table,
-        plan["query_cu"],
-        residue,
-        dummy_cos,
-        dummy_sin,
-    )
+    projected_hidden = hidden.index_select(0, plan["hidden_ids"])
+    if native:
+        key = ("native_projection", ratio)
+        residue = plan["query_metadata"].get(key)
+        if residue is None:
+            residue = ((plan["start"] + plan["depths"]) % ratio).to(torch.int32)
+            plan["query_metadata"][key] = residue
+        # Device-only projection: one state row per node, no synthetic page table
+        # or unused linear compression. Every real node is overwritten by the op.
+        nodes[:1].zero_()
+        torch.ops._C_ascend.compressor_tree_project(
+            projected_hidden,
+            module.wkv.weight,
+            module.wgate.weight,
+            nodes,
+            module.ape,
+            residue,
+            plan["query_cu"],
+        )
+    else:
+        key = ("projection", ratio)
+        saved = plan["query_metadata"].get(key)
+        if saved is None:
+            # Projection uses one independent row per node. Its logical residue
+            # preserves APE exactly; the disposable native aggregation sees only
+            # null history. Triton performs the real branch aggregation afterwards.
+            residue = ((plan["start"] + plan["depths"]) % ratio).to(torch.int32)
+            table = torch.zeros((n, ratio), dtype=torch.int32, device=device)
+            table.scatter_(1, residue.long().unsqueeze(1), (plan["token_index"] + 1).int().unsqueeze(1))
+            saved = (
+                residue,
+                table,
+                torch.ones((n, module.rope_head_dim), device=device),
+                torch.zeros((n, module.rope_head_dim), device=device),
+            )
+            plan["query_metadata"][key] = saved
+        residue, projection_table, dummy_cos, dummy_sin = saved
+        nodes.zero_()
+        module._compress(
+            projected_hidden,
+            nodes,
+            projection_table,
+            plan["query_cu"],
+            residue,
+            dummy_cos,
+            dummy_sin,
+        )
     full_cos, full_sin = cache_meta.full_compress_cos, cache_meta.full_compress_sin
     cos = full_cos.view(full_cos.shape[0], full_cos.shape[-1])
     sin = full_sin.view(full_sin.shape[0], full_sin.shape[-1])
-    output = aggregate_nodes(
+    output = aggregate(
         state,
         nodes,
         state_meta.block_table,

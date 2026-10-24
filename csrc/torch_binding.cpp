@@ -3701,3 +3701,5 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
 // Independent tree operator; shares the ACLNN adapter in this translation unit.
 #include "attention/sparse_attn_sharedkv_tree/torch_binding.h"
+#include "attention/compressor_tree/torch_binding.h"
+#include "attention/compressor_tree_project/torch_binding.h"

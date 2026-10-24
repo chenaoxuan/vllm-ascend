@@ -1105,6 +1105,8 @@ class TreeSpecConfig:
     node_pool: bool = False
     # Only selects compressed-layer attention in the DSV4 shared tree path.
     attention_backend: Literal["triton", "native"] = "triton"
+    # Selects tree node projection plus branch aggregation/Norm/RoPE.
+    compressor_backend: Literal["triton", "native"] = "triton"
 
     @field_validator("params", mode="before")
     @classmethod
@@ -1119,6 +1121,8 @@ class TreeSpecConfig:
     def _validate(self):
         if self.attention_backend == "native" and not (self.enabled and self.node_pool):
             raise ValueError("Native tree attention requires enabled=True and node_pool=True")
+        if self.compressor_backend == "native" and not (self.enabled and self.node_pool):
+            raise ValueError("Native tree compressor requires enabled=True and node_pool=True")
         if self.method is not None and self.method not in self.SUPPORTED_METHODS:
             raise ValueError(
                 f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "

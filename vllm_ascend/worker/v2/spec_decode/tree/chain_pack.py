@@ -12,6 +12,7 @@ import torch
 import torch_npu
 from vllm.triton_utils import triton
 
+from vllm_ascend.ops.triton.spec_decode.tree.node_pool import build_ancestors
 from vllm_ascend.ops.triton.spec_decode.tree.state_commit import (
     copy_tree_state_rows_kernel,
     select_tree_state_kernel,
@@ -195,31 +196,14 @@ def _build_plan(num_tokens: int, device) -> dict | None:
         host_buffers=host_buffers,
     )
     tokens = torch.arange(n, dtype=torch.long, device=device)
-    roots = host_qsl[:-1].long().index_select(0, req_ids)
-    local = tokens - roots
-    counts = torch.minimum(layout["num_nodes"], host_qsl[1:] - host_qsl[:-1] - 1)
-    node = (local > 0) & (local <= counts.index_select(0, req_ids))
-    slots = (local - 1).clamp(0, layout["parents"].shape[1] - 1)
-    parents = layout["parents"][req_ids, slots].long()
-    depths = layout["depths"][req_ids, slots].long()
-    depths = torch.where(node, torch.minimum(depths.clamp(1, depth_limit), local), 0)
-    parents = torch.where(node, torch.minimum(parents.clamp(min=0), (local - 1).clamp(min=0)), 0)
-    ancestors = torch.zeros((n, depth_limit + 1), dtype=torch.long, device=device)
-    cursor = torch.where(node, local, 0)
-    for offset in range(depth_limit):
-        column = (depths - offset).clamp(min=0)
-        ancestors.scatter_(1, column.unsqueeze(1), torch.where(column > 0, cursor, 0).unsqueeze(1))
-        parent = layout["parents"][req_ids, (cursor - 1).clamp(0, layout["parents"].shape[1] - 1)]
-        cursor = torch.where(column > 0,
-                             torch.minimum(parent.long().clamp(min=0), (cursor - 1).clamp(min=0)), 0)
-    ancestors[:, 0].zero_()
-    ancestor_ids = roots.unsqueeze(1) + ancestors
-    ancestor_ids.clamp_(0, n - 1)
+    ancestor_ids, valid, depths, hidden_ids, parent_ids = build_ancestors(
+        layout["parents"], layout["depths"], layout["num_nodes"], req_ids,
+        host_qsl, depth_limit,
+    )
     lens = (depths + 1).to(torch.int32)
     cu = torch.cat((lens.new_zeros(1), lens.cumsum(0, dtype=torch.int32)))
     steps = torch.arange(depth_limit + 1, device=device).unsqueeze(0)
     capacity = n * (depth_limit + 1)
-    valid = steps <= depths.unsqueeze(1)
     # Live chain positions are unique. Give every inactive entry its own tail
     # slot as well: ordinary scatter needs no reduction or duplicate writes.
     padding = capacity + torch.arange(capacity, device=device).view(n, depth_limit + 1)
@@ -231,8 +215,8 @@ def _build_plan(num_tokens: int, device) -> dict | None:
         "n": n, "n_req": n_req, "req_cu": qsl, "max_depth": depth_limit,
         "req_ids": req_ids, "req_index": req_index, "prefixes": prefix_of,
         "depths": depths, "lens": lens, "ancestors": ancestor_ids,
-        "parent_ids": (roots + parents).clamp(0, n - 1),
-        "hidden_ids": torch.where(node, tokens, roots),
+        "parent_ids": parent_ids, "visibility": valid,
+        "hidden_ids": hidden_ids,
         "max_q": depth_limit + 1, "max_kv": max(prefixes) + depth_limit + 1,
         "token_count": capacity, "rows": rows[:capacity], "cu": cu,
         "query_cu": torch.arange(n + 1, dtype=torch.int32, device=device),

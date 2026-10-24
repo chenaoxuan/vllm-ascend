@@ -232,6 +232,19 @@ class AscendIndexerOps:
         from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import indexer_batch
 
         batch = indexer_batch(key_cache)
+        if batch is not None and "node_cache" in batch:
+            from vllm_ascend.ops.triton.spec_decode.tree.node_indexer import node_indexer
+            from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
+            key_binding = batch["node_cache"]
+            scale_binding = batch["plan"]["node_kv"][cp._key(scale_cache)]
+            n = batch["plan"]["n"]
+            return node_indexer(
+                query[:n], weights[:n], query_scale[:n],
+                key_binding["original"], scale_binding["original"],
+                key_binding["rows"], scale_binding["rows"], key_binding["table"],
+                batch["plan"], self.index_topk,
+            )
         if batch is not None:
             key_cache = tree_cache_view(key_cache)
             scale_cache = tree_cache_view(scale_cache)

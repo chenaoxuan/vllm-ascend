@@ -66,35 +66,56 @@ def compress_nodes(module, hidden, state, metadata):
     # Retain each node once until acceptance. History is never copied per branch.
     record_nodes(plan, state, nodes[1:], state_meta, 1)
 
-    # Transitional adapter for the existing indexer/attention consumers. This
-    # expansion is removed when those consumers can read the pool directly.
+    # Reserve block zero and one physical row per node. Persistent prefix
+    # pages remain in the original cache and are addressed directly by readers.
     caches = cp._KV_STACK[-1]
     bs = int(cache_meta.storage_block_size)
-    layout = cp._workspace_layout(plan, cache_meta.block_table, cache_meta, "kv", bs, ratio=ratio)
-    _, kv_table = cp._workspace(plan, caches, layout, "kv")
-    count = max(1, min(plan["token_count"], plan["token_count"] // ratio + n))
-    meta_key = ("node_compressed", cache_meta.cache_group_key, ratio, bs)
-    packed = plan["query_metadata"].get(meta_key)
-    if packed is None:
-        rope_shape = (count, 1, 1, cos.shape[-1])
-        rc = torch.empty(rope_shape, dtype=cos.dtype, device=device)
-        rs = torch.empty_like(rc)
-        slots = torch.empty((count, 2), dtype=torch.int32, device=device)
-        torch.ops._C_ascend.compressor_metadata_out(
-            cos, sin, plan["cu"], plan["start"], kv_table, bs, 2, ratio, n, rc, rs, slots
-        )
-        steps = torch.arange(plan["max_q"], device=device).unsqueeze(0)
-        positions = plan["start"].unsqueeze(1) + steps
-        emit = plan["visibility"] & ((positions + 1) % ratio == 0)
-        rank = emit.reshape(-1).long().cumsum(0) - 1
-        tail = count + torch.arange(emit.numel(), device=device)
-        ids = torch.full((count + emit.numel(),), n, dtype=torch.long, device=device)
-        ids.scatter_(0, torch.where(emit.reshape(-1), rank, tail), torch.where(emit, plan["ancestors"], n).reshape(-1))
-        packed = slots, ids[:count]
-        plan["query_metadata"][meta_key] = packed
-    slots, ids = packed
-    output = torch.cat((output, output.new_zeros((1, head)))).index_select(0, ids)
+    views = cp._new_cache_views(cp._LayerBuffers(), caches, 1 + triton.cdiv(n, bs))
+    bindings = plan.setdefault("node_kv", {})
+    for original, view in zip(caches, views):
+        rows = view[1:].reshape(-1, *view.shape[2:])[:n]
+        binding = {"original": original, "rows": rows, "table": cache_meta.block_table}
+        for tensor in (original, view):
+            cp_key = cp._key(tensor)
+            plan["cache_views"][cp_key] = view
+            bindings[cp_key] = binding
+        record_nodes(plan, original, rows, cache_meta, ratio)
+    slot_key = ("node_slots", ratio, bs)
+    slots = plan["query_metadata"].get(slot_key)
+    if slots is None:
+        emit = (plan["start"] + plan["depths"] + 1) % ratio == 0
+        slots = torch.stack((plan["token_index"] // bs + 1, plan["token_index"] % bs), 1).int()
+        slots = torch.where(emit.unsqueeze(1), slots, -1)
+        plan["query_metadata"][slot_key] = slots
     return output, slots
+
+
+def attend_nodes(query, original, compressed, metadata, topk, sinks, ratio, window, scale):
+    from vllm_ascend.ops.triton.spec_decode.tree.node_attention import node_attention
+    from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
+    plan = cp._PLAN
+    binding = plan["node_kv"][cp._key(compressed)]
+    n = plan["n"]
+    output = node_attention(
+        query[:n],
+        original,
+        binding["original"],
+        binding["rows"],
+        metadata.block_table,
+        binding["table"],
+        plan,
+        topk,
+        sinks,
+        ratio,
+        window,
+        scale,
+    )
+    if query.shape[0] > n:
+        output = torch.cat((output, output.new_zeros((query.shape[0] - n, *output.shape[1:]))))
+    cp.finish_tree_layer()
+    plan["node_kv"].clear()
+    return output
 
 
 def record_nodes(plan, original, snapshot, metadata, ratio):

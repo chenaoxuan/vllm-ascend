@@ -12,10 +12,22 @@ from vllm_ascend.worker.v2.spec_decode.tree.node_pool import commit_nodes, prepa
 
 
 @pytest.mark.parametrize(
-    "winner,enabled,ratio", [(0, True, 1), (3, True, 1), (4, True, 1), (4, False, 1), (3, True, 4), (4, True, 4)]
+    "winner,enabled,ratio,prefix",
+    [
+        (0, True, 1, 2),
+        (3, True, 1, 2),
+        (4, True, 1, 2),
+        (4, False, 1, 2),
+        (3, True, 4, 2),
+        (4, True, 4, 2),
+        (3, True, 128, 125),
+        (4, True, 128, 125),
+        (0, True, 128, 127),
+        (4, False, 128, 125),
+    ],
 )
 @pytest.mark.parametrize("alias", [False, True])
-def test_node_commit_preserves_baseline_and_siblings(winner, enabled, ratio, alias):
+def test_node_commit_preserves_baseline_and_siblings(winner, enabled, ratio, prefix, alias):
     device = "npu"
     torch.npu.set_device(0)
     parents = torch.tensor([[0, 0, 1, 2]], dtype=torch.int32, device=device)
@@ -28,12 +40,12 @@ def test_node_commit_preserves_baseline_and_siblings(winner, enabled, ratio, ali
         n=5,
         max_q=4,
         req_index=[0] * 5,
-        prefixes=[2] * 5,
+        prefixes=[prefix] * 5,
         req_cu=[0, 5],
         req_ids=req,
         ancestors=ancestors,
         depths=depth,
-        start=torch.full((5,), 2, dtype=torch.int32, device=device),
+        start=torch.full((5,), prefix, dtype=torch.int32, device=device),
         host_uploads=[],
     )
     page_map = [1, 1, 1] if alias else [1, 2, 1]
@@ -52,7 +64,7 @@ def test_node_commit_preserves_baseline_and_siblings(winner, enabled, ratio, ali
         touched = set()
         if enabled:
             for d, node in enumerate(path):
-                pos = 2 + d
+                pos = prefix + d
                 if (pos + 1) % ratio:
                     continue
                 p = (pos + 1) // ratio - 1

@@ -79,6 +79,7 @@ else:
 from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
     chain_layout_active,
     finish_tree_layer,
+    node_kv_active,
     tree_cache_view,
 )
 
@@ -2387,6 +2388,21 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             )
 
         notify_kv_cache_written(layer_name)
+        if self.compress_ratio > 1 and node_kv_active():
+            from vllm_ascend.worker.v2.spec_decode.tree.node_pool import attend_nodes
+
+            record_attention_compute_start()
+            return attend_nodes(
+                q,
+                swa_kv_cache,
+                compress_kv_cache,
+                swa_req_metadata,
+                compress_topk_idxs,
+                self.attn_sink,
+                self.compress_ratio,
+                self.window_size,
+                self.softmax_scale,
+            )
         wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_metadata.sas_metadata))
         record_attention_compute_start()
         kv_plan = get_dsa_attn_kv_plan(self.vllm_config)

@@ -708,9 +708,15 @@ def chain_attention_view(ori_cache, ori_block_table, block_size, window_size, *,
     return view
 
 
+def node_kv_active():
+    return _PLAN is not None and bool(_PLAN.get("node_kv"))
+
+
 def indexer_batch(key_cache):
     if _LAYOUT is None:
         return None
+    if _PLAN is not None and _key(key_cache) in _PLAN.get("node_kv", {}):
+        return {"node_cache": _PLAN["node_kv"][_key(key_cache)], "plan": _PLAN}
     table = lookup_kv_table(key_cache)
     plan = _PLAN
     seq = plan["seqused"]

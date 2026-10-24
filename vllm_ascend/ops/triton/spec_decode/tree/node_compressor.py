@@ -90,11 +90,15 @@ def _epilogue(
     tl.store(Output + node * D + d, tl.where(emitted, y, 0))
 
 
-def aggregate_nodes(state, nodes, table, plan, norm, cos, sin, ratio, head_dim, rope_dim, eps, dtype):
+def aggregate_nodes(state, nodes, table, plan, norm, cos, sin, ratio, head_dim, rope_dim, eps, dtype, workspace=None):
     """All tensors are on device. The cache table addresses read-only history."""
     n = plan["n"]
-    aggregate = torch.empty((n, head_dim), dtype=torch.float32, device=state.device)
-    output = torch.empty((n, head_dim), dtype=dtype, device=state.device)
+    if workspace is None:
+        aggregate = torch.empty((n, head_dim), dtype=torch.float32, device=state.device)
+        output = torch.empty((n, head_dim), dtype=dtype, device=state.device)
+    else:
+        aggregate = workspace.acquire("aggregate", (n, head_dim), torch.float32, state.device)
+        output = workspace.acquire("compressed", (n, head_dim), dtype, state.device)
     coeff = 2 if ratio == 4 else 1
     _aggregate[(n, triton.cdiv(head_dim, 32))](
         state,

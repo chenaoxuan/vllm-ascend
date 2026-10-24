@@ -11,10 +11,54 @@ from vllm_ascend.ops.triton.spec_decode.tree.node_commit import commit_node_page
 from vllm_ascend.ops.triton.spec_decode.tree.node_compressor import aggregate_nodes
 
 
+class NodeWorkspace:
+    """Module-owned device storage reused across serialized verification rounds.
+
+    Nodes/cache views stay live through accepted-chain commitment. Different
+    modules and repeated invocations within one round must use distinct pools.
+    All reuse is ordered on the same tree execution stream.
+    """
+
+    def __init__(self):
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import _LayerBuffers
+
+        self.buffers = _LayerBuffers()
+        self.views = {}
+
+    def cache_views(self, caches, num_pages):
+        from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
+        key = tuple(cp._key(cache) for cache in caches)
+        saved = self.views.get(key)
+        if saved is None or saved[0].shape[0] < num_pages:
+            # Cache storage is independent of resettable aggregation scratch.
+            saved = cp._new_cache_views(cp._LayerBuffers(), caches, num_pages)
+            self.views[key] = saved
+        else:
+            # Keep null pages and unused rows deterministic on every round.
+            for view in saved:
+                view[:num_pages].zero_()
+        return [view[:num_pages] for view in saved]
+
+
+def node_workspace(module, plan):
+    owners = plan.setdefault("node_workspace_owners", set())
+    if id(module) in owners:
+        return NodeWorkspace()
+    owners.add(id(module))
+    workspace = module.__dict__.get("_tree_node_workspace")
+    if workspace is None:
+        workspace = NodeWorkspace()
+        module._tree_node_workspace = workspace
+    workspace.buffers.reset()
+    return workspace
+
+
 def compress_nodes(module, hidden, state, metadata):
     from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
 
     plan = cp._build_plan(hidden.shape[0], hidden.device)
+    workspace = node_workspace(module, plan)
     cache_meta = metadata.cache.req_metadata
     state_meta = metadata.state.req_metadata
     ratio, head = module.compress_ratio, module.head_dim
@@ -36,7 +80,8 @@ def compress_nodes(module, hidden, state, metadata):
         )
         plan["query_metadata"][key] = saved
     residue, projection_table, dummy_cos, dummy_sin = saved
-    nodes = torch.zeros((n + 1, 1, 1, 2 * module.coff * head), dtype=state.dtype, device=device)
+    nodes = workspace.buffers.acquire("nodes", (n + 1, 1, 1, 2 * module.coff * head), state.dtype, device)
+    nodes.zero_()
     module._compress(
         hidden.index_select(0, plan["hidden_ids"]),
         nodes,
@@ -62,6 +107,7 @@ def compress_nodes(module, hidden, state, metadata):
         module.rope_head_dim,
         module.norm_eps,
         hidden.dtype,
+        workspace=workspace.buffers,
     )
     # Retain each node once until acceptance. History is never copied per branch.
     record_nodes(plan, state, nodes[1:], state_meta, 1)
@@ -70,7 +116,7 @@ def compress_nodes(module, hidden, state, metadata):
     # pages remain in the original cache and are addressed directly by readers.
     caches = cp._KV_STACK[-1]
     bs = int(cache_meta.storage_block_size)
-    views = cp._new_cache_views(cp._LayerBuffers(), caches, 1 + triton.cdiv(n, bs))
+    views = workspace.cache_views(caches, 1 + triton.cdiv(n, bs))
     bindings = plan.setdefault("node_kv", {})
     for original, view in zip(caches, views):
         rows = view[1:].reshape(-1, *view.shape[2:])[:n]
@@ -123,18 +169,27 @@ def record_nodes(plan, original, snapshot, metadata, ratio):
     from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
 
     real, _ = cp._LAYOUT["host_tables"][metadata.cache_group_key]
-    pages = set()
     bs = original.shape[1]
-    for node, req in enumerate(plan["req_index"]):
-        start = plan["prefixes"][node]
-        length = min(plan["max_q"], node - plan["req_cu"][req] + 1)
-        begin = start if ratio == 1 else start // ratio
-        end = start + length if ratio == 1 else (start + length) // ratio
-        for pos in range(begin, end):
-            col = pos // bs
-            if col < len(real[req]) and real[req][col] > 0:
-                pages.add(real[req][col])
-    plan.setdefault("node_records", []).append((original, snapshot, metadata.block_table, sorted(pages), ratio))
+    # A scheduler snapshot shares the same CPU rows across layers in a group.
+    # The cache is round-local, so request replacement cannot reuse stale pages.
+    key = (id(real), bs, ratio)
+    page_sets = plan.setdefault("node_page_sets", {})
+    pages = page_sets.get(key)
+    if pages is None:
+        touched = set()
+        for req, (begin_node, end_node) in enumerate(zip(plan["req_cu"], plan["req_cu"][1:])):
+            if begin_node == end_node:
+                continue
+            start = plan["prefixes"][begin_node]
+            length = min(plan["max_q"], end_node - begin_node)
+            begin = start if ratio == 1 else start // ratio
+            end = start + length if ratio == 1 else (start + length) // ratio
+            if end > begin:
+                first, last = begin // bs, min((end - 1) // bs + 1, len(real[req]))
+                touched.update(page for page in real[req][first:last] if page > 0)
+        pages = tuple(sorted(touched))
+        page_sets[key] = pages
+    plan.setdefault("node_records", []).append((original, snapshot, metadata.block_table, pages, ratio))
 
 
 def prepare_nodes(plan, winner, active):

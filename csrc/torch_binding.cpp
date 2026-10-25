@@ -3703,3 +3703,4 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 #include "attention/sparse_attn_sharedkv_tree/torch_binding.h"
 #include "attention/compressor_tree/torch_binding.h"
 #include "attention/compressor_tree_project/torch_binding.h"
+#include "attention/quant_lightning_indexer_tree/torch_binding.h"

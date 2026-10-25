@@ -53,7 +53,6 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
-
 from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
     cache_tree_topk,
     chain_layout_active,
@@ -233,8 +232,13 @@ class AscendIndexerOps:
 
         batch = indexer_batch(key_cache)
         if batch is not None and "node_cache" in batch:
-            from vllm_ascend.ops.triton.spec_decode.tree.node_indexer import node_indexer
+            from vllm_ascend.ascend_config import get_ascend_config
             from vllm_ascend.worker.v2.spec_decode.tree import chain_pack as cp
+
+            if get_ascend_config().tree_spec_config.indexer_backend == "native":
+                from vllm_ascend.ops.triton.spec_decode.tree.native_indexer import native_indexer as node_indexer
+            else:
+                from vllm_ascend.ops.triton.spec_decode.tree.node_indexer import node_indexer
 
             key_binding = batch["node_cache"]
             scale_binding = batch["plan"]["node_kv"][cp._key(scale_cache)]

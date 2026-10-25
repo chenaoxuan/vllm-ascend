@@ -1107,6 +1107,8 @@ class TreeSpecConfig:
     attention_backend: Literal["triton", "native"] = "triton"
     # Selects tree node projection plus branch aggregation/Norm/RoPE.
     compressor_backend: Literal["triton", "native"] = "triton"
+    # Only selects scoring/Top-K in the DSV4 shared tree path.
+    indexer_backend: Literal["triton", "native"] = "triton"
 
     @field_validator("params", mode="before")
     @classmethod
@@ -1123,6 +1125,8 @@ class TreeSpecConfig:
             raise ValueError("Native tree attention requires enabled=True and node_pool=True")
         if self.compressor_backend == "native" and not (self.enabled and self.node_pool):
             raise ValueError("Native tree compressor requires enabled=True and node_pool=True")
+        if self.indexer_backend == "native" and not (self.enabled and self.node_pool):
+            raise ValueError("Native tree indexer requires enabled=True and node_pool=True")
         if self.method is not None and self.method not in self.SUPPORTED_METHODS:
             raise ValueError(
                 f"tree_spec_config.method must be one of {self.SUPPORTED_METHODS}, "

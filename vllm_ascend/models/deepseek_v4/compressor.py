@@ -208,20 +208,50 @@ class Compressor(nn.Module):
         state_metadata = metadata.state.req_metadata
         assert compressor_metadata is not None
         assert state_metadata is not None
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
+
+        if chain_layout_active():
+            from vllm_ascend.worker.v2.spec_decode.tree.node_pool import compress_nodes
+
+            return compress_nodes(self, hidden_states, state_cache, metadata)
+
         compress_cos, compress_sin, slot_mapping = self._compute_metadata(compressor_metadata)
-        compressed_kv = torch.ops._C_ascend.compressor(
+        compressed_kv = self._compress(
             hidden_states,
+            state_cache,
+            state_metadata.block_table,
+            compressor_metadata.query_start_loc,
+            compressor_metadata.start_pos,
+            compress_cos,
+            compress_sin,
+        )
+        return compressed_kv, slot_mapping
+
+    def _compress(
+        self,
+        hidden: torch.Tensor,
+        state: torch.Tensor,
+        state_bt: torch.Tensor,
+        cu: torch.Tensor,
+        start: torch.Tensor,
+        compress_cos: torch.Tensor,
+        compress_sin: torch.Tensor,
+        *,
+        seqused: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.ops._C_ascend.compressor(
+            hidden,
             self.wkv.weight,
             self.wgate.weight,
-            state_cache.squeeze(-2),
+            state.squeeze(-2),
             self.ape,
             self.norm.weight,
             compress_sin.view(-1, compress_sin.shape[-1]),
             compress_cos.view(-1, compress_cos.shape[-1]),
-            state_block_table=state_metadata.block_table,
-            cu_seqlens=compressor_metadata.query_start_loc,
-            seqused=None,
-            start_pos=compressor_metadata.start_pos,
+            state_block_table=state_bt,
+            cu_seqlens=cu,
+            seqused=seqused,
+            start_pos=start,
             rope_head_dim=self.rope_head_dim,
             cmp_ratio=self.compress_ratio,
             coff=2 if self.overlap else 1,
@@ -229,4 +259,3 @@ class Compressor(nn.Module):
             rotary_mode=2,
             cache_mode=1,
         )
-        return compressed_kv, slot_mapping

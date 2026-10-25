@@ -589,6 +589,35 @@
 #       profiling startup and per-step timing callbacks without monkey-patching
 #       `EngineCore` and the multiprocess entry point.
 #
+# ** 18. File: platform/patch_spec_decode_stats.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.spec_decode.metrics.SpecDecodingStats.observe_draft`
+#      `vllm.v1.core.sched.scheduler.Scheduler.schedule`
+#      vLLM-Ascend custom scheduler `schedule` overrides
+#    Why:
+#       Tree spec decode schedules ``budget`` draft nodes, which can exceed
+#       ``num_speculative_tokens`` (tree depth). Upstream ``observe_draft``
+#       indexes per-position lists of length ``num_speculative_tokens``, so
+#       ``budget > num_speculative_tokens`` raises IndexError in
+#       ``Scheduler.make_spec_decoding_stats``. The scheduler also reserves
+#       ``1 + num_speculative_tokens`` query rows while the DSV4 beam worker
+#       verifies ``1 + budget`` rows, which desynchronizes scheduler output
+#       from worker input when the two widths differ.
+#    How：
+#       Replace ``observe_draft`` so scalar draft/accepted totals still count
+#       every node, while per-position updates clamp to the existing list
+#       length (chain-depth logging / Prometheus counters stay aligned).
+#       For enabled trees in eager mode, wrap each supported scheduler entry so only
+#       new-request verify padding observes the DSV4 DSpark beam budget. Restore
+#       ``num_spec_tokens`` immediately, keep ``num_spec_tokens_to_schedule`` and
+#       async next-step placeholders at draft depth, and leave metrics unchanged.
+#       A zero speculative depth remains zero rather than expanding to budget.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend tree spec; upstream stats assume chain drafts.
+#    Future Plan:
+#       Remove this patch when upstream tree spec owns both scheduler query
+#       width and metrics for ``budget > num_speculative_tokens``.
+#
 # ** 19. File: platform/patch_speculative_config.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.config.speculative.SpeculativeConfig.hf_config_override`
@@ -598,19 +627,36 @@
 #       loaded as the target model's MTP layer rather than a standalone model.
 #       Upstream `SpeculativeConfig.hf_config_override` does not remap these
 #       target model_types/architectures to their MTP variants, so spec decoding
-#       cannot locate the drafter.
+#       cannot locate the drafter. Legacy Qwen3 DSpark checkpoints also ship as
+#       ``DSparkDraftModel`` and need remapping to ``Qwen3DSparkModel``.
 #    How：
 #       Replace `SpeculativeConfig.hf_config_override` to detect the supported
 #       target model_type/architecture, derive `n_predict` from
 #       `num_nextn_predict_layers` (or `mtp_num_hidden_layers`), and rewrite
 #       `model_type`/`architectures` to the corresponding MTP model. Also remaps
-#       MistralLarge3 to its Eagle variant.
+#       MistralLarge3 to its Eagle variant, and Qwen3 ``DSparkDraftModel`` to
+#       ``Qwen3DSparkModel``.
 #    Related PR (if no, explain why):
-#       No, vllm-ascend-specific MTP model type remapping.
+#       No, vllm-ascend-specific MTP / DSpark model type remapping.
 #    Future Plan:
 #       Remove this patch once upstream vLLM supports loading these MTP draft
 #       models without a custom `hf_config_override`, or exposes a plugin hook
 #       for MTP model_type/architecture remapping.
+#   2. `vllm.config.speculative.SpeculativeConfig.__post_init__`
+#    Why:
+#       Huang2020/Qwen3-8B-Domino-b16 is a DFlash draft (``DFlashDraftModel``,
+#       ``projector_type=domino``) whose repo name does not contain ``dflash``.
+#       Upstream then leaves ``method=draft_model`` and never wraps EAGLEConfig
+#       or selects the DFlash speculator.
+#    How:
+#       If method is unset and the draft path contains ``domino`` / ``dflash``,
+#       set ``method=dflash`` before upstream post_init. After post_init, if
+#       method is still ``draft_model`` but the architecture is ``DFlash*`` or
+#       ``projector_type=domino``, promote to dflash and wrap EAGLEConfig.
+#    Related PR (if no, explain why):
+#       No, vllm-ascend tree / Domino draft; upstream only name-matches dflash.
+#    Future Plan:
+#       Remove when upstream auto-detects ``DFlashDraftModel`` / Domino.
 #
 #   2. `vllm.config.speculative.SpeculativeConfig.__post_init__`
 #    Why:

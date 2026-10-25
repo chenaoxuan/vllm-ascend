@@ -1269,7 +1269,20 @@ def _compute_potential_max_tokens(vllm_config) -> int:
     compilation_config = vllm_config.compilation_config
     scheduler_config = vllm_config.scheduler_config
     speculative_config = vllm_config.speculative_config
-    uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
+    if speculative_config:
+        from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
+
+        if dflash_tree_spec_enabled(vllm_config):
+            from vllm_ascend.worker.v2.spec_decode import tree_target_query_len
+
+            qlen = tree_target_query_len(vllm_config)
+            uniform_decode_query_len = (
+                qlen if qlen is not None else 1 + speculative_config.num_speculative_tokens
+            )
+        else:
+            uniform_decode_query_len = 1 + speculative_config.num_speculative_tokens
+    else:
+        uniform_decode_query_len = 1
 
     # Use max cudagraph capture size if available, otherwise the maximal uniform
     # decode token count.

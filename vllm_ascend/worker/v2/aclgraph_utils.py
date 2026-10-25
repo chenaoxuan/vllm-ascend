@@ -18,6 +18,7 @@
 #
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 from functools import partial
 from typing import Any
 
@@ -165,17 +166,125 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         )
         self.breakable_cg_runner: BreakableACLGraphWrapper | None = None
         self.model_runner = model_runner
+        self.tree_full_graph_manager = None
+        self.tree_mixed_batch = False
+        self.tree_batch_shape = None
         self.update_stream = self.model_runner.update_stream
         self.capture_sizes = collect_sorted_captured_token_sizes(self._capture_descs)
         if super().needs_capture():
             set_graph_params(self.capture_sizes)
 
+    def _init_candidates(self) -> None:
+        super()._init_candidates()
+        self._reshape_tree_verify_full_descs()
+
+    def _reshape_tree_verify_full_descs(self) -> None:
+        """Capture tree-verify FULL graphs as ``k x (1+budget)`` uniform tree
+        batches instead of ``N x small`` ones.
+
+        Upstream ``CudaGraphManager._init_candidates`` sizes FULL descriptors
+        with ``num_reqs = min(num_tokens, max_num_reqs)`` and leaves
+        ``max_query_len`` / ``uniform_token_count`` unset. ``make_dummy`` then
+        distributes tokens evenly across those requests, so a ``k*(1+budget)``
+        tree-verify graph is captured as ``N x small`` (e.g. 33x1 when
+        ``max_num_seqs >= 33``). ``split_decodes_and_prefills`` reports
+        ``num_decodes = N``, the ``_tree_fia_bsnd_shape`` guard
+        (``n_dec == num_decodes``) rejects the BSND path, and the fallback TND
+        path drops the tree-visibility mask -- which silently lowers the
+        acceptance length as ``max_num_seqs`` grows.
+
+        For tree spec, reshape those descriptors to ``num_reqs = k``,
+        ``max_query_len = uniform_token_count = 1+budget`` so the dummy batch
+        is ``k x (1+budget)``, the BSND tree path is captured, and runtime
+        dispatch matches it. Descriptors whose token count is not a multiple of
+        the tree query width are left untouched.
+        """
+        from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
+        shape = TreeShape.from_config(self.vllm_config)
+        if shape is None:
+            return
+        qlen = shape.target_query_len
+        full_descs = self._capture_descs.get(CUDAGraphMode.FULL)
+        if not full_descs:
+            return
+        remap: dict[int, BatchExecutionDescriptor] = {}
+        reshaped: list[BatchExecutionDescriptor] = []
+        for orig in full_descs:
+            d = orig
+            if orig.num_tokens > 0 and orig.num_tokens % qlen == 0:
+                k = orig.num_tokens // qlen
+                d = replace(
+                    orig,
+                    num_reqs=k,
+                    max_query_len=qlen,
+                    uniform_token_count=qlen,
+                )
+            remap[id(orig)] = d
+            reshaped.append(d)
+        self._capture_descs[CUDAGraphMode.FULL] = reshaped
+        # _candidates indexes the same descriptor objects (range-filled by
+        # num_tokens); swap in the reshaped ones so dispatch sees the new
+        # max_query_len / uniform_token_count / num_reqs.
+        for key, lst in self._candidates.items():
+            self._candidates[key] = [remap.get(id(d), d) for d in lst]
+
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableACLGraphWrapper(model, self.vllm_config)
 
+    def dispatch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+        max_query_len: int | None = None,
+        num_ubatches: int = 1,
+    ) -> BatchExecutionDescriptor:
+        if self.tree_mixed_batch:
+            # These calls contain independently built linear and tree metadata.
+            # Captured tree-only gears cannot replay either the phase partition
+            # or its mutable metadata. Keep ordinary eager execution for them.
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=num_active_loras,
+                num_ubatches=num_ubatches,
+            )
+        if (
+            self._graphs_captured
+            and self.tree_full_graph_manager is not None
+            and self.tree_batch_shape == (num_reqs, num_tokens)
+            and num_active_loras == 0
+            and num_ubatches == 1
+        ):
+            # The final decode round can contain a truncated tree. Capture its
+            # exact shape lazily rather than silently dropping it into eager.
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.FULL,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                uniform_token_count=uniform_token_count,
+                max_query_len=max_query_len,
+            )
+        return super().dispatch(
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            num_active_loras,
+            max_query_len=max_query_len,
+            num_ubatches=num_ubatches,
+        )
+
     def run_fullgraph(self, desc: BatchExecutionDescriptor) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Override run_fullgraph to update full graph params in run_fullgraph."""
+        if self.tree_full_graph_manager is not None:
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_layout_active
+
+            if chain_layout_active():
+                return self.tree_full_graph_manager.run(desc)
         num_tokens = desc.num_tokens
         assert self.update_stream is not None
         with set_current_vllm_config(self.vllm_config):
@@ -273,6 +382,13 @@ class ModelAclGraphManager(ModelCudaGraphManager):
         pcp_manager: Any = None,
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
+        from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
+
+        speculator = self.model_runner.speculator
+        if isinstance(speculator, AscendTreeSpeculator) and speculator.packed_dsv4_verify():
+            from vllm_ascend.worker.v2.spec_decode.tree.full_graph import TreeFullGraphManager
+
+            self.tree_full_graph_manager = TreeFullGraphManager(self.model_runner)
         metadata = getattr(model_state, "device_metadata", None)
         model = ModelWithContext(model, device_metadata=metadata)
         pcp_manager = getattr(self.model_runner, "pcp_manager", None)

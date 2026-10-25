@@ -417,6 +417,8 @@ def build_attn_metadata(
     copy_sfa_restore_tails: bool = False,
     draft_layer_names: set[str] | None = None,
     common_metadata_callback=None,
+    tree_visibility: torch.Tensor | None = None,
+    slot_positions: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -548,6 +550,9 @@ def build_attn_metadata(
             dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
             pcp_context=pcp_context,
             pcp_cache_group_idx=i if pcp_context is not None else None,
+            tree_visibility=tree_visibility,
+            slot_positions=slot_positions,
+            for_cudagraph_capture=for_cudagraph_capture,
             **common_attn_metadata_extra_kwargs,
         )
         if common_metadata_callback is not None:
@@ -1433,6 +1438,10 @@ def _allocate_kv_cache(
                     (backend is None or not backend.is_sparse())
                     and not use_dcp
                     and not requires_contiguous_pa_kv_cache(layer, vllm_config, layer_spec)
+                    # Tree verification uses FIA BSND with a custom mask.
+                    # That ABI requires contiguous K/V on Ascend 910B;
+                    # interleaving K and V within each page violates it.
+                    and not get_ascend_config().tree_spec_config.enabled
                 ):
                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
                     continue
@@ -2017,3 +2026,12 @@ def build_attn_metadata_factory(
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = raw  # restore
+
+
+def build_draft_attn_metadata_factory(positions, pad, is_prefilling, seq_lens_np=None):
+    return build_attn_metadata_factory(
+        positions,
+        pad,
+        is_prefilling,
+        seq_lens_cpu=torch.from_numpy(seq_lens_np) if seq_lens_np is not None else None,
+    )

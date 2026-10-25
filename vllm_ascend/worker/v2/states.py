@@ -20,6 +20,8 @@
 import torch
 from vllm.v1.worker.gpu.states import RequestState
 
+from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
 
 class AscendRequestState(RequestState):
     """Request state for Ascend NPUs."""
@@ -32,6 +34,7 @@ class AscendRequestState(RequestState):
         num_speculative_steps: int,
         vocab_size: int,
         device: torch.device,
+        tree_shape: TreeShape | None = None,
     ):
         super().__init__(
             max_num_reqs,
@@ -44,3 +47,60 @@ class AscendRequestState(RequestState):
         # Ascend attention needs a torch CPU view of the upstream NumPy state.
         # Sharing storage keeps both APIs coherent without duplicate writes.
         self.num_computed_tokens_cpu: torch.Tensor = torch.from_numpy(self.num_computed_tokens_np)
+
+        if tree_shape is not None:
+            max_nodes = tree_shape.budget
+            self.draft_tokens: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=self.draft_tokens.dtype,
+                device=device,
+            )
+            self.tree_depths: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_parents: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_num_nodes: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_visibility: torch.Tensor = torch.zeros(
+                self.max_num_reqs,
+                max_nodes,
+                max_nodes,
+                dtype=torch.bool,
+                device=device,
+            )
+            self.tree_first_child: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.tree_next_sibling: torch.Tensor = torch.full(
+                (self.max_num_reqs, max_nodes + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+
+    def add_request(self, req_id, *args, **kwargs):
+        result = super().add_request(req_id, *args, **kwargs)
+        if hasattr(self, "tree_num_nodes"):
+            idx = self.req_id_to_index[req_id]
+            self.tree_num_nodes[idx] = 0
+            self.tree_depths[idx].zero_()
+            self.tree_parents[idx].fill_(-1)
+            self.tree_visibility[idx].zero_()
+            self.tree_first_child[idx].fill_(-1)
+            self.tree_next_sibling[idx].fill_(-1)
+        return result

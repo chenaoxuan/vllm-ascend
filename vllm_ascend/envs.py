@@ -29,6 +29,9 @@ from typing import Any
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Preserve the best sequential candidate path during tree pruning.
+    # Existing optional policy; 0 (default) disables, 1 enables. Not sensitive.
+    "VLLM_ASCEND_TREE_KEEP_GREEDY": lambda: os.getenv("VLLM_ASCEND_TREE_KEEP_GREEDY", "0") == "1",
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

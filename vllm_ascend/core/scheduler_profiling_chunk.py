@@ -1160,6 +1160,13 @@ class ProfilingChunkScheduler(Scheduler):
         return scheduler_output
 
 
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
+
+_patch_tree_verify_width(ProfilingChunkScheduler)
+
+
 class ProfilingChunkAsyncScheduler(AsyncScheduler, ProfilingChunkScheduler):
     """Profiling-chunk scheduler variant for async scheduling.
 

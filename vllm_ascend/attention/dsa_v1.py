@@ -28,6 +28,15 @@ from vllm_ascend.attention.dsa_attn_kv_plan import (
     write_dsa_cache,
 )
 from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla
+from vllm_ascend.attention.tree_spec import (
+    DsaTreeSpecAdapter,
+    align_up,
+    is_target_tree_step,
+    tree_decode_threshold,
+    tree_query_len,
+    tree_spec_enabled,
+    tree_treat_short_extends_as_decodes,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     enable_pcp,
@@ -90,6 +99,10 @@ else:
     build_dspark_swa_indices_triton = None  # type: ignore
     dspark_swa_indices_supported = None  # type: ignore
 
+from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+    chain_layout_active,
+    tree_cache_view,
+)
 
 # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
 DSA_METADATA_BUFFER_SIZE = 1024
@@ -137,6 +150,17 @@ def reset_compressor_metadata_cache() -> None:
     forward_context.additional_kwargs.pop(_COMPRESSOR_METADATA_CACHE_KEY, None)
 
 
+def _compressor_layout(metadata: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Packed request layout for compressor_metadata."""
+    return (
+        metadata.query_start_loc,
+        metadata.start_pos,
+        metadata.block_table,
+        metadata.num_compressed_tokens,
+        metadata.num_actual_reqs,
+    )
+
+
 def get_or_compute_compressor_metadata(
     metadata: Any,
     compress_ratio: int,
@@ -165,9 +189,12 @@ def get_or_compute_compressor_metadata(
 
     assert metadata.full_compress_cos is not None
     assert metadata.full_compress_sin is not None
-    assert metadata.num_compressed_tokens is not None
-    assert metadata.start_pos is not None
-    assert metadata.num_actual_reqs is not None
+    query_start_loc, start_pos, block_table, num_compressed_tokens, num_actual_reqs = (
+        _compressor_layout(metadata)
+    )
+    assert num_compressed_tokens is not None
+    assert start_pos is not None
+    assert num_actual_reqs is not None
     full_compress_cos = metadata.full_compress_cos.view(
         metadata.full_compress_cos.shape[0],
         metadata.full_compress_cos.shape[-1],
@@ -179,14 +206,14 @@ def get_or_compute_compressor_metadata(
     computed_metadata = torch.ops._C_ascend.compressor_metadata(
         full_compress_cos,
         full_compress_sin,
-        metadata.query_start_loc,
-        metadata.start_pos,
-        metadata.block_table,
+        query_start_loc,
+        start_pos,
+        block_table,
         metadata.storage_block_size,
         get_dsa_attn_kv_plan(vllm_config).get_dsa_compressor_slot_mapping_format(),
         compress_ratio,
-        metadata.num_compressed_tokens,
-        metadata.num_actual_reqs,
+        num_compressed_tokens,
+        num_actual_reqs,
     )
     cache[cache_group_key] = computed_metadata
     return computed_metadata
@@ -200,8 +227,11 @@ def build_compressor_metadata_out(
 ) -> None:
     assert metadata.full_compress_cos is not None
     assert metadata.full_compress_sin is not None
-    assert metadata.start_pos is not None
-    assert metadata.num_actual_reqs is not None
+    query_start_loc, start_pos, block_table, _, num_actual_reqs = _compressor_layout(
+        metadata
+    )
+    assert start_pos is not None
+    assert num_actual_reqs is not None
     full_compress_cos = metadata.full_compress_cos.view(
         metadata.full_compress_cos.shape[0],
         metadata.full_compress_cos.shape[-1],
@@ -213,13 +243,13 @@ def build_compressor_metadata_out(
     torch.ops._C_ascend.compressor_metadata_out(
         full_compress_cos,
         full_compress_sin,
-        metadata.query_start_loc,
-        metadata.start_pos,
-        metadata.block_table,
+        query_start_loc,
+        start_pos,
+        block_table,
         metadata.storage_block_size,
         get_dsa_attn_kv_plan(vllm_config).get_dsa_compressor_slot_mapping_format(),
         compress_ratio,
-        metadata.num_actual_reqs,
+        num_actual_reqs,
         *outputs,
     )
 
@@ -482,6 +512,7 @@ class AscendDSAReqMetadata:
     dspark_swa_topk_lengths: torch.Tensor | None = None
     use_sparse_flash_mla_for_draft: bool = False
     vision_swa_indices: torch.Tensor | None = None
+    tree_ori_indices: torch.Tensor | None = None
 
 
 @dataclass
@@ -507,6 +538,9 @@ class AscendDSAMetadata:
     # metadata for dsv4 indexer
 
     hadamard: torch.Tensor | None = None
+    # Mixed DSV4 target calls retain complete, independently built phase
+    # metadata. Tiling buffers are never sliced or shared between the phases.
+    tree_phases: tuple["AscendDSAMetadata | None", "AscendDSAMetadata | None"] | None = None
 
 
 DSAMetadataDict: TypeAlias = dict[str, AscendDSAMetadata]
@@ -773,6 +807,18 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             (max_num_batched_tokens, 2) if kv_plan.requires_block_offset_slots else (max_num_batched_tokens,)
         )
         self.dspark_swa_topk_lengths_buffer: torch.Tensor | None = None
+        self.tree_ori_indices_buffer: torch.Tensor | None = None
+        self.tree_ori_index_width: int | None = None
+        self.tree_spec_enabled = tree_spec_enabled(vllm_config)
+        self.tree_adapter = DsaTreeSpecAdapter() if self.tree_spec_enabled else None
+        # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
+        self.compressor_ratio = getattr(
+            kv_cache_spec,
+            "compress_ratio",
+            getattr(kv_cache_spec, "tokens_per_state", 0),
+        )
+        if self.tree_spec_enabled:
+            self.decode_threshold = tree_decode_threshold(vllm_config)
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             self.spec_slot_mapping = [
@@ -805,12 +851,20 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.dspark_swa_topk_lengths_buffer = torch.zeros(
                     (max_dspark_rows, 1), dtype=torch.int32, device=self.device
                 )
-            self.decode_threshold += spec_token_num
-            assert self.decode_threshold <= 16, (
-                f"decode_threshold exceeded \
-                npu_fused_infer_attention_score TND layout's limit of 16, \
-                got {self.decode_threshold}"
-            )
+            if self.tree_spec_enabled:
+                self.decode_threshold = tree_decode_threshold(vllm_config)
+            else:
+                self.decode_threshold += spec_token_num
+                assert self.decode_threshold <= 16, (
+                    f"decode_threshold exceeded \
+                    npu_fused_infer_attention_score TND layout's limit of 16, \
+                    got {self.decode_threshold}"
+                )
+
+        # Tree ori indices live on the SWA builder: C4/C128 forward reads
+        # ``swa_req_metadata``. Draft builders skip this in ``build_for_drafting``.
+        if self.tree_adapter is not None and self.compressor_ratio <= 1:
+            self.tree_adapter.configure_builder(self, vllm_config, device)
 
         self.reorder_batch_threshold = self.decode_threshold
         self.num_decodes = 0
@@ -823,12 +877,6 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.seq_lens: torch.Tensor = None
         self.tq_group_block_sizes: torch.Tensor | None = None
 
-        # vLLM #51718 renamed ``compress_ratio`` to ``tokens_per_state``.
-        self.compressor_ratio = getattr(
-            kv_cache_spec,
-            "compress_ratio",
-            getattr(kv_cache_spec, "tokens_per_state", 0),
-        )
         if not layer_names:
             raise ValueError("DSV4 compressor metadata builder requires at least one layer name")
         self.layer_names = list(layer_names)
@@ -837,7 +885,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         self.hadamard = None
         self._init_hadamard(layer_names)
         max_num_reqs = scheduler_config.max_num_seqs * self._request_capacity_factor
-        self.start_pos_prefill: torch.Tensor = torch.zeros(max_num_reqs, dtype=torch.int32, device=self.device)
+        self.start_pos_prefill: torch.Tensor = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=self.device
+        )
         self.sas_metadata_buffer: torch.Tensor = torch.zeros(
             DSA_METADATA_BUFFER_SIZE, dtype=torch.int32, device=self.device
         )
@@ -881,6 +931,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         # retain [block_idx, block_offset] mappings for paged cache writes.
         self.slot_mapping = torch.zeros(self.slot_mapping_shape, dtype=torch.int32, device=self.device)
         self.compressor_metadata_buffers: CompressorMetadataOutput | None = None
+        self._tree_phase_builders = None
 
     def _init_hadamard(self, layer_names: list[str]) -> None:
         hf_config = self.model_config.hf_config
@@ -920,6 +971,39 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
+    def _is_dspark_draft(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> bool:
+        gkey = self.cache_group_key or ""
+        return not bool(common_attn_metadata.causal) and (
+            gkey.startswith("mtp.") or ".mtp." in f".{gkey}."
+        )
+
+    def _split_decode_threshold(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+    ) -> int:
+        if (
+            self._is_dspark_draft(common_attn_metadata)
+            and self.speculative_config is not None
+        ):
+            return 1 + int(self.speculative_config.num_speculative_tokens)
+        return self.decode_threshold
+
+    def _tree_short_prefill(self, input_batch, req_index: int) -> bool:
+        """Tree decode_threshold is 1+budget; first prefills shorter than that stay prefills."""
+        if not self.tree_spec_enabled:
+            return False
+        is_pref = getattr(input_batch, "is_prefilling_np", None)
+        if is_pref is not None and req_index < len(is_pref):
+            return bool(is_pref[req_index])
+        num_prompt = getattr(input_batch, "num_prompt_tokens", None)
+        num_computed = getattr(input_batch, "num_computed_tokens_cpu", None)
+        if num_prompt is None or num_computed is None:
+            return False
+        return int(num_computed[req_index]) < int(num_prompt[req_index])
+
     def reorder_batch(self, input_batch: "NPUInputBatch", scheduler_output: "SchedulerOutput") -> bool:
         # We now want to reorder the batch so that the "decode" requests are at
         # the front and the "prefill" requests are at the using the least amount
@@ -932,7 +1016,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         for i, req_id in enumerate(input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if num_tokens <= self.decode_threshold:
+            if num_tokens <= self.decode_threshold and not self._tree_short_prefill(input_batch, i):
                 decodes.append(i)
             else:
                 prefills.append(i)
@@ -999,30 +1083,44 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         full_graph_mode: bool = False,
         **kwargs,
     ) -> AscendDSAMetadata:
+        if self.tree_spec_enabled and not kwargs.pop("tree_phase_build", False):
+            from vllm_ascend.worker.v2.spec_decode.tree import chain_pack
+
+            mixed = (chain_pack._LAYOUT or {}).get("mixed_batch")
+            if mixed is not None:
+                return self._build_mixed_tree_metadata(common_attn_metadata, mixed, kwargs)
         num_reqs = common_attn_metadata.num_reqs
         num_actual_reqs = kwargs.get("num_actual_reqs")
         self.common_ratio_to_sas_metadata = kwargs.get("common_ratio_to_sas_metadata")
         assert self.common_ratio_to_sas_metadata is not None
         self.set_num_actual_tokens(common_attn_metadata)
         num_input_tokens = common_attn_metadata.num_input_tokens
+        self._active_decode_threshold = self._split_decode_threshold(
+            common_attn_metadata
+        )
+        # DSpark context KV is pre-inserted before the block forward, so a
+        # short non-causal draft block is decode-shaped even when the target
+        # request is still in its first prefill.
+        self._active_treat_short_extends = (
+            True
+            if self._is_dspark_draft(common_attn_metadata)
+            else tree_treat_short_extends_as_decodes(
+                common_attn_metadata,
+                tree_enabled=self.tree_spec_enabled,
+            )
+        )
 
         if self.common_ratio_to_sas_metadata.get("num_decodes") is None:
             self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
                 split_decodes_and_prefills(
                     common_attn_metadata,
-                    decode_threshold=self.decode_threshold,
+                    decode_threshold=self._active_decode_threshold,
+                    treat_short_extends_as_decodes=self._active_treat_short_extends,
                 )
             )
-            self.common_ratio_to_sas_metadata["num_decodes"] = self.num_decodes
-            self.common_ratio_to_sas_metadata["num_prefills"] = self.num_prefills
-            self.common_ratio_to_sas_metadata["num_decode_tokens"] = self.num_decode_tokens
-            self.common_ratio_to_sas_metadata["num_prefill_tokens"] = self.num_prefill_tokens
             assert self.num_decodes + self.num_prefills == num_reqs
             assert self.num_decode_tokens + self.num_prefill_tokens == common_attn_metadata.num_actual_tokens
             self.seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-            self.common_ratio_to_sas_metadata["seq_lens"] = self.seq_lens
-            # Prefer _seq_lens_cpu (always available, updated during draft
-            # iterations) over seq_lens_cpu (None in async spec decode mode).
             if common_attn_metadata._seq_lens_cpu is not None:
                 seq_lens_cpu = common_attn_metadata._seq_lens_cpu
             elif common_attn_metadata.seq_lens_cpu is not None:
@@ -1040,6 +1138,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 input_positions,
                 use_cache=need_use_rope_cache,
             )
+            self.common_ratio_to_sas_metadata["num_decodes"] = self.num_decodes
+            self.common_ratio_to_sas_metadata["num_prefills"] = self.num_prefills
+            self.common_ratio_to_sas_metadata["num_decode_tokens"] = self.num_decode_tokens
+            self.common_ratio_to_sas_metadata["num_prefill_tokens"] = self.num_prefill_tokens
+            self.common_ratio_to_sas_metadata["seq_lens"] = self.seq_lens
+            self.common_ratio_to_sas_metadata["seq_lens_cpu"] = seq_lens_cpu
             self.common_ratio_to_sas_metadata["cos"] = cos
             self.common_ratio_to_sas_metadata["sin"] = sin
         else:
@@ -1087,6 +1191,60 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             hadamard=self.hadamard,
         )
 
+    def _build_mixed_tree_metadata(self, common, mixed, kwargs):
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import linear_prefill_scope
+
+        if self._tree_phase_builders is None:
+            # Each builder owns start_pos, slots, SAS/QLI and compressor
+            # buffers. Reusing one builder for both phases would overwrite the
+            # first result and its deferred metadata closures. Mixed target
+            # calls build these independent metadata buffers eagerly.
+            self._tree_phase_builders = tuple(
+                AscendDSAMetadataBuilder(
+                    self.kv_cache_spec, self.layer_names, self.vllm_config,
+                    self.device, metadata_cls=self.metadata_cls,
+                )
+                for _ in range(2)
+            )
+        shared = kwargs["common_ratio_to_sas_metadata"]
+        self.common_ratio_to_sas_metadata = shared
+        caches = shared.setdefault("tree_phase_caches", ({}, {}))
+        results = []
+        for index, phase in enumerate((mixed.decode, mixed.prefill)):
+            if phase.num_reqs == 0:
+                results.append(None)
+                continue
+            child_kwargs = dict(kwargs)
+            child_kwargs.update(
+                common_ratio_to_sas_metadata=caches[index],
+                num_actual_reqs=phase.num_reqs,
+                full_graph_mode=False,
+                tree_phase_build=True,
+            )
+            if "formatted_slot_mapping" in child_kwargs:
+                child_kwargs["formatted_slot_mapping"] = child_kwargs["formatted_slot_mapping"].index_select(
+                    0, phase.token_indices
+                )
+            phase_common = phase.common_metadata(common)
+            builder = self._tree_phase_builders[index]
+            if phase.prefilling:
+                with linear_prefill_scope():
+                    metadata = builder.build(0, phase_common, can_use_rope_cache=False, **child_kwargs)
+            else:
+                metadata = builder.build(0, phase_common, can_use_rope_cache=False, **child_kwargs)
+            results.append(metadata)
+        self._device_metadata_tasks = ()
+        return self.metadata_cls(
+            num_actual_tokens=common.num_actual_tokens,
+            num_decodes=mixed.decode.num_reqs,
+            num_decode_tokens=mixed.decode.num_tokens,
+            num_prefills=mixed.prefill.num_reqs,
+            head_dim=self.model_config.get_head_size(),
+            attn_state=common.attn_state,
+            hadamard=self.hadamard,
+            tree_phases=tuple(results),
+        )
+
     def _build_sas_metadata(
         self,
         metadata_cache: dict,
@@ -1098,8 +1256,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         cu_seqlens_ori_kv: torch.Tensor | None,
         cu_seqlens_cmp_kv: torch.Tensor | None,
         ori_win_left: int,
-        ori_win_right: int,
-        dspark_swa: bool,
+        ori_win_right: int = 0,
+        ori_topk: int = 0,
+        has_cmp_kv: bool | None = None,
+        dspark_swa: bool = False,
     ) -> torch.Tensor:
         # DSpark widens the SWA window to include the whole draft block.
         # Metadata and execution must use the same window so split-G cores
@@ -1109,13 +1269,21 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             tp_size = get_tensor_model_parallel_world_size()
             n_local_heads = self.model_config.hf_config.num_attention_heads // tp_size
             index_topk = self.model_config.hf_config.index_topk
-            cmp_ratio = (
-                _dsa_swa_only_cmp_ratio(self.compressor_ratio, self.vllm_config)
-                if self.compressor_ratio <= 1
-                else 4
-                if self.compressor_ratio == 4
-                else 128
-            )
+            if has_cmp_kv is None:
+                has_cmp_kv = self.compressor_ratio > 1
+            # A3 SCFA (has_cmp_kv) ignores ori_sparse_indices. Packed tree
+            # therefore runs the SWA template on C4 layers so tree slots apply.
+            if has_cmp_kv:
+                sas_ori_topk = 0
+                cmp_ratio = 4 if self.compressor_ratio == 4 else 128
+            elif self.compressor_ratio <= 1:
+                sas_ori_topk = ori_topk
+                cmp_ratio = _dsa_swa_only_cmp_ratio(
+                    self.compressor_ratio, self.vllm_config
+                )
+            else:
+                sas_ori_topk = ori_topk
+                cmp_ratio = 1
             kv_plan = get_dsa_attn_kv_plan(self.vllm_config, self.compressor_ratio)
             metadata_op = kv_plan.get_dsa_sparse_attn_metadata_op()
             metadata_kwargs = kv_plan.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
@@ -1133,22 +1301,27 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 head_dim=self.model_config.get_head_size(),
                 cu_seqlens_q=query_start_loc,
                 cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv if has_cmp_kv else None,
                 seqused_q=self.seqused_q,
                 seqused_kv=sas_seq_lens,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=len(seq_lens),
-                cmp_topk=index_topk if self.compressor_ratio == 4 else 0,
+                ori_topk=sas_ori_topk,
+                cmp_topk=index_topk if has_cmp_kv and self.compressor_ratio == 4 else 0,
                 cmp_ratio=cmp_ratio,
                 ori_mask_mode=0 if dspark_swa else 4,
                 cmp_mask_mode=3,  # 3:causal
+                # Must match the runtime ori_win_* / ori_sparse_indices width.
+                # Tree verify and DSpark draft widen the window past SWA-only
+                # ``W-1``; a shorter SAS workspace drops the newest prefix slot
+                # (the root's just-written KV) and root logits collapse.
                 ori_win_left=ori_win_left,
                 ori_win_right=ori_win_right,
                 layout_q="TND",
                 layout_kv=_dsa_layout_kv(self.vllm_config),
                 has_ori_kv=True,
-                has_cmp_kv=self.compressor_ratio > 1,
+                has_cmp_kv=has_cmp_kv,
             )
             metadata_cache[layer_name] = sas_metadata
 
@@ -1420,7 +1593,10 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             if num_actual_reqs < num_reqs:
                 self.start_pos_prefill[num_actual_reqs:num_reqs].fill_(0)
                 self.block_table[num_actual_reqs:num_reqs, ...].fill_(0)
-        layer_name = f"c{self.compressor_ratio}"
+        # RoPE registry keys are ``c4`` / ``c1`` / ``c128``. SAS metadata for
+        # two ratio=1 pools (96+ vs 192+) must not share that key.
+        rope_group = f"c{self.compressor_ratio}"
+        layer_name = f"{rope_group}:{self.cache_group_key}"
         cu_seqlens_ori_kv = None
         cu_seqlens_cmp_kv = None
         dspark_swa_indices = None
@@ -1440,9 +1616,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         ):
             # DSpark non-causal parallel drafting: every draft query attends to
             # the trailing context window plus the whole current draft block.
-            # Not gated on the SAS metadata cache: the indices depend on the
-            # current step's block table / sequence lengths, so they must be
-            # rebuilt whenever a DSpark draft step runs.
+            # This is required for both the first prefill and later decode
+            # steps; prefill/decode only changes the SAS metadata layout.
             assert self.speculative_config is not None
             if use_sparse_flash:
                 if self.dspark_swa_topk_lengths_buffer is None:
@@ -1477,6 +1652,34 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 )
                 dspark_swa_topk_lengths = None
             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+        tree_ori_indices = None
+        # tree_visibility is allocated on every target batch, including prompt
+        # prefill; only the decode-shaped packed window is tree verify.
+        tree_step = (
+            not has_prefill
+            and self.tree_adapter is not None
+            and (get_ascend_config().tree_spec_config.topk or 0) > 1
+            and is_target_tree_step(common_attn_metadata)
+        )
+        packed_tree = tree_step
+        if tree_step:
+            window = int(self.model_config.hf_config.sliding_window)
+            budget = (tree_query_len() or 1) - 1
+            ori_win_left, ori_win_right = window + budget - 1, 0
+            idx_key = f"tree_ori_indices:{self.cache_group_key}"
+            tree_ori_indices = self.common_ratio_to_sas_metadata.get(idx_key)
+            gkey = self.cache_group_key or ""
+            if (
+                tree_ori_indices is None
+                and self.compressor_ratio <= 1
+                and "state_cache" not in gkey
+            ):
+                tree_ori_indices = self.tree_adapter.build_target_inputs(
+                    self,
+                    common_attn_metadata,
+                    num_decodes=self.num_decodes,
+                )
+                self.common_ratio_to_sas_metadata[idx_key] = tree_ori_indices
         # Text-only requests and lightweight metadata fixtures do not carry
         # multimodal document ranges. Treat those as having no vision spans.
         mm_ranges = getattr(common_attn_metadata, "mm_req_doc_ranges", None)
@@ -1519,13 +1722,24 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         elif has_prefill:
             cu_seqlens_ori_kv = query_start_loc
 
+        tree_ori_topk = tree_ori_indices.shape[-1] if tree_ori_indices is not None else 0
+        if packed_tree and tree_ori_topk == 0:
+            window = int(self.model_config.hf_config.sliding_window)
+            budget = (tree_query_len() or 1) - 1
+            tree_ori_topk = align_up(window + budget, 128)
+        # Tree nodes already occupy distinct KV slots (prefix + query
+        # offset). Compressed attention uses the same seq_lens, so those
+        # slots stay visible. Do not shorten or skip them.
+        sas_has_cmp = self.compressor_ratio > 1
+        sas_seq_lens = seq_lens
+        sas_max_kv = max_seqlen_kv
         def build_sas_metadata() -> torch.Tensor:
             if use_sparse_flash:
                 assert dspark_swa_indices is not None
                 assert dspark_swa_topk_lengths is not None
                 result = self._build_dspark_sparse_flash_mla_metadata(
                     query_start_loc=query_start_loc,
-                    seq_lens=seq_lens,
+                    seq_lens=sas_seq_lens,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_kv=max_seqlen_kv,
                     ori_topk_length=dspark_swa_topk_lengths,
@@ -1545,6 +1759,8 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 ori_win_left=ori_win_left,
                 ori_win_right=ori_win_right,
                 dspark_swa=dspark_swa_indices is not None,
+                ori_topk=tree_ori_topk,
+                has_cmp_kv=sas_has_cmp,
             )
 
         if self._device_metadata_enabled:
@@ -1553,12 +1769,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self._build_qli_metadata(
                     metadata_cache=metadata_cache,
                     query_start_loc=query_start_loc,
-                    seq_lens=seq_lens,
+                    seq_lens=sas_seq_lens,
                     max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
+                    max_seqlen_kv=sas_max_kv,
                 )
 
-            if self.compressor_ratio == 4:
+            if self.compressor_ratio == 4 and sas_has_cmp:
                 self._device_metadata_tasks = (
                     DeviceMetadataTask(DeviceMetadataStage.INDEXER, build_qli_metadata, id(self.qli_metadata_buffer)),
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
@@ -1568,7 +1784,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                     DeviceMetadataTask(DeviceMetadataStage.ATTENTION, build_sas_metadata, id(self.sas_metadata_buffer)),
                 )
             sas_metadata = self.sas_metadata_buffer
-            qli_metadata = self.qli_metadata_buffer if self.compressor_ratio == 4 else None
+            qli_metadata = (
+                self.qli_metadata_buffer
+                if self.compressor_ratio == 4 and sas_has_cmp
+                else None
+            )
         else:
             self._device_metadata_tasks = ()
             sas_metadata = build_sas_metadata()
@@ -1576,11 +1796,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self._build_qli_metadata(
                     metadata_cache=metadata_cache,
                     query_start_loc=query_start_loc,
-                    seq_lens=seq_lens,
+                    seq_lens=sas_seq_lens,
                     max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv,
+                    max_seqlen_kv=sas_max_kv,
                 )
-                if self.compressor_ratio == 4
+                if self.compressor_ratio == 4 and sas_has_cmp
                 else None
             )
 
@@ -1592,7 +1812,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 num_actual_reqs = num_reqs
             else:
                 num_compressed_tokens = self._num_compressor_metadata_rows(num_reqs)
-            full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(layer_name)
+            full_compress_cos, full_compress_sin = get_full_cos_and_sin_dsa(rope_group)
             slot_mapping = None
         else:
             num_compressed_tokens = self.num_actual_tokens
@@ -1636,8 +1856,12 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
             dspark_swa_topk_lengths=dspark_swa_topk_lengths,
             vision_swa_indices=vision_swa_indices,
             use_sparse_flash_mla_for_draft=use_sparse_flash,
+            tree_ori_indices=tree_ori_indices,
         )
-        if self._device_metadata_enabled and self.compressor_metadata_buffers is not None:
+        if (
+            self._device_metadata_enabled
+            and self.compressor_metadata_buffers is not None
+        ):
             assert num_compressed_tokens is not None
             buffers = self.compressor_metadata_buffers
             outputs = (
@@ -1668,10 +1892,15 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         **kwargs,
     ) -> AscendDSAMetadata:
         assert self.compressor_ratio <= 1, "vLLM-Ascend only support SWA-layer for Deepseek-V4 now."
+        # Draft keep the linear DSpark threshold; tree 1+budget is target-only.
+        draft_threshold = self._split_decode_threshold(common_attn_metadata)
+        self._active_decode_threshold = draft_threshold
+        self._active_treat_short_extends = True
         self.num_decodes, self.num_prefills, self.num_decode_tokens, self.num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,
-                decode_threshold=self.decode_threshold,
+                decode_threshold=draft_threshold,
+                treat_short_extends_as_decodes=True,
             )
         )
         num_reqs = common_attn_metadata.num_reqs
@@ -2069,28 +2298,33 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         self,
         attn_layer_name: str,
         attn_metadata: DSAMetadataDict,
+        tree_phase: int | None = None,
     ) -> AscendDSALayerMetadata:
+        def select(name):
+            metadata = attn_metadata[name]
+            return metadata if tree_phase is None else metadata.tree_phases[tree_phase]
+
         assert self.swa_cache_layer is not None
-        swa_metadata = attn_metadata[self.swa_cache_layer.prefix]
+        swa_metadata = select(self.swa_cache_layer.prefix)
         attention_metadata = None
         compressor_metadata = None
         indexer_metadata = None
 
         if self.compress_ratio > 1:
             assert self.compressor is not None
-            attention_metadata = attn_metadata[attn_layer_name]
+            attention_metadata = select(attn_layer_name)
             compressor_metadata = AscendCompressorMetadata(
                 cache=attention_metadata,
-                state=attn_metadata[self.compressor.state_cache.prefix],
+                state=select(self.compressor.state_cache.prefix),
             )
             if self.compress_ratio == 4:
                 assert self.indexer is not None
                 assert self.indexer.compressor is not None
-                indexer_cache_metadata = attn_metadata[self.indexer.k_cache.prefix]
+                indexer_cache_metadata = select(self.indexer.k_cache.prefix)
                 indexer_metadata = AscendIndexerMetadata(
                     compressor=AscendCompressorMetadata(
                         cache=indexer_cache_metadata,
-                        state=attn_metadata[self.indexer.compressor.state_cache.prefix],
+                        state=select(self.indexer.compressor.state_cache.prefix),
                     ),
                 )
 
@@ -2322,33 +2556,74 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
             return output
 
-        req_metadata = _require_req_metadata(common_attn_metadata)
-        o_proj_input[:actual_tokens] = self._forward_attention(
-            layer_name,
-            hidden_states[:actual_tokens],
-            kv_cache,
-            layer_metadata,
-            cache_is_prepared,
-        )
-        cos = req_metadata.cos[layer_name]
-        sin = req_metadata.sin[layer_name]
+        if common_attn_metadata.tree_phases is not None:
+            self._forward_mixed_tree_attention(
+                layer_name, hidden_states, kv_cache, attn_metadata, o_proj_input,
+            )
+        else:
+            req_metadata = _require_req_metadata(common_attn_metadata)
+            o_proj_input[:actual_tokens] = self._forward_attention(
+                layer_name,
+                hidden_states[:actual_tokens],
+                kv_cache,
+                layer_metadata,
+                cache_is_prepared,
+            )
+            cos = req_metadata.cos[layer_name]
+            sin = req_metadata.sin[layer_name]
 
-        negate_sin = get_current_hardware_profile().supports(HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN)
-        sin_arg = sin[:actual_tokens] if negate_sin else -sin[:actual_tokens]
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input[:actual_tokens].unsqueeze(1),
-            cos[:actual_tokens],
-            sin_arg,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-            negate_sin=negate_sin,
-        )
+            negate_sin = get_current_hardware_profile().supports(HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN)
+            sin_arg = sin[:actual_tokens] if negate_sin else -sin[:actual_tokens]
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                o_proj_input[:actual_tokens].unsqueeze(1),
+                cos[:actual_tokens],
+                sin_arg,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+                negate_sin=negate_sin,
+            )
 
         # o
         self._forward_o_proj(o_proj_input, output)
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
+
+    def _forward_mixed_tree_attention(self, layer_name, hidden, caches, metadata, output):
+        from vllm_ascend.worker.v2.spec_decode.tree import chain_pack
+
+        mixed = chain_pack._LAYOUT["mixed_batch"]
+        # Prefill writes its ordinary persistent caches; decode writes private
+        # nodes. Both calls include projection, compression, quantization,
+        # indexer selection, cache scatter and attention through the same entry.
+        for index, phase in ((1, mixed.prefill), (0, mixed.decode)):
+            if phase.num_reqs == 0:
+                continue
+            layer = self._get_layer_metadata(layer_name, metadata, tree_phase=index)
+            phase_hidden = hidden.index_select(0, phase.token_indices)
+            if phase.prefilling:
+                with chain_pack.linear_prefill_scope():
+                    result = self._forward_attention(
+                        layer_name, phase_hidden, caches, layer, notify_cache_write=False,
+                    )
+            else:
+                result = self._forward_attention(
+                    layer_name, phase_hidden, caches, layer, notify_cache_write=False,
+                )
+            common = layer.attention if layer.attention is not None else layer.swa
+            req = _require_req_metadata(common)
+            cos, sin = req.cos[layer_name], req.sin[layer_name]
+            negate_sin = get_current_hardware_profile().supports(
+                HardwareCapability.INPLACE_PARTIAL_ROTARY_MUL_NEGATE_SIN
+            )
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                result.unsqueeze(1), cos[:phase.num_tokens],
+                sin[:phase.num_tokens] if negate_sin else -sin[:phase.num_tokens],
+                rotary_mode="interleave", partial_slice=[self.nope_head_dim, self.head_dim],
+                negate_sin=negate_sin,
+            )
+            output.index_copy_(0, phase.token_indices, result)
+        notify_kv_cache_written(layer_name)
 
     def _mla_prolog_single_stream(
         self,
@@ -2604,11 +2879,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                     overlap_result, compressor_done = compressor_overlap_output
                     torch.npu.current_stream().wait_event(compressor_done)
                     return overlap_result
-                return compressor(
-                    hidden_states=hidden_states,
-                    state_cache=state_cache,
-                    metadata=layer_metadata.compressor,
+                from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+                    chain_kv_scope,
                 )
+
+                with chain_kv_scope([compress_kv_cache]):
+                    return compressor(
+                        hidden_states=hidden_states,
+                        state_cache=state_cache,
+                        metadata=layer_metadata.compressor,
+                    )
 
             def scatter_attention_compressed_kv(
                 compressed_kv: torch.Tensor,
@@ -2616,7 +2896,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             ) -> None:
                 if compressed_kv.shape[0] > 0:
                     self._write_kv_cache(
-                        compress_kv_cache,
+                        tree_cache_view(compress_kv_cache),
                         compressed_kv,
                         compress_slot_mapping,
                         quantize=True,
@@ -2625,7 +2905,15 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             overlap_plan = IndexerOverlapPlan(
                 compute_attention_compressed_kv=compute_attention_compressed_kv,
                 scatter_attention_compressed_kv=scatter_attention_compressed_kv,
-                aux_stream=dsv4_dsa_overlap_stream() if self.multistream_dsv4_dsa_overlap else None,
+                aux_stream=(
+                    dsv4_dsa_overlap_stream()
+                    if (
+                        write_cache
+                        and self.multistream_dsv4_dsa_overlap
+                        and not chain_layout_active()
+                    )
+                    else None
+                ),
             )
             return self.indexer(
                 hidden_states=hidden_states,
@@ -2644,14 +2932,17 @@ class AscendDSAImpl(AttentionImplBase[Any]):
             (compressed_kv, compress_slot_mapping), compressor_done = compressor_overlap_output
             torch.npu.current_stream().wait_event(compressor_done)
         else:
-            compressed_kv, compress_slot_mapping = compressor(
-                hidden_states=hidden_states,
-                state_cache=state_cache,
-                metadata=layer_metadata.compressor,
-            )
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import chain_kv_scope
+
+            with chain_kv_scope([compress_kv_cache]):
+                compressed_kv, compress_slot_mapping = compressor(
+                    hidden_states=hidden_states,
+                    state_cache=state_cache,
+                    metadata=layer_metadata.compressor,
+                )
         if compressed_kv.shape[0] > 0:
             self._write_kv_cache(
-                compress_kv_cache,
+                tree_cache_view(compress_kv_cache),
                 compressed_kv,
                 compress_slot_mapping,
                 quantize=True,
@@ -2665,6 +2956,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         kv_cache: tuple[torch.Tensor, ...],
         layer_metadata: AscendDSALayerMetadata,
         cache_is_prepared: bool = False,
+        *,
+        notify_cache_write: bool = True,
     ) -> torch.Tensor:
         # DSA PCP sets cache_is_prepared after global cache updates and forces
         # single-stream attention because there is no local KV update to overlap.
@@ -2687,6 +2980,10 @@ class AscendDSAImpl(AttentionImplBase[Any]):
 
         common_metadata = _require_req_metadata(common_attn_metadata)
         swa_req_metadata = _require_req_metadata(swa_metadata)
+        # dspark-ori-binding-fix:v1
+        if chain_layout_active():
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_binding import record_original_kv
+            record_original_kv(layer_name, swa_kv_cache, swa_req_metadata)
         has_prefill = common_attn_metadata.num_prefills > 0
         num_tokens = hidden_states.shape[0]
         cos = common_metadata.cos[layer_name][:num_tokens]
@@ -2696,21 +2993,32 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         ori_win_left = self.window_size - 1 if swa_req_metadata.ori_win_left is None else swa_req_metadata.ori_win_left
         ori_win_right = 0 if swa_req_metadata.ori_win_right is None else swa_req_metadata.ori_win_right
 
+        if chain_layout_active() and cache_is_prepared:
+            raise RuntimeError("Packed V4 verification requires its own cache updates")
+
+        write_swa_cache = not cache_is_prepared
+        write_cmp = not cache_is_prepared
+        use_overlap = self.multistream_dsv4_dsa_overlap and not chain_layout_active()
         compressor_tail_fn = None
-        if self.multistream_dsv4_dsa_overlap and self.compress_ratio > 1:
+        if use_overlap and self.compress_ratio > 1 and write_cmp:
             compressor = self.compressor
             tail_compressor_metadata = layer_metadata.compressor
             assert compressor is not None
             assert tail_compressor_metadata is not None
 
             def compressor_tail_fn() -> CompressorForwardOutput:
-                return compressor(
-                    hidden_states=hidden_states,
-                    state_cache=state_cache,
-                    metadata=tail_compressor_metadata,
+                from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+                    chain_kv_scope,
                 )
 
-        if self.multistream_dsv4_dsa_overlap:
+                with chain_kv_scope([compress_kv_cache]):
+                    return compressor(
+                        hidden_states=hidden_states,
+                        state_cache=state_cache,
+                        metadata=tail_compressor_metadata,
+                    )
+
+        if use_overlap and write_cmp:
             q, qr, qr_pertoken_scale, compressor_overlap_output = self._mla_prolog_multistream(
                 hidden_states,
                 cos,
@@ -2728,7 +3036,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 sin,
                 swa_kv_cache,
                 swa_req_metadata.slot_mapping,
-                write_swa_cache=not cache_is_prepared,
+                write_swa_cache=write_swa_cache,
             )
 
         compress_topk_idxs = None
@@ -2746,12 +3054,27 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 compress_kv_cache=compress_kv_cache,
                 state_cache=state_cache,
                 compressor_overlap_output=compressor_overlap_output,
-                write_cache=not cache_is_prepared,
+                write_cache=write_cmp,
             )
 
-        notify_kv_cache_written(layer_name)
+        if notify_cache_write:
+            notify_kv_cache_written(layer_name)
+        if self.compress_ratio > 1 and chain_layout_active():
+            from vllm_ascend.worker.v2.spec_decode.tree.node_pool import attend_nodes
+
+            record_attention_compute_start()
+            return attend_nodes(
+                q,
+                swa_kv_cache,
+                compress_kv_cache,
+                swa_req_metadata,
+                compress_topk_idxs,
+                self.attn_sink,
+                self.compress_ratio,
+                self.window_size,
+                self.softmax_scale,
+            )
         wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_metadata.sas_metadata))
-        record_attention_compute_start()
         kv_plan = self.get_kv_plan()
         attn_op = kv_plan.get_dsa_sparse_attn_op()
         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
@@ -2795,7 +3118,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
                 )
             elif swa_req_metadata.dspark_swa_indices is not None:
                 attn_kwargs["ori_sparse_indices"] = swa_req_metadata.dspark_swa_indices
-        else:
+        if swa_req_metadata.tree_ori_indices is not None:
+            attn_kwargs["ori_sparse_indices"] = swa_req_metadata.tree_ori_indices
+        if self.compress_ratio > 1:
             assert compressor_metadata is not None
             attn_kwargs.update(
                 cmp_kv=compress_kv_cache,
@@ -2809,5 +3134,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
         if self.turboquant is not None:
             q = self.turboquant.forward(q)
         with attention_transfer_window():
-            result = attn_op(q, **attn_kwargs)[0]
-        return self.turboquant.inverse(result) if self.turboquant is not None else result
+            attn_out = attn_op(q, **attn_kwargs)[0]
+        if self.turboquant is not None:
+            attn_out = self.turboquant.inverse(attn_out)
+        return attn_out

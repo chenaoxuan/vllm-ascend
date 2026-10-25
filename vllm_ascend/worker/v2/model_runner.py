@@ -117,13 +117,16 @@ from vllm_ascend.worker.v2.attn_utils import (
     skip_ring_state_update,
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
-from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled, init_speculator, tree_target_query_len
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+from vllm_ascend.worker.v2.spec_decode.tree.draft_tokens import TreeDraftTokensHandler
+from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
     AscendV2KVBlockZeroer,
@@ -203,6 +206,9 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.tree_kv_compact = None
+        self.tree_commit = None
+        self.tree_verification_plan = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -223,9 +229,21 @@ class NPUModelRunner(GPUModelRunner):
             # Shared update_stream: main model (ModelAclGraphManager) and draft
             # (Eagle/DFlash/DSpark AclGraphManager) all use this same stream.
             self.speculator.update_stream = self.update_stream
+        self._dsv4_tree_chain = (
+            isinstance(self.speculator, AscendTreeSpeculator)
+            and self.speculator._dsv4_dspark_draft
+            and self.speculator.topk == 1
+        )
+        self.tree_host_metadata = None
+        if isinstance(self.speculator, AscendTreeSpeculator) and self.speculator.packed_dsv4_verify():
+            from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import TreeHostMetadata
 
+            self.tree_host_metadata = TreeHostMetadata()
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
+        # Non-last PP ranks also prepare tree metadata, although only the last
+        # rank owns a drafter and sampler.
+        self.tree_shape = TreeShape.from_config(self.vllm_config)
         self.req_states: AscendRequestState = AscendRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -233,7 +251,22 @@ class NPUModelRunner(GPUModelRunner):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            tree_shape=self.tree_shape,
         )
+
+        if self._dsv4_tree_chain:
+            # DSV4 topk=1 publishes a K-token chain. Keep request-state storage
+            # at that width while tree metadata retains its budget capacity.
+            self.req_states.draft_tokens = self.req_states.draft_tokens[:, : self.num_speculative_steps].contiguous()
+        if (
+            isinstance(self.speculator, AscendTreeSpeculator)
+            and not self._dsv4_tree_chain
+            and not self.scheduler_config.async_scheduling
+        ):
+            # Sync scheduling consumes these published rows. Async scheduling
+            # retains its existing K-wide scheduler-owned placeholder contract.
+            with torch_cuda_wrapper():
+                self.draft_tokens_handler = TreeDraftTokensHandler(self.device, self.req_states, self.speculator)
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
         self.input_buffers: AscendInputBuffers = AscendInputBuffers(
@@ -253,9 +286,14 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm.
-        self.decode_query_len = self.num_speculative_steps + 1
+        # Qwen3 packed tree and DSV4 topk>1 are ``1+budget``. DSV4 topk=1
+        # is ``1+spec``. Path TND may emit more tokens later; MC2 dummy
+        # must stay on this scheduler width.
+        if dflash_tree_spec_enabled(vllm_config):
+            qlen = tree_target_query_len(vllm_config)
+            self.decode_query_len = qlen if qlen is not None else self.num_speculative_steps + 1
+        else:
+            self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
@@ -319,6 +357,14 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        if dflash_tree_spec_enabled(self.vllm_config) and isinstance(self.speculator, AscendTreeSpeculator):
+            from vllm_ascend.worker.v2.spec_decode.tree.commit import TreeCommitCoordinator
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
+
+            self.tree_kv_compact = TreeKvCompact(self)
+            self.speculator.tree_kv_compact = self.tree_kv_compact
+            self.tree_commit = TreeCommitCoordinator(self)
+            self.speculator.tree_commit = self.tree_commit
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -397,6 +443,16 @@ class NPUModelRunner(GPUModelRunner):
             pcp_manager._sampling_hidden_restored = False
         self._restore_replicated_draft_target_states()
         output = super().sample_tokens(grammar_output)
+        if self.is_last_pp_rank and isinstance(self.speculator, AscendTreeSpeculator):
+            tree = self.speculator.tree
+            input_batch = self.speculator.input_batch
+            idx = input_batch.idx_mapping
+            self.req_states.tree_depths[idx] = tree.depths
+            self.req_states.tree_parents[idx] = tree.parents
+            self.req_states.tree_visibility[idx] = tree.visibility
+            self.req_states.tree_num_nodes[idx] = tree.num_nodes
+            self.req_states.tree_first_child[idx] = tree.first_child
+            self.req_states.tree_next_sibling[idx] = tree.next_sibling
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()
@@ -411,6 +467,19 @@ class NPUModelRunner(GPUModelRunner):
         # _pool() on the pooling path.
         self._finalize_dump_data()
         return output
+
+    def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().add_requests(scheduler_output)
+        if self.tree_host_metadata is not None:
+            self.tree_host_metadata.add_requests(scheduler_output.scheduled_new_reqs)
+
+    def update_requests(self, scheduler_output: SchedulerOutput) -> None:
+        super().update_requests(scheduler_output)
+        if self.tree_host_metadata is not None:
+            self.tree_host_metadata.update_requests(
+                scheduler_output.scheduled_cached_reqs,
+                self.req_states.req_id_to_index,
+            )
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return apply_dspark_resident_kv_specs(
@@ -797,6 +866,29 @@ class NPUModelRunner(GPUModelRunner):
         if self._uses_flashmla and batch_state is not None:
             # The backend order must precede derived inputs and graph dispatch.
             batch_state, uniform_token_count = prepare_flashmla_batch_req_state(batch_state, uniform_token_count)
+        if isinstance(self.speculator, AscendTreeSpeculator) and self.speculator.packed_dsv4_verify():
+            manager = self.cudagraph_manager
+            if manager is not None:
+                manager.tree_batch_shape = None
+                state = batch_state
+                manager.tree_mixed_batch = bool(
+                    state is not None
+                    and state.has_prefill
+                    and any(scheduler_output.scheduled_spec_decode_tokens.values())
+                )
+                if manager.tree_mixed_batch:
+                    # A prompt-tail row may otherwise look decode-shaped. Mixed
+                    # DSV4 state modes use ordinary eager dispatch; pure decode
+                    # retains the exact tree FULL gear below.
+                    batch_state = state = state._replace(decode_graph_eligible=False)
+                    uniform_token_count = None
+                if (
+                    manager.tree_full_graph_manager is not None
+                    and state is not None
+                    and not state.has_prefill
+                    and any(scheduler_output.scheduled_spec_decode_tokens.values())
+                ):
+                    manager.tree_batch_shape = (len(state.req_ids), state.num_tokens)
         return batch_state, uniform_token_count
 
     def _check_finegrained_tp_graph_step(self, cg_mode: CUDAGraphMode) -> None:
@@ -821,6 +913,14 @@ class NPUModelRunner(GPUModelRunner):
         seq_lens_cpu here.
         """
         self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
+        if self._dsv4_tree_chain:
+            for req_id, draft_ids in scheduler_output.scheduled_spec_decode_tokens.items():
+                if len(draft_ids) > self.num_speculative_steps:
+                    raise RuntimeError(
+                        f"V4 topk=1 request {req_id} scheduled {len(draft_ids)} drafts; "
+                        f"expected at most {self.num_speculative_steps}. "
+                        "Restart after applying both chain-width changes."
+                    )
         num_tokens = batch_req_state.num_tokens
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         graph_num_reqs = batch_desc.num_reqs
@@ -968,14 +1068,43 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
+        tree_depths = (
+            self.req_states.tree_depths
+            if dflash_tree_spec_enabled(self.vllm_config) and not self._dsv4_tree_chain
+            else None
         )
+        # topk>1 packed tree: RoPE from depth, KV from unique slot_positions.
+        # DSV4 DSpark beam must take this path; linear pos makes siblings
+        # look like a chain and tanks acceptance. topk=1 stays linear.
+        use_tree_pos = (
+            tree_depths is not None
+            and self.ascend_config.tree_spec_config.topk is not None
+            and self.ascend_config.tree_spec_config.topk > 1
+        )
+        if use_tree_pos:
+            is_prefilling = async_copy_to_gpu(
+                torch.from_numpy(batch_req_state.is_prefilling_np),
+                device=self.device,
+            )
+            prepare_tree_spec_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                is_prefilling,
+                self.req_states.num_computed_tokens.gpu,
+                tree_depths,
+                self.input_buffers.positions,
+                self.input_buffers.slot_positions,
+                self.input_buffers.seq_lens,
+            )
+        else:
+            # Prepare positions and seq_lens.
+            prepare_pos_seq_lens(
+                idx_mapping,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+            )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
@@ -1058,6 +1187,76 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
+
+        if tree_depths is not None:
+            input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
+            input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
+            input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
+            input_batch.tree_depths = tree_depths[idx_mapping]
+            input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
+            input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
+            input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+            if use_tree_pos:
+                input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
+
+        from vllm_ascend.worker.v2.spec_decode.tree.chain_pack import (
+            clear_tree_chain_layout,
+            set_tree_chain_layout,
+        )
+
+        is_v4_tree = isinstance(self.speculator, AscendTreeSpeculator) and self.speculator.packed_dsv4_verify()
+        n_req = input_batch.num_reqs
+        mixed = None
+        if use_tree_pos and is_v4_tree and batch_req_state.has_prefill and input_batch.num_draft_tokens > 0:
+            from vllm_ascend.worker.v2.spec_decode.tree.mixed_batch import TreeMixedBatch
+
+            mixed = TreeMixedBatch.from_input_batch(input_batch, self.device)
+        if (
+            use_tree_pos
+            and is_v4_tree
+            and (not batch_req_state.has_prefill or mixed is not None)
+            and input_batch.num_draft_tokens > 0
+        ):
+            if mixed is None:
+                parents = input_batch.tree_parents[:n_req]
+                counts = input_batch.tree_num_nodes[:n_req]
+                depths = input_batch.tree_depths[:n_req]
+                query_cu = input_batch.query_start_loc[: n_req + 1]
+                query_cu_cpu = input_batch.query_start_loc_np[: n_req + 1]
+                request_rows = list(range(n_req))
+            else:
+                phase = mixed.decode
+                parents = input_batch.tree_parents.index_select(0, phase.request_indices)
+                counts = input_batch.tree_num_nodes.index_select(0, phase.request_indices)
+                depths = input_batch.tree_depths.index_select(0, phase.request_indices)
+                query_cu = phase.query_start_loc
+                query_cu_cpu = phase.query_start_loc_cpu.numpy()
+                request_rows = phase.request_indices_cpu.tolist()
+            self.tree_verification_plan = set_tree_chain_layout(
+                parents,
+                counts,
+                depths,
+                query_cu,
+                query_start_loc_cpu=query_cu_cpu,
+                start_pos_cpu=self.req_states.num_computed_tokens_np[idx_mapping_np[request_rows]],
+                max_depth=self.speculator.num_speculative_steps,
+                host_tables=self.tree_host_metadata.snapshot(
+                    [input_batch.req_ids[i] for i in request_rows],
+                    self.block_tables,
+                    self.kv_cache_config,
+                ),
+            )
+            self.tree_verification_plan["graph_requested"] = batch_desc.cg_mode == CUDAGraphMode.FULL
+            if mixed is not None:
+                self.tree_verification_plan["mixed_batch"] = mixed
+        else:
+            if is_v4_tree and input_batch.num_draft_tokens == 0:
+                # Ordinary sampling bypasses the tree rejection sampler. Let the
+                # ordinary target path update root/prefill caches directly.
+                input_batch.tree_visibility = None
+            clear_tree_chain_layout()
+            self.tree_verification_plan = None
+
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.
         if self.pcp_manager is not None:
@@ -1095,6 +1294,25 @@ class NPUModelRunner(GPUModelRunner):
             # The parent already filled the entire persistent slot buffer.
             slot_mappings = self.block_tables.slot_mappings[:, : input_batch.num_tokens_after_padding]
         return slot_mappings
+
+    def prepare_attn(self, input_batch):
+        """Use unique slot_positions for tree spec KV mapping; RoPE stays on positions."""
+        if self.pcp_manager is not None:
+            return self.pcp_manager.prepare_attn(input_batch)
+
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        slot_pos = input_batch.slot_positions
+        positions = slot_pos if slot_pos is not None else input_batch.positions
+        slot_mappings = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
+        return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity every rank agrees on (config-derived:
@@ -1297,6 +1515,13 @@ class NPUModelRunner(GPUModelRunner):
             # Restore its rows before Mamba aligns the accepted recurrent state.
             # Postprocess skips -1 (freed/unsampled) rows; gather needs valid indices.
             self.block_tables.gather_block_tables(idx_mapping.clamp_min(0), idx_mapping.shape[0])
+        if self.tree_commit is not None:
+            sampler = self.rejection_sampler
+            if sampler.acceptance is not None:
+                self.tree_commit.commit(idx_mapping, sampler.acceptance)
+                sampler.acceptance = None
+                sampler.path_node_ids = None
+
         super().postprocess_sampled(
             idx_mapping,
             sampled_tokens,
@@ -1391,6 +1616,7 @@ class NPUModelRunner(GPUModelRunner):
             # topology between capture and replay.
             num_reqs_padded = descriptor_num_reqs
 
+        last_loc = int(query_start_loc_np[num_reqs])
         if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
@@ -1399,11 +1625,10 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
                 np.arange(1, num_reqs_padded + 1 - num_reqs) * query_len + last_loc
             )
-        else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
-            assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
+        elif last_loc < num_tokens_padded:
+            # Short prefill (or mixed) padded to a decode-sized graph, e.g.
+            # 16 tokens → 17-token FULL gear. Treating that as uniform decode
+            # leaves actual_seq_q[-1]==16 while queryT==17 and FIA tiling dies.
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 

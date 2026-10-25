@@ -45,7 +45,9 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.utils import enable_dsa_cp, should_skip_allreduce_across_dp_group
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_update_skipped
+from vllm_ascend.attention.attention_mask import dummy_tree_mask_for_capture
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
 
 class ReplayAttnMetadata(ModelSpecificAttnMetadata):
@@ -519,6 +521,28 @@ class AscendModelState(DefaultModelState):
             if self.pcp_manager is not None
             else None
         )
+        tree_visibility = input_batch.tree_visibility
+        # Dummy batch has no tree. Only target tree-verify gears (k × 1+budget)
+        # need the dummy identity; draft capture must keep its own mask/indices.
+        if (
+            for_capture
+            and tree_visibility is None
+            and dflash_tree_spec_enabled(self.vllm_config)
+            and dummy_tree_mask_for_capture(num_input_tokens, num_reqs)
+        ):
+            from vllm_ascend.ascend_config import get_ascend_config
+            from vllm_ascend.attention.tree_spec import (
+                dummy_tree_visibility,
+                is_draft_forward,
+            )
+
+            if not is_draft_forward():
+                tree_visibility = dummy_tree_visibility(
+                    num_reqs,
+                    self.device,
+                    budget=get_ascend_config().tree_spec_config.budget,
+                )
+
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
         self.block_tables = block_tables
@@ -568,6 +592,8 @@ class AscendModelState(DefaultModelState):
                 if self.decoder_replay is not None
                 else None
             ),
+            tree_visibility=tree_visibility,
+            slot_positions=input_batch.slot_positions,
         )
         self._prepare_decoder_replay(input_batch, cudagraph_mode, attn_groups, kv_cache_config)
         if restore_copy_sfa_tails:
@@ -577,3 +603,13 @@ class AscendModelState(DefaultModelState):
                     manager.restore_copy_sfa_tails(metadata)
                     break
         return self.attn_metadata
+
+    def custom_sampler(self, sampler):
+        spec_config = self.vllm_config.speculative_config
+        if spec_config is None or not dflash_tree_spec_enabled(self.vllm_config):
+            return None
+        from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
+            TreeRejectionSampler,
+        )
+
+        return sampler, TreeRejectionSampler(sampler, spec_config, self.device)

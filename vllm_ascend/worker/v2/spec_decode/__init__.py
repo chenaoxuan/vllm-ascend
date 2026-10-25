@@ -20,6 +20,9 @@ import copy
 
 import torch
 from vllm.config import CompilationMode, VllmConfig
+from vllm.logger import init_logger
+
+logger = init_logger("vllm." + __name__)
 
 
 def init_speculator(
@@ -27,7 +30,11 @@ def init_speculator(
     device: torch.device,
 ):
     """Override GPU init_speculator for Ascend NPUs.
-    Use AscendEagleSpeculator when eagle is used.
+
+    DFlash and DSpark (Qwen3, DeepSeek-V4 ``DSparkDraftModel``, or
+    ``DeepSeekV4MTPModel``) use
+    ``AscendTreeSpeculator`` when ``tree_spec_config.enabled`` is true.
+    The tree host selects its scorer from the loaded draft model.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -44,12 +51,31 @@ def init_speculator(
 
         return ExtractHiddenStatesSpeculator(vllm_config, device)
     if speculative_config.use_dspark():
+        if dflash_tree_spec_enabled(vllm_config) and _is_tree_dspark(speculative_config):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
+        if dflash_tree_spec_enabled(vllm_config):
+            draft = getattr(speculative_config, "draft_model_config", None)
+            logger.warning(
+                "tree_spec_config.enabled but using plain DSpark speculator (draft arches=%s model_type=%s)",
+                _config_arches(draft),
+                _config_model_type(draft),
+            )
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
         )
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
+        if dflash_tree_spec_enabled(vllm_config):
+            from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
+                AscendTreeSpeculator,
+            )
+
+            return AscendTreeSpeculator(vllm_config, device)
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
                 AscendDFlash2Speculator,
@@ -84,3 +110,99 @@ def init_speculator(
 
         return AscendStandaloneARSpeculator(vllm_config, device)
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")
+
+
+_DSV4_DSPARK_ARCHES = ("DSparkDraftModel", "DeepSeekV4MTPModel")
+_NON_DSV4_DSPARK_ARCHES = (
+    "Qwen3DSparkModel",
+    "Qwen3OmniDSparkModel",
+    "Gemma4DSparkModel",
+    "K3DSparkModel",
+)
+_DSV4_TARGET_ARCHES = (
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForConditionalGeneration",
+    "DeepSeekV4MTPModel",
+    "DSparkDraftModel",
+)
+
+
+def _config_arches(config) -> tuple:
+    if config is None:
+        return ()
+    arches = tuple(getattr(config, "architectures", None) or ())
+    hf = getattr(config, "hf_config", None)
+    hf_arches = tuple(getattr(hf, "architectures", None) or ()) if hf is not None else ()
+    if not hf_arches:
+        return arches
+    if not arches:
+        return hf_arches
+    return arches + tuple(a for a in hf_arches if a not in arches)
+
+
+def _config_model_type(config) -> str:
+    hf = getattr(config, "hf_config", None) if config is not None else None
+    return str(getattr(hf, "model_type", None) or "")
+
+
+def _is_dsv4_model_type(model_type: str) -> bool:
+    return model_type in ("deepseek_v4", "deepseek_mtp") or model_type.startswith("deepseek_v4")
+
+
+def _is_dsv4_config(config) -> bool:
+    if config is None:
+        return False
+    arches = _config_arches(config)
+    if any(a in _DSV4_TARGET_ARCHES or a in _DSV4_DSPARK_ARCHES for a in arches):
+        return True
+    return _is_dsv4_model_type(_config_model_type(config))
+
+
+def _is_tree_dspark(speculative_config) -> bool:
+    """True when a DSpark drafter should host tree spec (beam / prefix / ...)."""
+    draft = getattr(speculative_config, "draft_model_config", None)
+    arches = _config_arches(draft)
+    if any(a in arches for a in ("Qwen3DSparkModel", "Qwen3OmniDSparkModel")):
+        return True
+    if any(a in _DSV4_DSPARK_ARCHES for a in arches):
+        return True
+    if _is_dsv4_model_type(_config_model_type(draft)):
+        return True
+    # method=dspark + DSV4 target: hf_config_override may leave the draft as
+    # DeepSeekV4MTPModel / deepseek_mtp while use_dspark() is already true.
+    return _is_dsv4_config(getattr(speculative_config, "target_model_config", None))
+
+
+def dsv4_dspark_draft(
+    vllm_config: VllmConfig | None = None,
+    speculative_config=None,
+) -> bool:
+    """True for DeepSeek V4 DSpark (MTP-structure), not Qwen3/Gemma/K3 DSpark."""
+    spec = speculative_config
+    if spec is None and vllm_config is not None:
+        spec = vllm_config.speculative_config
+    if spec is None or not spec.use_dspark():
+        return False
+    draft = getattr(spec, "draft_model_config", None)
+    arches = _config_arches(draft)
+    if any(a in _NON_DSV4_DSPARK_ARCHES for a in arches):
+        return False
+    if any(a in _DSV4_DSPARK_ARCHES for a in arches):
+        return True
+    if _is_dsv4_model_type(_config_model_type(draft)):
+        return True
+    return _is_dsv4_config(getattr(spec, "target_model_config", None))
+
+
+def tree_target_query_len(vllm_config: VllmConfig) -> int | None:
+    """Target capacity from the same host shape contract used by tree proposals."""
+    from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
+    shape = TreeShape.from_config(vllm_config)
+    return shape.target_query_len if shape is not None else None
+
+
+def dflash_tree_spec_enabled(vllm_config: VllmConfig | None = None) -> bool:
+    from vllm_ascend.attention.tree_spec import tree_spec_enabled
+
+    return tree_spec_enabled(vllm_config)

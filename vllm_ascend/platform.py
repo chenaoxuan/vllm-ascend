@@ -1727,7 +1727,14 @@ def _get_reduced_cg_cap(vllm_config: VllmConfig) -> int | None:
     decode_query_len = 1
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config and speculative_config.num_speculative_tokens:
-        decode_query_len += speculative_config.num_speculative_tokens
+        from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
+        # Platform defaults precede AscendConfig initialization. Shape resolution
+        # reads this VllmConfig directly, so capture and runtime use one rule.
+        tree_shape = TreeShape.from_config(vllm_config)
+        decode_query_len = (
+            tree_shape.target_query_len if tree_shape is not None else 1 + speculative_config.num_speculative_tokens
+        )
 
     return min(max_num_seqs * decode_query_len, 512)
 

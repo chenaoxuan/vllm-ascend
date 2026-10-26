@@ -102,7 +102,7 @@ class TreeKvCompact:
         prefix = num_computed[safe_idx]
         dst_pos = prefix.unsqueeze(1) + self._depth
         src_pos = prefix.unsqueeze(1) + path.clamp(min=0).to(dtype=prefix.dtype)
-        present = path != -1
+        present = path >= 0
         valid = present & (live_req & self._active[:num_reqs]).unsqueeze(1)
         max_pos = self.runner.max_model_len - 1
         in_range = (src_pos >= 0) & (src_pos <= max_pos) & (dst_pos >= 0) & (dst_pos <= max_pos)
@@ -120,14 +120,19 @@ class TreeKvCompact:
             dst_block = block_table[req_f, dst_bi.clamp(max=max_block)]
             src_flat = (src_block * block_size + src_pos % block_size).to(dtype=torch.long).reshape(-1)
             dst_flat = (dst_block * block_size + dst_pos % block_size).to(dtype=torch.long).reshape(-1)
+            # Layers in one block-table group share the device movement plan.
+            # Capacity is a host shape; payload width/dtype do not affect slots.
+            indices = {}
             for cache, gather in zip(caches, gathers):
-                pages_valid = (
-                    (src_block > 0) & (dst_block > 0) & (src_block < cache.shape[0]) & (dst_block < cache.shape[0])
-                )
-                keep = (valid & columns_valid & pages_valid).reshape(-1)
-                safe_src = src_flat.clamp(0, cache.shape[0] * block_size - 1)
-                source = torch.stack((safe_src // block_size, safe_src % block_size), dim=1)
-                destination = torch.stack((dst_flat // block_size, dst_flat % block_size), dim=1)
-                destination = torch.where(keep.unsqueeze(1), destination, -1)
+                capacity = cache.shape[0]
+                if capacity not in indices:
+                    pages_valid = (src_block > 0) & (dst_block > 0) & (src_block < capacity) & (dst_block < capacity)
+                    keep = (valid & columns_valid & pages_valid).reshape(-1)
+                    safe_src = src_flat.clamp(0, capacity * block_size - 1)
+                    source = torch.stack((safe_src // block_size, safe_src % block_size), dim=1)
+                    destination = torch.stack((dst_flat // block_size, dst_flat % block_size), dim=1)
+                    destination = torch.where(keep.unsqueeze(1), destination, -1)
+                    indices[capacity] = source, destination
+                source, destination = indices[capacity]
                 moves.append(TreeRowMove(cache, source, destination, gather[:nslot]))
         relocate_tree_rows(moves, deduplicate=True)

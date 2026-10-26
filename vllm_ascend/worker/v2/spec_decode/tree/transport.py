@@ -31,44 +31,60 @@ def relocate_tree_rows(moves: list[TreeRowMove], *, deduplicate: bool) -> None:
     inspected by the host.
     """
     transfers = {}
-    writes = []
     for move in moves:
-        view = move.tensor.view(torch.int8)
-        dimensions = move.source.shape[1]
-        if dimensions == 1:
-            gathered = view.index_select(0, move.source[:, 0])
-        else:
-            gathered = view[tuple(move.source[:, axis] for axis in range(dimensions))]
-        if move.scratch is not None:
-            scratch = move.scratch.view(torch.int8)
-            scratch.copy_(gathered)
-            gathered = scratch
+        tensor = move.tensor
+        key = (tensor.data_ptr(), tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
         if not deduplicate:
-            writes.append((view, move.destination, gathered))
-            continue
-        key = (view.data_ptr(), tuple(view.shape), tuple(view.stride()))
-        transfer = transfers.setdefault(key, (view, [], [], dimensions))
-        transfer[1].append(move.destination)
-        transfer[2].append(gathered)
+            key = (id(move),)
+        transfers.setdefault(key, []).append(move)
 
-    for view, destinations, values, dimensions in transfers.values():
-        destination = torch.cat(destinations)
-        keep = (destination >= 0).all(dim=1)
-        flat = destination[:, 0]
-        capacity = view.shape[0]
-        for axis in range(1, dimensions):
-            flat = flat * view.shape[axis] + destination[:, axis]
-            capacity *= view.shape[axis]
-        # Invalid rows sort after real slots and never acquire a write target.
-        flat = torch.where(keep, flat, capacity)
-        flat, order = flat.sort()
-        keep = keep[order]
-        data = torch.cat(values).index_select(0, order)
-        duplicate = torch.zeros_like(keep)
-        duplicate[1:] = keep[1:] & keep[:-1] & (flat[1:] == flat[:-1])
-        destination = destination.index_select(0, order)
-        destination = torch.where((keep & ~duplicate).unsqueeze(1), destination, -1)
-        writes.append((view, destination, data))
+    plans, writes = {}, []
+    for bindings in transfers.values():
+        first = bindings[0]
+        view = first.tensor.view(torch.int8)
+        dimensions = first.source.shape[1]
+        # Index tensors are shared across layers. Sort/reorder the small index
+        # plan once, before gathering; never sort or reorder each KV payload.
+        key = (tuple((id(move.source), id(move.destination)) for move in bindings), tuple(view.shape[:dimensions]))
+        if key not in plans:
+            source = first.source if len(bindings) == 1 else torch.cat([move.source for move in bindings])
+            destination = (
+                first.destination if len(bindings) == 1 else torch.cat([move.destination for move in bindings])
+            )
+            if deduplicate:
+                keep = (destination >= 0).all(dim=1)
+                flat, capacity = destination[:, 0], view.shape[0]
+                for axis in range(1, dimensions):
+                    flat = flat * view.shape[axis] + destination[:, axis]
+                    capacity *= view.shape[axis]
+                flat = torch.where(keep, flat, capacity)
+                flat, order = flat.sort(stable=True)
+                keep = keep.index_select(0, order)
+                duplicate = torch.zeros_like(keep)
+                duplicate[1:] = flat[1:] == flat[:-1]
+                source = source.index_select(0, order)
+                destination = destination.index_select(0, order)
+                destination = torch.where((keep & ~duplicate).unsqueeze(1), destination, -1)
+            linear_source = source[:, 0]
+            for axis in range(1, dimensions):
+                linear_source = linear_source * view.shape[axis] + source[:, axis]
+            plans[key] = source, destination, linear_source
+        source, destination, linear_source = plans[key]
+        scratch = (
+            first.scratch.view(torch.int8)
+            if len(bindings) == 1 and first.scratch is not None
+            else view.new_empty((source.shape[0], *view.shape[dimensions:]))
+        )
+        # Flatten only when it is a view. Padded physical pages must retain
+        # their strides; reshape could silently copy an entire KV cache.
+        if all(view.stride(axis) == view.shape[axis + 1] * view.stride(axis + 1) for axis in range(dimensions - 1)):
+            rows = view.flatten(0, dimensions - 1)
+            torch.index_select(rows, 0, linear_source, out=scratch)
+        else:
+            # aten.index.Tensor_out falls back to CPU on torch_npu. The normal
+            # indexing overload stays on device and supports graph capture.
+            scratch.copy_(view[tuple(source[:, axis] for axis in range(dimensions))])
+        writes.append((view, destination, scratch))
 
     for view, destination, data in writes:
         torch_npu.npu_scatter_nd_update_(view, destination, data)

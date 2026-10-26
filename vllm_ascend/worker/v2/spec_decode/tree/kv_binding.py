@@ -89,7 +89,7 @@ def record_original_kv(layer_name, cache, metadata):
     context = layout.get("_ori_commit_bindings")
     if context is None:
         n = layout["num_nodes"].shape[0]
-        context = dict(num_reqs=n, bindings={})
+        context = dict(num_reqs=n, bindings={}, tables={})
         layout["_ori_commit_bindings"] = context
     n = context["num_reqs"]
     table, bs = metadata.block_table, int(metadata.storage_block_size)
@@ -100,10 +100,15 @@ def record_original_kv(layer_name, cache, metadata):
     key = (owner, cache_key)
     if key in context["bindings"]:
         return
-
+    # One scheduler group has one original block mapping for this round.
+    # Retain it before builders reuse their metadata storage, and share the
+    # snapshot across layers so compaction builds one movement plan per group.
+    table_key = (owner, bs)
+    if table_key not in context["tables"]:
+        context["tables"][table_key] = table.clone()
     context["bindings"][key] = dict(
         cache=cache,
-        table=table.clone(),
+        table=context["tables"][table_key],
         block_size=bs,
     )
 
@@ -120,17 +125,21 @@ def bind_original_kv(compactor, num_reqs):
     matches = state_ids.unsqueeze(1) == idx.unsqueeze(0)
     rows = matches.to(torch.int32).argmax(dim=1)
     present = matches.any(dim=1)
-    groups = []
+    groups = {}
     used_scratch = {}
     for key, record in context["bindings"].items():
         cache, table, bs = record["cache"], record["table"], record["block_size"]
-        state_table = torch.where(present.unsqueeze(1), table.index_select(0, rows), 0)
+        table_key = (_view_key(table), bs)
+        if table_key not in groups:
+            state_table = torch.where(present.unsqueeze(1), table.index_select(0, rows), 0)
+            groups[table_key] = ([], state_table, bs, [])
         scratch = compactor._binding_scratch.get(key)
         shape = (compactor.max_num_reqs * compactor.spec_len, *cache.shape[2:])
         if scratch is None or scratch.shape != shape:
             scratch = torch.empty(shape, dtype=cache.dtype, device=cache.device)
         used_scratch[key] = scratch
-        groups.append(([cache], state_table, bs, [scratch]))
+        groups[table_key][0].append(cache)
+        groups[table_key][3].append(scratch)
     # Reused slots never retain old mappings; only allocation scratch survives.
     compactor._binding_scratch = used_scratch
-    return groups
+    return list(groups.values())

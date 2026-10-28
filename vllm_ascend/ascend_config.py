@@ -538,7 +538,9 @@ class AscendConfig:
                 "enabled": false,
                 "budget": null,
                 "topk": null,
-                "candidate_size": null
+                "candidate_size": 64,
+                "depth_penalty": null,
+                "keep_origin_chain": false
             },
             "sparse_kv_offload_config": {
                 "enabled": false,
@@ -1314,16 +1316,25 @@ class TreeSpecConfig:
     """Shared tree policy; the loaded draft model supplies its scoring adapter.
 
     ``budget`` counts non-root nodes and ``topk`` bounds each retained level.
-    ``candidate_size`` optionally restricts Domino correction to its base
-    Top-C candidates (for example 64); None retains the existing C=topk
-    behavior. DSpark continues to normalize its complete draft vocabulary.
+    ``candidate_size`` controls Domino's base Top-C shortlist and defaults to
+    64. Set it to None to retain the historical C=topk behavior. The setting
+    is ignored by DSpark and DFlash without a Domino correction head, which
+    continue to score their complete draft vocabulary.
+    ``depth_penalty`` controls the depth penalty applied during global budget
+    pruning. When None (the default), each scorer keeps its existing value:
+    0.2 for DFlash/Domino and 0.0 for DSpark/Markov. An explicit value
+    overrides that scorer default for every backend.
+    ``keep_origin_chain`` preserves the draft model's per-step argmax chain
+    during global budget pruning.
     Draft depth remains speculative_config.num_speculative_tokens.
     """
 
     enabled: bool = False
     budget: int | None = None
     topk: int | None = None
-    candidate_size: int | None = None
+    candidate_size: int | None = 64
+    depth_penalty: float | None = None
+    keep_origin_chain: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -1346,6 +1357,8 @@ class TreeSpecConfig:
             raise ValueError("tree_spec_config.topk must be >= 1")
         if self.candidate_size is not None and self.candidate_size < 1:
             raise ValueError("tree_spec_config.candidate_size must be >= 1")
+        if self.depth_penalty is not None and (not math.isfinite(self.depth_penalty) or self.depth_penalty < 0):
+            raise ValueError("tree_spec_config.depth_penalty must be finite and >= 0")
         return self
 
     def _validate_backend(self, vllm_config):

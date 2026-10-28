@@ -9,26 +9,26 @@ import torch.nn.functional as F
 from vllm_ascend.ops.vocab_parallel_embedding import AscendVocabParallelEmbedding, VocabParallelMode
 
 
-def select_candidates(logits, width, *, keep_greedy=False):
+def select_candidates(logits, width, *, keep_origin_chain=False):
     """Full-vocabulary normalized edge scores; IDs remain in the input vocab."""
     log_probs = torch.log_softmax(logits.float(), dim=-1)
     scores, ids = log_probs.topk(width, dim=-1)
-    if keep_greedy:
-        greedy = logits.argmax(-1)
-        present = (ids == greedy.unsqueeze(-1)).any(-1)
-        ids[..., -1] = torch.where(present, ids[..., -1], greedy)
+    if keep_origin_chain:
+        origin = logits.argmax(-1)
+        present = (ids == origin.unsqueeze(-1)).any(-1)
+        ids[..., -1] = torch.where(present, ids[..., -1], origin)
         scores[..., -1] = log_probs.gather(-1, ids[..., -1:])[..., 0]
-        greedy_child = (ids == greedy.unsqueeze(-1)).long().argmax(-1)
+        origin_child = (ids == origin.unsqueeze(-1)).long().argmax(-1)
     else:
-        greedy_child = None
-    return scores, ids, greedy_child
+        origin_child = None
+    return scores, ids, origin_child
 
 
 @dataclass
 class CandidateLayer:
     scores: torch.Tensor
     token_ids: torch.Tensor
-    greedy_child: torch.Tensor | None = None
+    origin_child: torch.Tensor | None = None
 
 
 class IndependentScorer:
@@ -37,7 +37,9 @@ class IndependentScorer:
     name = "independent"
     # Preserve the original prefix/DFlash pruning preference for shallow nodes.
     # This biases global selection only, never edge normalization or expansion.
-    depth_penalty = 0.2
+    default_depth_penalty = 0.2
+    # Kept for callers that inspected the scorer-specific setting directly.
+    depth_penalty = default_depth_penalty
 
     def reserve(self, num_reqs, num_nodes, device):
         pass
@@ -45,16 +47,16 @@ class IndependentScorer:
     def workspace_tensors(self):
         return ()
 
-    def prepare(self, state, logits, roots, hidden, *, keep_greedy=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
         # Independent depths share no parent state. Score them in one batch,
         # preserving the original DFlash kernel count and contiguous inputs.
-        scores, ids, greedy = select_candidates(logits, state.width, keep_greedy=keep_greedy)
-        return CandidateLayer(scores, ids, greedy)
+        scores, ids, origin = select_candidates(logits, state.width, keep_origin_chain=keep_origin_chain)
+        return CandidateLayer(scores, ids, origin)
 
-    def score(self, state, ctx, depth_slot, keep_greedy):
+    def score(self, state, ctx, depth_slot, keep_origin_chain):
         scores, ids = ctx.scores[:, depth_slot], ctx.token_ids[:, depth_slot]
-        greedy = None if ctx.greedy_child is None else ctx.greedy_child[:, depth_slot]
-        return CandidateLayer(scores.unsqueeze(1), ids.unsqueeze(1), None if greedy is None else greedy.unsqueeze(1))
+        origin = None if ctx.origin_child is None else ctx.origin_child[:, depth_slot]
+        return CandidateLayer(scores.unsqueeze(1), ids.unsqueeze(1), None if origin is None else origin.unsqueeze(1))
 
     def update(self, state, ctx, num_added):
         pass
@@ -70,24 +72,25 @@ class MarkovScorer(IndependentScorer):
     """DSpark correction in draft vocabulary, followed by target-ID mapping."""
 
     name = "markov"
-    depth_penalty = 0.0
+    default_depth_penalty = 0.0
+    depth_penalty = default_depth_penalty
 
     def __init__(self, model):
         self.model = model
 
-    def prepare(self, state, logits, roots, hidden, *, keep_greedy=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
         return MarkovContext(logits, roots.unsqueeze(1))
 
-    def score(self, state, ctx, depth_slot, keep_greedy):
+    def score(self, state, ctx, depth_slot, keep_origin_chain):
         logits = ctx.logits[:, depth_slot].unsqueeze(1)
         if self.model is not None:
             emb = self.model.markov_embed(ctx.frontier_tokens)
             bias = self.model.markov_bias(emb.reshape(-1, emb.shape[-1]))
             logits = logits + bias.view(*emb.shape[:-1], -1)
-        scores, ids, greedy = select_candidates(logits, state.width, keep_greedy=keep_greedy)
+        scores, ids, origin = select_candidates(logits, state.width, keep_origin_chain=keep_origin_chain)
         if self.model is not None:
             ids = self.model.map_draft_to_target(ids)
-        return CandidateLayer(scores, ids, greedy)
+        return CandidateLayer(scores, ids, origin)
 
     def update(self, state, ctx, num_added):
         ctx.frontier_tokens = state.tokens[:, state.num_nodes : state.num_nodes + num_added]
@@ -233,7 +236,7 @@ class DominoScorer(IndependentScorer):
 
     name = "domino"
 
-    def __init__(self, correction, prefix_len=0, candidate_size=None):
+    def __init__(self, correction, prefix_len=0, candidate_size=64):
         self.correction = correction
         self.prefix_len = prefix_len
         self.candidate_size = candidate_size
@@ -248,7 +251,7 @@ class DominoScorer(IndependentScorer):
     def workspace_tensors(self):
         return () if self._hidden is None else (self._hidden,)
 
-    def prepare(self, state, logits, roots, hidden, *, keep_greedy=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
         if hidden is None:
             raise ValueError("Domino tree scoring requires draft hidden states")
         scorer = self.correction
@@ -263,11 +266,13 @@ class DominoScorer(IndependentScorer):
         states[:, 0] = scorer.update_hidden(roots.reshape(-1), states[:, 0])
         return DominoContext(logits, states, vals, ids, weight, bias, scorer.project_z(hidden[:, :depth]))
 
-    def score(self, state, ctx, depth_slot, keep_greedy):
+    def score(self, state, ctx, depth_slot, keep_origin_chain):
         if depth_slot < self.prefix_len:
-            scores, ids, greedy = select_candidates(ctx.logits[:, depth_slot], state.width, keep_greedy=keep_greedy)
+            scores, ids, origin = select_candidates(
+                ctx.logits[:, depth_slot], state.width, keep_origin_chain=keep_origin_chain
+            )
             return CandidateLayer(
-                scores.unsqueeze(1), ids.unsqueeze(1), None if greedy is None else greedy.unsqueeze(1)
+                scores.unsqueeze(1), ids.unsqueeze(1), None if origin is None else origin.unsqueeze(1)
             )
         h = self.correction.gru_hidden_dim
         parent_hidden = ctx.hidden_states.gather(1, state.frontier.unsqueeze(-1).expand(-1, -1, h))
@@ -283,8 +288,8 @@ class DominoScorer(IndependentScorer):
         )
         # The shortlist defines Domino's candidate distribution. Its best
         # retained edge is the greedy edge of that same distribution.
-        greedy = scores.argmax(-1) if keep_greedy else None
-        return CandidateLayer(scores, ids, greedy)
+        origin = scores.argmax(-1) if keep_origin_chain else None
+        return CandidateLayer(scores, ids, origin)
 
     def update(self, state, ctx, num_added):
         h = self.correction.gru_hidden_dim

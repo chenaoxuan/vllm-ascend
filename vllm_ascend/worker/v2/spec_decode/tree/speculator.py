@@ -109,6 +109,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.budget = tree_cfg.budget
         self.topk = tree_cfg.topk
         self.candidate_size = tree_cfg.candidate_size
+        self.depth_penalty = tree_cfg.depth_penalty
+        self.keep_origin_chain = tree_cfg.keep_origin_chain
         self.draft_backend = "dspark" if self.speculative_config.use_dspark() else "dflash"
         from vllm_ascend.worker.v2.spec_decode import dsv4_dspark_draft
 
@@ -447,6 +449,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             correction_scorer=self._domino_scorer,
             prefix_len=self._domino_prefix_len,
             candidate_size=self.candidate_size,
+            depth_penalty=self.depth_penalty,
+            keep_origin_chain=self.keep_origin_chain,
         )
         logger.info(
             "Tree correction heads: markov=%s domino=%s prefix_len=%s shift_label=%s",
@@ -672,7 +676,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     seen.add(int(n))
         return sorted(seen)
 
-    def _run_tree_finalize(self, num_reqs: int, *, graph_safe: bool) -> None:
+    def _run_tree_finalize(self, num_reqs: int) -> None:
         """Compute logits and build a tree from the current persistent inputs.
 
         Eager execution and graph capture use the same operations and output
@@ -695,7 +699,6 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             layout,
             root_token_ids=root_token_ids,
             draft_hidden=sample_hidden_states.view(num_reqs, self.num_speculative_steps, -1),
-            graph_safe=graph_safe,
         )
 
     def _capture_tree_graphs(self) -> None:
@@ -736,10 +739,10 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             try:
                 validate_cudagraph_capturing_enabled()
                 with torch.inference_mode():
-                    self._run_tree_finalize(num_reqs, graph_safe=True)
+                    self._run_tree_finalize(num_reqs)
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph, pool=pool):
-                        self._run_tree_finalize(num_reqs, graph_safe=True)
+                        self._run_tree_finalize(num_reqs)
                 self._tree_graphs[num_reqs] = graph
                 self.tree_graph_stats.record_capture("tree")
                 logger.info("Captured tree ACLGraph scorer_backend=%s num_reqs=%s", self.draft_backend, num_reqs)
@@ -791,7 +794,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             self.tree_graph_stats.record_replay("tree")
             self.tree = self._load_layout_from_buffers(num_reqs)
         else:
-            self._run_tree_finalize(num_reqs, graph_safe=False)
+            self._run_tree_finalize(num_reqs)
         self._tree_finalized = True
 
     def _generate_draft(

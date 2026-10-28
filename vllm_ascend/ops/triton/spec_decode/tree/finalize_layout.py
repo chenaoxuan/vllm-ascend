@@ -22,7 +22,7 @@ def finalize_tree_layout_kernel(
     nprog = tl.num_programs(0)
     req = pid
     while req < num_reqs:
-        for n in range(NUM_NODES + 1):
+        for n in range(BUDGET + 1):
             tl.store(first_child_ptr + req * stride_fc_r + n, -1)
             tl.store(next_sibling_ptr + req * stride_ns_r + n, -1)
         for slot in range(NUM_NODES):
@@ -31,12 +31,13 @@ def finalize_tree_layout_kernel(
             cur_first = tl.load(first_child_ptr + req * stride_fc_r + parent_id)
             tl.store(next_sibling_ptr + req * stride_ns_r + node_id, cur_first)
             tl.store(first_child_ptr + req * stride_fc_r + parent_id, node_id)
-        for slot in range(NUM_NODES):
+        for slot in range(BUDGET):
             for j in range(BUDGET):
                 tl.store(
                     visibility_ptr + req * stride_vis_r + slot * stride_vis_i + j,
                     0,
                 )
+        for slot in range(NUM_NODES):
             parent_id = tl.load(parent_ids_ptr + req * stride_par_r + slot)
             src = tl.where(parent_id > 0, parent_id - 1, 0)
             for j in range(slot):
@@ -66,7 +67,7 @@ def finalize_tree_layout_triton(
 
     # Pointers and strides must refer to the same storage. Do not
     # ``.contiguous()`` the in-place outputs (would drop writes on a copy).
-    par = parent_ids.contiguous().to(torch.long)
+    par = parent_ids
     vis = visibility.view(torch.int8) if visibility.dtype == torch.bool else visibility
     num_reqs = par.shape[0]
     budget = visibility.shape[1]

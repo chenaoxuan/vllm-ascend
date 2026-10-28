@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm_ascend import envs
-from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout
+from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout_from_state
 from vllm_ascend.worker.v2.spec_decode.tree.scoring import DominoScorer, IndependentScorer, MarkovScorer
 
 
@@ -47,8 +47,8 @@ class TreeBuilder:
         self.num_selected_nodes = 0
         self._scratch_reqs = self._scratch_vocab = self._scratch_spec = 0
         self._tokens_buf = self._depths_buf = self._parents_buf = None
-        self._path_scores_buf = self._frontier_buf = self._old_to_new_buf = None
-        self._node_arange = self._budget_ids = self._selection_buf = None
+        self._path_scores_buf = self._frontier_buf = None
+        self._node_arange = self._selection_buf = None
         self._scratch_frozen = False
 
     def prepare_for_capture(
@@ -79,9 +79,7 @@ class TreeBuilder:
             self._parents_buf,
             self._path_scores_buf,
             self._frontier_buf,
-            self._old_to_new_buf,
             self._node_arange,
-            self._budget_ids,
             self._selection_buf,
         )
         return tuple(buffer for buffer in buffers if buffer is not None) + self.scorer.workspace_tensors()
@@ -125,9 +123,7 @@ class TreeBuilder:
             self._parents_buf = torch.empty((r, max_nodes), dtype=torch.long, device=device)
             self._path_scores_buf = torch.empty((r, max_nodes), dtype=torch.float32, device=device)
             self._frontier_buf = torch.empty((r, w), dtype=torch.long, device=device)
-            self._old_to_new_buf = torch.empty((r, max_nodes), dtype=torch.long, device=device)
             self._node_arange = torch.arange(max_nodes + 1, device=device, dtype=torch.long)
-            self._budget_ids = torch.arange(1, self.budget + 1, device=device, dtype=torch.long)
 
             self._selection_buf = torch.empty((r, w), dtype=torch.long, device=device)
             self.scorer.reserve(r, max_nodes, device)
@@ -215,22 +211,14 @@ class TreeBuilder:
         if self.keep_greedy:
             priority = priority.clone()
             priority.scatter_(1, torch.stack(greedy_pools, dim=1) - 1, float("inf"))
-        # Nonpositive log-probabilities, nonnegative depth penalties and stable
-        # ancestor-first ties ensure closure. Preserve the existing pool IDs.
-        kept = priority.argsort(dim=-1, descending=True, stable=True)[:, :num_nodes]
-        kept_ids = (kept + 1).sort(dim=-1).values
-        old_to_new = self._old_to_new_buf[:r, : state.num_nodes + 1]
-        old_to_new.zero_()
-        old_to_new.scatter_(1, kept_ids, self._budget_ids[:num_nodes].unsqueeze(0).expand(r, -1))
-        parent_ids = old_to_new.gather(1, state.parents.gather(1, kept_ids))
         self.num_selected_nodes = num_nodes
-        return finalize_tree_layout(
+        return finalize_tree_layout_from_state(
             out,
-            state.tokens.gather(1, kept_ids - 1),
-            state.depths.gather(1, kept_ids - 1),
-            parent_ids,
+            priority,
+            state.tokens,
+            state.depths,
+            state.parents,
             num_nodes,
-            force_torch=graph_safe,
         )
 
 

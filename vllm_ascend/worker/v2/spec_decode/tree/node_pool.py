@@ -226,7 +226,7 @@ def prepare_nodes(plan, winner, active):
     staging = torch.empty(total, dtype=torch.uint8, device=winner.device)
     enabled = torch.empty(len(descriptors), dtype=torch.bool, device=winner.device)
     if descriptors:
-        freeze_node_pages[(len(descriptors), max_rows)](
+        freeze_node_pages[(len(descriptors),)](
             desc,
             plan["ancestors"],
             plan["depths"],
@@ -239,7 +239,6 @@ def prepare_nodes(plan, winner, active):
             plan["n"],
             plan["max_q"],
             triton.next_power_of_2(plan["n"]),
-            256,
         )
     return desc, staging, enabled, max_rows
 
@@ -247,4 +246,4 @@ def prepare_nodes(plan, winner, active):
 def commit_nodes(prepared):
     desc, staging, enabled, max_rows = prepared
     if desc.shape[0]:
-        commit_node_pages[(desc.shape[0], max_rows)](desc, staging, enabled, 256)
+        commit_node_pages[(desc.shape[0],)](desc, staging, enabled)

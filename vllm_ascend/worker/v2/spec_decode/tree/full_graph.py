@@ -144,7 +144,7 @@ class GraphNodeCommit:
         plan = self.plan
         jobs = self.descriptors.shape[0]
         self.update_descriptors[(jobs,)](self.base, self.prefixes, self.descriptors)
-        freeze_node_pages[(jobs, self.max_rows)](
+        freeze_node_pages[(jobs,)](
             self.descriptors,
             plan["ancestors"],
             plan["depths"],
@@ -157,17 +157,15 @@ class GraphNodeCommit:
             plan["n"],
             plan["max_q"],
             triton.next_power_of_2(plan["n"]),
-            256,
         )
 
     def commit(self):
         from vllm_ascend.ops.triton.spec_decode.tree.node_commit import commit_node_pages
 
-        commit_node_pages[(self.descriptors.shape[0], self.max_rows)](
+        commit_node_pages[(self.descriptors.shape[0],)](
             self.descriptors,
             self.staging,
             self.enabled,
-            256,
         )
 
 

@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.attention_mask import dummy_tree_mask_for_capture
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import CopySfaRequestStates
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
@@ -45,7 +46,6 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
 )
 from vllm_ascend.utils import enable_dsa_cp, should_skip_allreduce_across_dp_group
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_update_skipped
-from vllm_ascend.attention.attention_mask import dummy_tree_mask_for_capture
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled
 
@@ -608,8 +608,16 @@ class AscendModelState(DefaultModelState):
         spec_config = self.vllm_config.speculative_config
         if spec_config is None or not dflash_tree_spec_enabled(self.vllm_config):
             return None
+        # Import at the tree-only factory boundary to avoid the model-state
+        # inheritance cycle. GDN snapshots need a path for topk=1 as well.
+        from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
         from vllm_ascend.worker.v2.spec_decode.tree.rejection_sampler import (
             TreeRejectionSampler,
         )
 
-        return sampler, TreeRejectionSampler(sampler, spec_config, self.device)
+        return sampler, TreeRejectionSampler(
+            sampler,
+            spec_config,
+            self.device,
+            preserve_tree_path=isinstance(self, AscendMambaHybridModelState),
+        )

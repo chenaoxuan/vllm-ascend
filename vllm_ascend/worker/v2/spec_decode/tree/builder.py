@@ -5,7 +5,12 @@ from dataclasses import dataclass
 import torch
 
 from vllm_ascend.worker.v2.spec_decode.tree.layout import TreeLayout, finalize_tree_layout_from_state
-from vllm_ascend.worker.v2.spec_decode.tree.scoring import DominoScorer, IndependentScorer, MarkovScorer
+from vllm_ascend.worker.v2.spec_decode.tree.scoring import (
+    DFlash2Scorer,
+    DominoScorer,
+    IndependentScorer,
+    MarkovScorer,
+)
 
 
 @dataclass
@@ -137,16 +142,24 @@ class TreeBuilder:
 
     def _expand_layer(self, state, layer, child_depth, origin_candidate):
         r, width = state.tokens.shape[0], state.width
-        scores = layer.scores.expand(-1, width, -1)
-        tokens = layer.token_ids.expand(-1, width, -1)
+        scores = layer.scores
+        tokens = layer.token_ids
+        if scores.shape[1] == 1:
+            scores = scores.expand(-1, width, -1)
+        elif scores.shape[1] != width:
+            raise ValueError(f"tree scorer returned {scores.shape[1]} parents for frontier width {width}")
+        if tokens.shape[1] == 1:
+            tokens = tokens.expand(-1, width, -1)
+        elif tokens.shape[1] != width:
+            raise ValueError(f"tree scorer returned {tokens.shape[1]} token parents for frontier width {width}")
+        child_width = scores.shape[-1]
+        if tokens.shape[-1] != child_width:
+            raise ValueError("tree scorer returned mismatched score/token candidate widths")
         live = 1 if child_depth == 1 else width
         parent_scores = state.path_scores.gather(1, state.frontier)
-        valid = torch.arange(width, device=scores.device) < live
-        flat = (
-            (parent_scores.unsqueeze(-1) + scores)
-            .masked_fill(~valid[None, :, None], float("-inf"))
-            .reshape(r, -1)
-        )
+        candidate_count = scores.shape[-1]
+        valid = (torch.arange(width, device=scores.device) < live).unsqueeze(-1).expand(width, candidate_count)
+        flat = (parent_scores.unsqueeze(-1) + scores).masked_fill(~valid[None], float("-inf")).reshape(r, -1)
         selected = flat.argsort(dim=-1, descending=True, stable=True)[:, :width].clone()
         if self.keep_origin_chain:
             present = (selected == origin_candidate[:, None]).any(-1)
@@ -154,13 +167,21 @@ class TreeBuilder:
         start = state.num_nodes + 1
         state.tokens[:, state.num_nodes : state.num_nodes + width] = tokens.reshape(r, -1).gather(1, selected)
         state.depths[:, state.num_nodes : state.num_nodes + width] = child_depth
-        state.parents[:, start : start + width] = state.frontier.gather(1, selected // width)
+        state.parents[:, start : start + width] = state.frontier.gather(1, selected // candidate_count)
         state.path_scores[:, start : start + width] = flat.gather(1, selected)
         start = state.num_nodes + 1
         frontier = self._node_arange[start : start + width].unsqueeze(0).expand(r, -1)
         return frontier, selected
 
-    def build(self, draft_logits, out: TreeLayout, *, root_token_ids, draft_hidden=None):
+    def build(
+        self,
+        draft_logits,
+        out: TreeLayout,
+        *,
+        root_token_ids,
+        draft_hidden=None,
+        draft_candidate_ids=None,
+    ):
         r, depth, vocab = draft_logits.shape
         width = self._frontier_width(vocab)
         capacity = self._pool_capacity(width, depth)
@@ -181,7 +202,12 @@ class TreeBuilder:
         state.path_scores.zero_()
         state.frontier.zero_()
         ctx = self.scorer.prepare(
-            state, draft_logits, root_token_ids, draft_hidden, keep_origin_chain=self.keep_origin_chain
+            state,
+            draft_logits,
+            root_token_ids,
+            draft_hidden,
+            keep_origin_chain=self.keep_origin_chain,
+            candidate_ids=draft_candidate_ids,
         )
         origin_pools = []
         origin_frontier = (
@@ -192,7 +218,7 @@ class TreeBuilder:
             origin_candidate = None
             if self.keep_origin_chain:
                 child = layer.origin_child.expand(-1, width).gather(1, origin_frontier[:, None])[:, 0]
-                origin_candidate = origin_frontier * width + child
+                origin_candidate = origin_frontier * layer.scores.shape[-1] + child
             state.frontier, selected = self._expand_layer(state, layer, slot + 1, origin_candidate)
             if self.keep_origin_chain:
                 origin_frontier = (selected == origin_candidate[:, None]).long().argmax(-1)
@@ -230,17 +256,24 @@ def create_tree_builder(
     keep_origin_chain=False,
 ):
     """Resolve the scorer once at model load; tree construction is shared."""
+    builder_type = TreeBuilder
     if draft_backend == "dspark":
         scorer = MarkovScorer(draft_model)
     elif draft_backend == "dflash":
-        scorer = (
-            IndependentScorer()
-            if correction_scorer is None
-            else DominoScorer(correction_scorer, prefix_len, candidate_size)
-        )
+        if correction_scorer is not None:
+            scorer = DominoScorer(correction_scorer, prefix_len, candidate_size)
+        elif draft_model is not None and hasattr(getattr(draft_model, "model", draft_model), "candidate_selector"):
+            # The DFlash2 beam keeps a wider pool than its next frontier.
+            # Import here because its subclass reuses TreeBuilder workspaces.
+            from vllm_ascend.worker.v2.spec_decode.tree.dflash2_builder import DFlash2BeamTreeBuilder
+
+            scorer = DFlash2Scorer(draft_model)
+            builder_type = DFlash2BeamTreeBuilder
+        else:
+            scorer = IndependentScorer()
     else:
         raise ValueError(f"Unsupported tree draft backend: {draft_backend!r}")
-    return TreeBuilder(
+    return builder_type(
         budget,
         topk,
         scorer,

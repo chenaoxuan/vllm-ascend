@@ -358,9 +358,14 @@ class NPUModelRunner(GPUModelRunner):
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
         if dflash_tree_spec_enabled(self.vllm_config) and isinstance(self.speculator, AscendTreeSpeculator):
+            from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
             from vllm_ascend.worker.v2.spec_decode.tree.commit import TreeCommitCoordinator
             from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
 
+            if isinstance(self.model_state, AscendMambaHybridModelState):
+                # Model loading resets the target width to K+1. GDN's uniform
+                # FULL capture must use root+budget before graph gears are built.
+                self.decode_query_len = self.speculator.tree_shape.target_query_len
             self.tree_kv_compact = TreeKvCompact(self)
             self.speculator.tree_kv_compact = self.tree_kv_compact
             self.tree_commit = TreeCommitCoordinator(self)
@@ -1518,7 +1523,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.tree_commit is not None:
             sampler = self.rejection_sampler
             if sampler.acceptance is not None:
-                self.tree_commit.commit(idx_mapping, sampler.acceptance)
+                self.tree_commit.commit(idx_mapping, sampler.acceptance, num_rejected=num_rejected)
                 sampler.acceptance = None
                 sampler.path_node_ids = None
 

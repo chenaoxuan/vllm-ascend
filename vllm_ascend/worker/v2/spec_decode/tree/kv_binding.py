@@ -7,7 +7,7 @@ Snapshot each binding once so later table-buffer reuse cannot change it.
 from __future__ import annotations
 
 import torch
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
 
 from vllm_ascend.worker.v2.spec_decode.tree.kv_layout import iter_unique_kv_cache_tensors
 
@@ -27,11 +27,11 @@ def _group_is_linear_token_cache(group) -> bool:
     if any("state_cache" in name for name in group.layer_names):
         return False
     spec = group.kv_cache_spec
-    if isinstance(spec, CircularBufferSpec) or getattr(spec, "cache_role", None):
+    if isinstance(spec, (CircularBufferSpec, MambaSpec)) or getattr(spec, "cache_role", None):
         return False
     inner = getattr(spec, "kv_cache_specs", None)
     for item in inner.values() if inner else [spec]:
-        if isinstance(item, CircularBufferSpec) or getattr(item, "cache_role", None):
+        if isinstance(item, (CircularBufferSpec, MambaSpec)) or getattr(item, "cache_role", None):
             return False
         ratio = getattr(item, "tokens_per_state", 1)
         if ratio is not None and ratio > 1:

@@ -695,6 +695,25 @@ at::Tensor npu_causal_conv1d_310_meta(
     return output;
 }
 
+
+at::Tensor npu_recurrent_gated_delta_rule_tree_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    at::Tensor& state,
+    const c10::optional<at::Tensor>& beta,
+    const c10::optional<double> scale,
+    const c10::optional<at::Tensor>& actual_seq_lengths,
+    const c10::optional<at::Tensor>& ssm_state_indices,
+    const c10::optional<at::Tensor>& num_accepted_tokens,
+    const c10::optional<at::Tensor>& g,
+    const c10::optional<at::Tensor>& gk,
+    const c10::optional<at::Tensor>& init_state_indices)
+{
+    auto options = value.options().dtype(at::ScalarType::BFloat16);
+    return at::empty_symint(value.sym_sizes(), options);
+}
+
 at::Tensor npu_recurrent_gated_delta_rule_310_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1765,6 +1784,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("get_physical_device_id", &vllm_ascend::meta::get_physical_device_id_meta);
+    ops.impl("npu_recurrent_gated_delta_rule_tree", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_tree_meta);
     //Gemma rmsnorm meta implementation
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     ops.impl("dequant_situ_quant", &vllm_ascend::meta::dequant_situ_quant_meta);

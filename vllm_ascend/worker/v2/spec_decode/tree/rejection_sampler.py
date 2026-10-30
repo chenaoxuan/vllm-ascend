@@ -104,9 +104,10 @@ def greedy_tree_reject_torch(
 class TreeRejectionSampler(RejectionSampler):
     """Greedy tree verification with shared accepted-path result buffers."""
 
-    def __init__(self, sampler, spec_config, device: torch.device):
+    def __init__(self, sampler, spec_config, device: torch.device, *, preserve_tree_path: bool = False):
         super().__init__(sampler, spec_config, device)
         self.device = device
+        self.preserve_tree_path = preserve_tree_path
         self.acceptance: TreeAcceptance | None = None
         self.path_node_ids: torch.Tensor | None = None
         self._result_buf: TreeAcceptance | None = None
@@ -135,8 +136,9 @@ class TreeRejectionSampler(RejectionSampler):
         draft_logits: torch.Tensor | None = None,
         invalid_drafts: torch.Tensor | None = None,
     ) -> SamplerOutput:
-        # Chain sampling retains upstream stochastic rejection semantics.
-        if get_ascend_config().tree_spec_config.topk <= 1:
+        # GDN's snapshot convolution needs the accepted path even for a
+        # single-branch tree. Other topk=1 paths keep upstream chain sampling.
+        if get_ascend_config().tree_spec_config.topk <= 1 and not self.preserve_tree_path:
             self.acceptance = None
             self.path_node_ids = None
             input_batch.path_node_ids = None

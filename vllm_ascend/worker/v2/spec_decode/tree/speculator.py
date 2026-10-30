@@ -1,10 +1,11 @@
+import copy
 from typing import Any
 
 import numpy as np
 import torch
 from torch import nn
 from vllm.config import VllmConfig
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -279,6 +280,19 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                 with torch.no_grad():
                     fc.weight.data.copy_(process_weight(fc.weight.data.cpu(), rotation_weight))
             return model
+        if "DFlash2DraftModel" in self.draft_model_config.architectures and not self.speculative_config.enforce_eager:
+            from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+
+            from vllm_ascend.worker.v2.spec_decode.pcp_utils import disable_profiling_chunk_for_draft
+
+            # Capture the fixed query forward directly with ACLGraph. A private
+            # compiler policy avoids retracing DFlash2 RoPE through NPU meta
+            # kernels, while retaining the shared attention-layer registrations.
+            config = copy.copy(self.vllm_config)
+            config.compilation_config = copy.copy(config.compilation_config)
+            config.compilation_config.mode = CompilationMode.NONE
+            with disable_profiling_chunk_for_draft(config):
+                return load_dflash_model(target_model, config)
         return super().load_draft_model(target_model, target_attn_layer_names)
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -434,6 +448,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         draft_model = None
         if self.draft_backend == "dspark":
             draft_model = model
+        elif self.draft_backend == "dflash" and hasattr(getattr(model, "model", model), "candidate_selector"):
+            # DFlash2 exposes a candidate-selector correction head. Pass the
+            # draft model to the tree builder so it can score edges with that
+            # head instead of treating each depth as independent logits.
+            draft_model = model
         if self.draft_backend == "dflash" and getattr(model, "projector_type", None) == "domino":
             self._domino_prefix_len = int(model.pure_draft_prefix_len)
             language_model = (
@@ -523,6 +542,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     acceptance,
                     input_batch.positions,
                     layout=verification_layout,
+                    input_batch=input_batch,
                 )
             self._tree_finalized = False
             # DSV4's HC inputs need width alignment. Qwen's combine_hidden_states
@@ -615,6 +635,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     # Storage capacity is the tree budget; the chain has only K
                     # draft tokens. Never publish the padded suffix to the runner.
                     return tokens[: input_batch.num_reqs, : self.num_speculative_steps]
+                if self.tree_builder is not None:
+                    # The target verifier must receive every node selected by the
+                    # tree builder. ``super().propose`` returns the chain-shaped
+                    # draft view, while the finalized layout contains budget nodes.
+                    out = self.tree.tokens[: input_batch.num_reqs, : self.budget]
+                    return out
             return tokens
         finally:
             self._dsv4_chunk_prefix_len = None
@@ -633,8 +659,22 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self.prepare_context_anchor(input_batch.num_reqs, input_batch.query_start_loc, num_rejected)
         self._precompute_context_kv(0, input_batch.num_tokens, dummy_run)
 
+    def _prepare_dflash2_graph_attention(self) -> None:
+        if self.tree_builder is None or getattr(self.tree_builder.scorer, "name", None) != "dflash2":
+            return
+        from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
+
+        context = self.vllm_config.compilation_config.static_forward_context
+        impls = [context[name].impl for name in self.draft_attn_layer_names]
+        windowed = [impl for impl in impls if impl.sliding_window]
+        if windowed:
+            mask = AttentionMaskBuilder(self.device).get_splitfuse_attn_mask()
+            for impl in windowed:
+                impl.configure_tree_draft_window(mask)
+
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
+        self._prepare_dflash2_graph_attention()
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
@@ -659,7 +699,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         )
         self._capture_tree_graphs()
         if self.tree_kv_compact is not None and not self.packed_dsv4_verify():
-            self.tree_kv_compact.capture(self._draft_capture_num_reqs())
+            sizes = self._draft_capture_num_reqs()
+            self.tree_kv_compact.capture(sizes)
+            if self.tree_builder is not None and self.tree_builder.scorer.name == "dflash2":
+                missing = set(sizes) - self.tree_kv_compact._graphs.keys()
+                if missing:
+                    raise RuntimeError(f"FULL DFlash2 tree KV compaction capture failed for batches {sorted(missing)}")
 
     def _draft_capture_num_reqs(self) -> list[int]:
         manager = self.query_cudagraph_manager
@@ -686,11 +731,22 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = hidden[self.sample_indices[:num_sample]]
+        draft_hidden = sample_hidden_states.view(num_reqs, self.num_speculative_steps, -1)
+        draft_candidate_ids = None
         if self.draft_backend == "dspark":
             logits = self.model.compute_draft_logits(sample_hidden_states)
+        elif hasattr(getattr(self.model, "model", self.model), "candidate_selector") and hasattr(
+            self.model, "compute_candidates"
+        ):
+            # DFlash2's selector head corrects the target-LM top-k lattice. Keep
+            # the candidate IDs alongside the unary logits so the tree scorer
+            # can evaluate edges against the actual frontier at each depth.
+            draft_candidate_ids, logits = self.model.compute_candidates(sample_hidden_states)
         else:
             logits = self.model.compute_logits(sample_hidden_states)
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
+        if draft_candidate_ids is not None:
+            draft_candidate_ids = draft_candidate_ids.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
         nqp = self.num_query_per_req
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(num_reqs, nqp)[:, 0]
@@ -698,7 +754,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             logits,
             layout,
             root_token_ids=root_token_ids,
-            draft_hidden=sample_hidden_states.view(num_reqs, self.num_speculative_steps, -1),
+            draft_hidden=draft_hidden,
+            draft_candidate_ids=draft_candidate_ids,
         )
 
     def _capture_tree_graphs(self) -> None:
@@ -749,6 +806,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             except Exception as exc:
                 if self.packed_dsv4_verify():
                     raise RuntimeError(f"DSV4 FULL tree construction capture failed for batch {num_reqs}") from exc
+                if self.tree_builder.scorer.name == "dflash2":
+                    raise RuntimeError(f"DFlash2 FULL tree construction capture failed for batch {num_reqs}") from exc
                 logger.warning(
                     "Tree ACLGraph capture failed for scorer_backend=%s num_reqs=%s; eager fallback for this size. %s",
                     self.draft_backend,

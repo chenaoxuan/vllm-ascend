@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 import torch_npu
 
+from vllm_ascend.ops.triton.spec_decode.tree.kv_transport import gather_tree_cache_rows, scatter_tree_cache_rows_
+
 
 @dataclass
 class TreeRowMove:
@@ -81,10 +83,13 @@ def relocate_tree_rows(moves: list[TreeRowMove], *, deduplicate: bool) -> None:
             rows = view.flatten(0, dimensions - 1)
             torch.index_select(rows, 0, linear_source, out=scratch)
         else:
-            # aten.index.Tensor_out falls back to CPU on torch_npu. The normal
-            # indexing overload stays on device and supports graph capture.
-            scratch.copy_(view[tuple(source[:, axis] for axis in range(dimensions))])
+            # Read only selected rows; aten.index can materialize the entire
+            # padded hybrid cache before gathering its small accepted path.
+            gather_tree_cache_rows(view, source, scratch)
         writes.append((view, destination, scratch))
 
     for view, destination, data in writes:
-        torch_npu.npu_scatter_nd_update_(view, destination, data)
+        if view.is_contiguous():
+            torch_npu.npu_scatter_nd_update_(view, destination, data)
+        else:
+            scatter_tree_cache_rows_(view, destination, data)

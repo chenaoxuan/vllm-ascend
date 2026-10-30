@@ -434,6 +434,11 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         draft_model = None
         if self.draft_backend == "dspark":
             draft_model = model
+        elif self.draft_backend == "dflash" and hasattr(getattr(model, "model", model), "candidate_selector"):
+            # DFlash2 exposes a candidate-selector correction head. Pass the
+            # draft model to the tree builder so it can score edges with that
+            # head instead of treating each depth as independent logits.
+            draft_model = model
         if self.draft_backend == "dflash" and getattr(model, "projector_type", None) == "domino":
             self._domino_prefix_len = int(model.pure_draft_prefix_len)
             language_model = (
@@ -523,6 +528,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     acceptance,
                     input_batch.positions,
                     layout=verification_layout,
+                    input_batch=input_batch,
                 )
             self._tree_finalized = False
             # DSV4's HC inputs need width alignment. Qwen's combine_hidden_states
@@ -615,6 +621,12 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
                     # Storage capacity is the tree budget; the chain has only K
                     # draft tokens. Never publish the padded suffix to the runner.
                     return tokens[: input_batch.num_reqs, : self.num_speculative_steps]
+                if self.tree_builder is not None:
+                    # The target verifier must receive every node selected by the
+                    # tree builder. ``super().propose`` returns the chain-shaped
+                    # draft view, while the finalized layout contains budget nodes.
+                    out = self.tree.tokens[: input_batch.num_reqs, : self.budget]
+                    return out
             return tokens
         finally:
             self._dsv4_chunk_prefix_len = None
@@ -686,11 +698,22 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         hidden = self._draft_hidden_buf
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = hidden[self.sample_indices[:num_sample]]
+        draft_hidden = sample_hidden_states.view(num_reqs, self.num_speculative_steps, -1)
+        draft_candidate_ids = None
         if self.draft_backend == "dspark":
             logits = self.model.compute_draft_logits(sample_hidden_states)
+        elif hasattr(getattr(self.model, "model", self.model), "candidate_selector") and hasattr(
+            self.model, "compute_candidates"
+        ):
+            # DFlash2's selector head corrects the target-LM top-k lattice. Keep
+            # the candidate IDs alongside the unary logits so the tree scorer
+            # can evaluate edges against the actual frontier at each depth.
+            draft_candidate_ids, logits = self.model.compute_candidates(sample_hidden_states)
         else:
             logits = self.model.compute_logits(sample_hidden_states)
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)
+        if draft_candidate_ids is not None:
+            draft_candidate_ids = draft_candidate_ids.view(num_reqs, self.num_speculative_steps, -1)
         layout = self._load_layout_from_buffers(num_reqs)
         nqp = self.num_query_per_req
         root_token_ids = self.input_buffers.input_ids[: num_reqs * nqp].view(num_reqs, nqp)[:, 0]
@@ -698,7 +721,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             logits,
             layout,
             root_token_ids=root_token_ids,
-            draft_hidden=sample_hidden_states.view(num_reqs, self.num_speculative_steps, -1),
+            draft_hidden=draft_hidden,
+            draft_candidate_ids=draft_candidate_ids,
         )
 
     def _capture_tree_graphs(self) -> None:

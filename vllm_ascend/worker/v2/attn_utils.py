@@ -39,6 +39,7 @@ from vllm.distributed import get_dcp_group, get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -198,6 +199,36 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
             )
 
 
+def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
+    """Allocate one recurrent state page and conv column per tree node."""
+    from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+        tree_conv_width,
+        tree_state_slot_count,
+        validate_tree_state_slots,
+    )
+
+    slots = tree_state_slot_count(vllm_config)
+    if slots is None:
+        return spec
+    validate_tree_state_slots(slots, spec.mamba_type)
+    num_spec = vllm_config.speculative_config.num_speculative_tokens
+    if slots > spec.num_speculative_blocks + 1:
+        spec = replace(spec, num_speculative_blocks=slots - 1)
+    conv_shape = tuple(spec.shapes[0])
+    width = tree_conv_width(spec.mamba_type, conv_shape, num_spec)
+    extra_columns = slots - num_spec
+    if width is None or extra_columns <= 0:
+        return spec
+    conv_dim = max(conv_shape)
+    expected_columns = width - 1 + slots
+    conv_shape = (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
+    return replace(
+        spec,
+        shapes=(conv_shape, *spec.shapes[1:]),
+        page_size_padded=spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0]),
+    )
+
+
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     """Build Ascend-specific KV cache specs for v2 worker patching."""
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -234,6 +265,7 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             continue
 
         if isinstance(spec, MambaSpec):
+            spec = _widen_mamba_spec_for_tree(spec, vllm_config)
             # Keep Mamba groups after attention groups. Ascend graph parameter
             # updates rely on this stable backend ordering.
             mamba_specs[layer_name] = spec

@@ -161,10 +161,45 @@ def test_unwrap_preserves_distinct_mamba_layouts():
 
 def test_mamba_model_state_inherits_upstream_state_management():
     assert issubclass(AscendMambaHybridModelState, MambaHybridModelState)
-    # preprocess_state is overridden on Ascend to defer the align pre-copy
-    # behind layerwise KV pool loads; postprocess stays upstream.
     assert AscendMambaHybridModelState.preprocess_state is not MambaHybridModelState.preprocess_state
-    assert AscendMambaHybridModelState.postprocess_state is MambaHybridModelState.postprocess_state
+    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
+    mapping = torch.tensor([0], dtype=torch.int32)
+    sampled = torch.tensor([4], dtype=torch.int32)
+    with patch.object(MambaHybridModelState, "postprocess_state") as upstream:
+        state.postprocess_state(mapping, sampled)
+    upstream.assert_called_once_with(mapping, sampled, None)
+
+
+@pytest.mark.parametrize("path", [[], [2], [2, 6], [1, 3, 7, 16]])
+def test_tree_postprocess_stores_node_cursor_and_previous_path(path, tree_commit_io):
+    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+    state.vllm_config = SimpleNamespace()
+    mapping = torch.tensor([2], dtype=torch.int32)
+    sampled = torch.tensor([len(path) + 1], dtype=torch.int32)
+    rejected = 17 - sampled
+    table = torch.full((1, 7), -1, dtype=torch.int32)
+    if path:
+        table[0, : len(path)] = torch.tensor(path, dtype=torch.int32)
+    NPUModelRunner._stage_tree_state_resume_column(SimpleNamespace(model_state=state), table, sampled, rejected)
+    with (
+        patch("vllm_ascend.worker.v2.spec_decode.tree.state_rollback.tree_state_slot_count", return_value=17),
+        patch.object(MambaHybridModelState, "postprocess_state") as upstream,
+    ):
+        state.postprocess_state(mapping, sampled)
+    resume = upstream.call_args.args[1]
+    assert resume.tolist() == [(path[-1] if path else 0) + 1]
+    assert state._tree_prev_num_sampled.tolist() == [0, 0, len(path) + 1, 0]
+    assert state._tree_prev_path[2, :7].tolist() == table[0].tolist()
+    assert state._tree_resume_column is None
+    assert state._tree_path is None
+    # A later plain prompt chunk must invalidate the old path for this request.
+    with (
+        patch("vllm_ascend.worker.v2.spec_decode.tree.state_rollback.tree_state_slot_count", return_value=17),
+        patch.object(MambaHybridModelState, "postprocess_state"),
+    ):
+        state.postprocess_state(mapping, 1)
+    assert state._tree_prev_num_sampled.tolist() == [0, 0, 0, 0]
 
 
 def test_mrv2_advertises_standardized_shared_kv_backing():
@@ -404,6 +439,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
         seq_lens_np=np.ones(4, dtype=np.int32),
         positions=None,
         attn_state=None,
+        tree_visibility=object(),
     )
 
     metadata = AscendMambaHybridModelState.prepare_attn(
@@ -418,6 +454,7 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
 
     assert metadata is expected_metadata
     kwargs = mock_build_attn_metadata.call_args.kwargs
+    assert kwargs["tree_visibility"] is input_batch.tree_visibility
     assert kwargs["num_actual_reqs"] == 2
     assert kwargs["num_actual_tokens"] == 2 * (num_spec + 1)
     graph_requests = 4 if graph_mode == CUDAGraphMode.FULL else 2
@@ -1005,3 +1042,112 @@ def test_init_model_state_uses_override_then_default():
             device,
         )
     assert state is default_cls.return_value
+
+
+@pytest.fixture
+def tree_commit_io(monkeypatch):
+    """Mock the accelerator write boundary, keeping production state staging real."""
+    calls = []
+
+    def commit(previous_path, previous_sampled, mapping, path=None, sampled=None, tree_rows=None):
+        calls.append(
+            (
+                mapping.clone(),
+                None if path is None else path.clone(),
+                None if sampled is None else sampled.clone(),
+                None if tree_rows is None else tree_rows.clone(),
+            )
+        )
+        # Contract oracle at the device boundary; snapshot every input before
+        # any destination write, including cache views sharing one backing.
+        paths = None if path is None else path.clone()
+        counts = None if sampled is None else sampled.clone()
+        for batch_row, request in enumerate(mapping.tolist()):
+            if request < 0 or request >= previous_sampled.shape[0]:
+                continue
+            previous_sampled[request] = 0
+            if paths is not None and counts is not None:
+                previous_path[request, : paths.shape[1]] = paths[batch_row].to(torch.int32)
+                if tree_rows is None or bool(tree_rows[batch_row]):
+                    previous_sampled[request] = counts[batch_row]
+
+    monkeypatch.setattr("vllm_ascend.worker.v2.model_states.mamba_hybrid.commit_tree_snapshot_metadata", commit)
+    return calls
+
+
+def _snapshot_commit_state():
+    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
+    state.vllm_config = SimpleNamespace()
+    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+    backing = torch.arange(4 * 18, dtype=torch.int32).reshape(4, 18)
+    state._tree_prev_path = backing[:, 1:17]
+    state._tree_prev_num_sampled = backing[:, 0]
+    return state, backing
+
+
+def test_snapshot_commit_masked_mapping_and_shared_backing(tree_commit_io):
+    state, backing = _snapshot_commit_state()
+    original = backing.clone()
+    mapping = torch.tensor([-1, 2, 0], dtype=torch.int32)
+    state._tree_path = torch.tensor(
+        [
+            [99, 99, 99, 99, 99, 99, 99],
+            [1, 3, 7, 16, -1, -1, -1],
+            [8, 16, -1, -1, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    state._tree_num_sampled = torch.tensor([8, 5, 3], dtype=torch.int32)
+    state._tree_is_tree_row = torch.tensor([True, False, True])
+    state._tree_resume_column = torch.tensor([17, 17, 17], dtype=torch.int32)
+    with (
+        patch("vllm_ascend.worker.v2.spec_decode.tree.state_rollback.tree_state_slot_count", return_value=17),
+        patch.object(MambaHybridModelState, "postprocess_state") as upstream,
+    ):
+        state.postprocess_state(mapping, torch.tensor([8, 5, 3], dtype=torch.int32))
+    assert len(tree_commit_io) == 1
+    assert tree_commit_io[0][0].shape == (3,)  # No device-dependent row compaction.
+    assert tree_commit_io[0][1].shape == (3, 7)
+    assert upstream.call_args.args[1].tolist() == [17, 17, 17]
+    assert state._tree_prev_num_sampled.tolist() == [3, 18, 0, 54]
+    assert state._tree_prev_path[0, :7].tolist() == [8, 16, -1, -1, -1, -1, -1]
+    assert state._tree_prev_path[2, :7].tolist() == [1, 3, 7, 16, -1, -1, -1]
+    torch.testing.assert_close(backing[3], original[3])  # -1 must not target the last slot.
+    torch.testing.assert_close(backing[:, 17], original[:, 17])  # Shared-storage padding.
+
+
+def test_snapshot_commit_two_round_node16_then_linear_clear(tree_commit_io):
+    state, backing = _snapshot_commit_state()
+    mapping = torch.tensor([2], dtype=torch.int32)
+    path = torch.tensor([[1, 3, 7, 16, -1, -1, -1]], dtype=torch.int32)
+    state._tree_path = path
+    state._tree_num_sampled = torch.tensor([5], dtype=torch.int32)
+    state._tree_is_tree_row = torch.tensor([True])
+    state._tree_resume_column = torch.tensor([17], dtype=torch.int32)
+    with (
+        patch("vllm_ascend.worker.v2.spec_decode.tree.state_rollback.tree_state_slot_count", return_value=17),
+        patch.object(MambaHybridModelState, "postprocess_state") as upstream,
+    ):
+        state.postprocess_state(mapping, torch.tensor([5], dtype=torch.int32))
+        assert upstream.call_args.args[1].tolist() == [17]
+        assert state._tree_prev_num_sampled[2] == 5
+        before_clear = backing.clone()
+        state.postprocess_state(mapping, 1)
+        assert upstream.call_args.args[1] == 1
+    assert state._tree_prev_num_sampled[2] == 0
+    torch.testing.assert_close(state._tree_prev_path, before_clear[:, 1:17])
+    assert len(tree_commit_io) == 2 and tree_commit_io[1][1] is None
+    assert state._tree_path is None and state._tree_resume_column is None
+
+
+def test_snapshot_commit_rejects_path_wider_than_budget():
+    from vllm_ascend.ops.triton.spec_decode.tree.state_commit import commit_tree_snapshot_metadata
+
+    with pytest.raises(ValueError, match="exceeds"):
+        commit_tree_snapshot_metadata(
+            torch.zeros(4, 16, dtype=torch.int32),
+            torch.zeros(4, dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.zeros(1, 17, dtype=torch.int32),
+            torch.ones(1, dtype=torch.int32),
+        )

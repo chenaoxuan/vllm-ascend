@@ -54,6 +54,7 @@
 #include "attention/kda_gate_cumsum_vllm/kda_gate_cumsum_vllm_torch_adpt.h"
 #include "attention/kda_layout_swap12/kda_layout_swap12_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/recurrent_gated_delta_rule_tree/recurrent_gated_delta_rule_tree_torch_adpt.h"
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
 #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
@@ -2810,6 +2811,22 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def("get_physical_device_id(int user_device_id) -> int");
     ops.impl("get_physical_device_id", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::get_physical_device_id);
+
+    ops.def(
+        "npu_recurrent_gated_delta_rule_tree(Tensor query, "
+        "                               Tensor key, "
+        "                               Tensor value, "
+        "                               Tensor(a!) state, "
+        "                               *, "
+        "                               Tensor? beta=None, "
+        "                               float? scale=None, "
+        "                               Tensor? actual_seq_lengths=None, "
+        "                               Tensor? ssm_state_indices=None, "
+        "                               Tensor? num_accepted_tokens=None, "
+        "                               Tensor? g=None, "
+        "                               Tensor? gk=None, "
+        "                               Tensor? init_state_indices=None) -> Tensor");
+    ops.impl("npu_recurrent_gated_delta_rule_tree", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_tree);
 
     // vLLM-Ascend custom ops
     // Gemma RmsNorm

@@ -47,7 +47,7 @@ class IndependentScorer:
     def workspace_tensors(self):
         return ()
 
-    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False, candidate_ids=None):
         # Independent depths share no parent state. Score them in one batch,
         # preserving the original DFlash kernel count and contiguous inputs.
         scores, ids, origin = select_candidates(logits, state.width, keep_origin_chain=keep_origin_chain)
@@ -78,7 +78,7 @@ class MarkovScorer(IndependentScorer):
     def __init__(self, model):
         self.model = model
 
-    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False, candidate_ids=None):
         return MarkovContext(logits, roots.unsqueeze(1))
 
     def score(self, state, ctx, depth_slot, keep_origin_chain):
@@ -94,6 +94,112 @@ class MarkovScorer(IndependentScorer):
 
     def update(self, state, ctx, num_added):
         ctx.frontier_tokens = state.tokens[:, state.num_nodes : state.num_nodes + num_added]
+
+
+@dataclass
+class DFlash2Context:
+    """Candidate lattice and projected hidden states for DFlash2 tree scoring."""
+
+    candidate_ids: torch.Tensor
+    unary_logits: torch.Tensor
+    hidden: torch.Tensor
+    root_token_ids: torch.Tensor
+
+
+class DFlash2Scorer:
+    """Score tree edges with a DFlash2 candidate-selector head.
+
+    DFlash2 first produces a top-k candidate lattice at every draft depth.  Its
+    correction head scores an edge from a predecessor token to each candidate
+    using predecessor/successor codebooks and a projected draft hidden state.
+    The ordinary DFlash tree scorer only sees independent full-vocabulary logits;
+    using it here would silently discard that correction head.  This adapter
+    keeps the candidate lattice and evaluates edges against the *actual* tree
+    frontier, which may be reordered or pruned by the builder.
+    """
+
+    name = "dflash2"
+    default_depth_penalty = 0.0
+    depth_penalty = default_depth_penalty
+    requires_candidate_ids = True
+
+    def __init__(self, model):
+        selector = getattr(getattr(model, "model", model), "candidate_selector", None)
+        if selector is None:
+            raise ValueError("DFlash2 tree scoring requires model.candidate_selector")
+        self.predecessor_codebook = selector.predecessor_codebook
+        self.successor_codebook = selector.successor_codebook
+        self.hidden_projection = selector.hidden_projection
+        self.top_k = int(selector.top_k)
+
+    def reserve(self, num_reqs, num_nodes, device):
+        del num_reqs, num_nodes, device
+
+    def workspace_tensors(self):
+        return ()
+
+    def prepare(self, state, unary_logits, roots, hidden, *, keep_origin_chain=False, candidate_ids=None):
+        del state, keep_origin_chain
+        if candidate_ids is None:
+            raise ValueError("DFlash2 tree scoring requires candidate_ids")
+        if unary_logits.shape != candidate_ids.shape:
+            raise ValueError(
+                "DFlash2 candidate IDs and unary logits must have the same shape, "
+                f"got {tuple(candidate_ids.shape)} and {tuple(unary_logits.shape)}"
+            )
+        if hidden is None or hidden.shape[:2] != candidate_ids.shape[:2]:
+            raise ValueError("DFlash2 candidate lattice and draft hidden states have mismatched depth")
+        if candidate_ids.shape[-1] != self.top_k:
+            raise ValueError(
+                f"DFlash2 candidate width must be selector_top_k={self.top_k}, got {candidate_ids.shape[-1]}"
+            )
+        # Match CandidateSelector.forward: the Ascend unquantized GEMM path
+        # requires a 2-D input during graph capture, then restores [R, L, rank].
+        projected = self.hidden_projection(hidden.flatten(0, 1))
+        projected = projected.view(*hidden.shape[:-1], -1)
+        return DFlash2Context(
+            candidate_ids=candidate_ids.to(torch.long),
+            unary_logits=unary_logits.float(),
+            hidden=projected,
+            root_token_ids=roots.to(torch.long),
+        )
+
+    @staticmethod
+    def _parent_token_ids(state, ctx):
+        """Resolve one token ID for every current frontier node."""
+        frontier = state.frontier
+        root = ctx.root_token_ids[:, None]
+        # Node IDs are one-based while state.tokens omits the root.
+        token_index = (frontier - 1).clamp_min(0)
+        node_tokens = state.tokens.gather(1, token_index)
+        return torch.where(frontier == 0, root.expand_as(node_tokens), node_tokens)
+
+    def score(self, state, ctx, depth_slot, keep_origin_chain):
+        del keep_origin_chain
+        candidate_ids = ctx.candidate_ids[:, depth_slot]
+        unary_logits = ctx.unary_logits[:, depth_slot]
+        hidden = ctx.hidden[:, depth_slot]
+        parent_ids = self._parent_token_ids(state, ctx)
+        # Preserve CandidateSelector's arithmetic: multiply in the draft
+        # dtype before the contraction, then add the FP32 unary logits.
+        predecessor = self.predecessor_codebook[parent_ids]
+        successor = self.successor_codebook[candidate_ids]
+        edge_scores = (
+            torch.einsum("rpd,rkd->rpk", predecessor * hidden[:, None, :], successor) + unary_logits[:, None, :]
+        )
+        # The builder expects one candidate layer per current frontier parent.
+        # All parents share this depth's DFlash2 candidate set; their edge scores
+        # differ through the predecessor codebook term above.  Preserve the
+        # correction-head argmax when the origin-chain policy is enabled.
+        origin_child = edge_scores.argmax(dim=-1)
+        return CandidateLayer(
+            torch.log_softmax(edge_scores.float(), dim=-1),
+            candidate_ids[:, None, :].expand(-1, parent_ids.shape[1], -1),
+            origin_child,
+        )
+
+    def update(self, state, ctx, num_added):
+        del state, ctx, num_added
 
 
 class DominoCorrectionScorer:
@@ -251,7 +357,7 @@ class DominoScorer(IndependentScorer):
     def workspace_tensors(self):
         return () if self._hidden is None else (self._hidden,)
 
-    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False):
+    def prepare(self, state, logits, roots, hidden, *, keep_origin_chain=False, candidate_ids=None):
         if hidden is None:
             raise ValueError("Domino tree scoring requires draft hidden states")
         scorer = self.correction

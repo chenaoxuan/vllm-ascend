@@ -29,7 +29,7 @@ from torch import nn
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
-from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator, is_conv_state_dim_first
 from vllm.model_executor.utils import replace_parameter
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
@@ -50,6 +50,7 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
+from vllm_ascend.ops.triton.spec_decode.tree.conv_state import scatter_tree_conv_pages_
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
@@ -215,6 +216,149 @@ def _rearrange_decode_qkv(
         key.contiguous().view(1, num_tokens, key_dim // head_k_dim, head_k_dim),
         value.contiguous().view(1, num_tokens, value_dim // head_v_dim, head_v_dim),
     )
+
+
+def tree_causal_conv1d(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    window_rows: torch.Tensor,
+    prefix_src: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: bool,
+) -> torch.Tensor:
+    """Causal short conv over each tree node's own root-to-node ancestors.
+
+    ``window_rows``/``prefix_src`` come from ``state_rollback.compute_tree_conv_rows``;
+    zero-length rows (full-graph padding) are skipped. The committed history is
+    re-anchored on the accepted node before it is read. Returns ``[T, conv_dim]``.
+    """
+    width = weight.shape[1]
+    conv_dim = weight.shape[0]
+    starts = query_start_loc.to(torch.long).reshape(-1)
+    rows = starts.numel() - 1
+    # cache_indices is packed token-major (a request's page sits at its token start);
+    # full-graph padding rows own no page and are skipped below.
+    pages = cache_indices.reshape(-1)[starts[:rows]].to(torch.long).clamp(min=0)
+    valid = torch.diff(starts) > 0
+    # Keep the row count fixed for graph capture: a boolean index would give a dynamic
+    # shape, so inactive rows keep a harmless page and are masked below.
+    page_ids = pages
+    dim_first = is_conv_state_dim_first()
+
+    # Re-anchor the committed history on the node accepted last step before reading it.
+    # Gather only selected logical pages; advanced indexing of the padded
+    # cache can materialize the entire pool on NPU.
+    state = gather_ssm_states(conv_state, page_ids, valid)
+    columns = prefix_src.to(torch.long)
+    if dim_first:
+        columns = columns.unsqueeze(1).expand(-1, conv_dim, -1)
+        gathered = state.gather(2, columns)
+        current = state[:, :, : width - 1]
+        updated = torch.where(valid[:, None, None], gathered, current)
+        state[:, :, : width - 1] = updated
+    else:
+        columns = columns.unsqueeze(-1).expand(-1, -1, conv_dim)
+        gathered = state.gather(1, columns)
+        current = state[:, : width - 1, :]
+        updated = torch.where(valid[:, None, None], gathered, current)
+        state[:, : width - 1, :] = updated
+
+    history = state[:, :, : width - 1].transpose(1, 2) if dim_first else state[:, : width - 1, :]
+    source = torch.cat((history.reshape(-1, conv_dim), x), dim=0)
+    taps = source.index_select(0, window_rows.reshape(-1).to(torch.long)).view(-1, width, conv_dim)
+    # Match the native kernel: FP32 products/accumulation (BF16 changes verified logits).
+    out = (taps.float() * weight.transpose(0, 1).float()).sum(dim=1)
+    if bias is not None:
+        out = out + bias.float()
+    if activation:
+        out = torch.nn.functional.silu(out)
+    out = out.to(x.dtype)
+
+    # Keep this step's activations at column width-1+node for the next step's history;
+    # columns past a row's nodes keep the previous step's values and are never read.
+    positions = torch.arange(x.shape[0], device=starts.device)
+    row_of_token = (positions.unsqueeze(1) >= starts[1:].unsqueeze(0)).sum(dim=1).clamp(max=rows - 1)
+    token_columns = width - 1 + positions - starts[:rows][row_of_token]
+    if dim_first:
+        state[row_of_token, :, token_columns] = x
+    else:
+        state[row_of_token, token_columns, :] = x
+    scatter_tree_conv_pages_(conv_state, pages, valid, state)
+    return out
+
+
+def _chunked_tree_verify(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    scale: float,
+    plan,
+    num_actual_tokens: int,
+) -> torch.Tensor:
+    """Verify a draft tree wider than the recurrent kernel's per-call width.
+
+    One ``npu_recurrent_gated_delta_rule_tree`` call verifies at most
+    ``GDN_RECURRENT_MAX_VERIFY_TOKENS`` tokens per request: the kernel's per-token
+    row buffers are sized by that constant and it *returns without updating the
+    state* above it. ``plan`` (see
+    ``spec_decode/tree/state_rollback.compute_tree_verify_plan``) cuts the verify
+    into node-column chunks, chained through the state pages: node ``j`` loads its
+    parent's page through ``init_state_indices``, which the chunk that verified
+    the parent already wrote (every builder guarantees ``parent_id < node_id``).
+    Each chunk is a padded ``rows * width`` token grid whose padding cells are
+    skipped through ``cu_seqlens``, so every recorded call has the same shape.
+
+    Args:
+        query: ``[1, tokens, nk, dk]`` in the packed token order of the step (the
+            same for ``key``), ``value`` ``[1, tokens, nv, dv]``, ``g``/``beta``
+            ``[1, tokens, nv]``.
+        state_indices: ``[rows, slots]`` packed ssm state table of this step,
+            used to check that ``plan`` belongs to this step.
+        num_actual_tokens: rows of the output buffer reserved for chunk padding,
+            past the last verified token.
+
+    Returns:
+        ``[tokens, nv, dv]``, in the packed token order of ``query``.
+    """
+    if state_indices.shape[0] != plan.rows:
+        raise RuntimeError(
+            f"the chunk plan was built for {plan.rows} rows but this step has "
+            f"{state_indices.shape[0]} speculative rows; the plan has to be "
+            "rebuilt on every step."
+        )
+    tokens = query.shape[1]
+    out = torch.empty(
+        (num_actual_tokens + plan.rows * plan.width, *value.shape[2:]),
+        dtype=value.dtype,
+        device=value.device,
+    )
+    for chunk in plan.chunks:
+        index = chunk.token_indices
+        chunk_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule_tree(
+            query=query.index_select(1, index).squeeze(0),
+            key=key.index_select(1, index).squeeze(0),
+            value=value.index_select(1, index).squeeze(0),
+            g=g.index_select(1, index).squeeze(0),
+            beta=beta.index_select(1, index).squeeze(0),
+            state=ssm_state,
+            scale=scale,
+            actual_seq_lengths=chunk.cu_seqlens,
+            ssm_state_indices=chunk.state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            init_state_indices=chunk.init_state_indices,
+        )
+        # Padding cells are scattered past the layer's real tokens, so the
+        # undefined output of a skipped row can never reach a verified token.
+        out.index_copy_(0, chunk.out_indices, chunk_out)
+    return out[:tokens]
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -513,21 +657,38 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             spec_causal_conv1d_meta = attn_metadata.spec_decode_metadata.spec_causal_conv1d
             spec_query_start_loc_device = spec_causal_conv1d_meta.query_start_loc
-            output_spec = torch.empty_like(mixed_qkv_spec)
-            output_spec = causal_conv1d_update(
-                mixed_qkv_spec,
-                self_kv_cache[0],
-                conv_weights_T,
-                bias=self.conv1d.bias,
-                activation="silu" if self.activation else None,
-                conv_state_indices=_normalize_causal_cache_indices(spec_causal_conv1d_meta.cache_indices),
-                num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
-                query_start_loc=spec_query_start_loc_device,
-                max_query_len=self.num_spec + 1,
-                null_block_id=0,
-                out=output_spec,
-            )
-            mixed_qkv_spec = output_spec
+            spec_meta = attn_metadata.spec_decode_metadata
+            if spec_meta.conv_window_rows is not None:
+                # Tree verification needs an independent causal window for every
+                # node; the fused update op assumes a single linear sequence.
+                assert spec_meta.conv_prefix_src is not None
+                mixed_qkv_spec = tree_causal_conv1d(
+                    mixed_qkv_spec,
+                    conv_weights_T.transpose(0, 1),
+                    self_kv_cache[0],
+                    spec_causal_conv1d_meta.cache_indices,
+                    spec_query_start_loc_device,
+                    spec_meta.conv_window_rows[: mixed_qkv_spec.shape[0]],
+                    spec_meta.conv_prefix_src,
+                    self.conv1d.bias,
+                    self.activation,
+                )
+            else:
+                output_spec = torch.empty_like(mixed_qkv_spec)
+                output_spec = causal_conv1d_update(
+                    mixed_qkv_spec,
+                    self_kv_cache[0],
+                    conv_weights_T,
+                    bias=self.conv1d.bias,
+                    activation="silu" if self.activation else None,
+                    conv_state_indices=_normalize_causal_cache_indices(spec_causal_conv1d_meta.cache_indices),
+                    num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens,
+                    query_start_loc=spec_query_start_loc_device,
+                    max_query_len=self.num_spec + 1,
+                    null_block_id=0,
+                    out=output_spec,
+                )
+                mixed_qkv_spec = output_spec
 
         # Ordinary mixed batches keep decode token-major while prefill can
         # use head-first convolution output. PCP retains its collective path.
@@ -705,11 +866,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
-            core_attn_out_spec = recurrent_gated_delta_rule(
-                query_spec.squeeze(0),
-                key_spec.squeeze(0),
-                value_spec.squeeze(0),
-                ssm_state,
+            init_state_indices = attn_metadata.spec_decode_metadata.init_state_indices
+            recurrent_kwargs = dict(
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
                 scale=key_spec.shape[-1] ** -0.5,
@@ -720,7 +878,39 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     spec_causal_conv1d_meta.query_start_loc,
                 ),
                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
-            ).unsqueeze(0)
+            )
+            verify_plan = attn_metadata.spec_decode_metadata.verify_plan
+            if verify_plan is not None:
+                core_attn_out_spec = _chunked_tree_verify(
+                    query_spec,
+                    key_spec,
+                    value_spec,
+                    g_spec,
+                    beta_spec,
+                    ssm_state,
+                    spec_state_indices_tensor,
+                    spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+                    scale=key_spec.shape[-1] ** -0.5,
+                    plan=verify_plan,
+                    num_actual_tokens=num_actual_tokens,
+                ).unsqueeze(0)
+            elif init_state_indices is not None:
+                recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
+                core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule_tree(
+                    query=query_spec.squeeze(0),
+                    key=key_spec.squeeze(0),
+                    value=value_spec.squeeze(0),
+                    state=ssm_state,
+                    **recurrent_kwargs,
+                ).unsqueeze(0)
+            else:
+                core_attn_out_spec = recurrent_gated_delta_rule(
+                    query_spec.squeeze(0),
+                    key_spec.squeeze(0),
+                    value_spec.squeeze(0),
+                    ssm_state,
+                    **recurrent_kwargs,
+                ).unsqueeze(0)
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 

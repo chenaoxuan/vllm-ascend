@@ -13,7 +13,7 @@ def align_up(value: int, alignment: int = 128) -> int:
 def tree_spec_enabled(vllm_config: VllmConfig | None = None) -> bool:
     """True when ``additional_config.tree_spec_config.enabled`` is set."""
     if vllm_config is not None:
-        tree_config = (vllm_config.additional_config or {}).get("tree_spec_config") or {}
+        tree_config = (getattr(vllm_config, "additional_config", None) or {}).get("tree_spec_config") or {}
         return bool(tree_config.get("enabled", False))
     try:
         from vllm_ascend.ascend_config import get_ascend_config

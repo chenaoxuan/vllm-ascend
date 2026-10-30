@@ -69,6 +69,32 @@ def test_stable_argsort_preserves_integer_precision():
     assert indices.tolist() == [1, 0, 2]
 
 
+def test_select_spec_state_indices_uses_tree_width():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.num_spec = 7
+    builder.spec_tree_slots = 17
+    block_table = torch.arange(2 * 24, dtype=torch.int32).reshape(2, 24)
+    rows = torch.tensor([1, 0], dtype=torch.long)
+
+    selected = builder._select_spec_state_indices(block_table, rows)
+
+    assert selected.shape == (2, 17)
+    assert torch.equal(selected, block_table[rows, :17])
+
+
+def test_select_spec_state_indices_keeps_chain_width():
+    builder = object.__new__(AscendGDNAttentionMetadataBuilder)
+    builder.num_spec = 7
+    builder.spec_tree_slots = None
+    block_table = torch.arange(2 * 24, dtype=torch.int32).reshape(2, 24)
+    rows = torch.tensor([1, 0], dtype=torch.long)
+
+    selected = builder._select_spec_state_indices(block_table, rows)
+
+    assert selected.shape == (2, 8)
+    assert torch.equal(selected, block_table[rows, :8])
+
+
 @pytest.fixture(autouse=True)
 def _patch_triton_cdiv(monkeypatch):
     if not hasattr(_fla_index.triton, "cdiv"):

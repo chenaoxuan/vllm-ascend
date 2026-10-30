@@ -587,7 +587,7 @@ class TreeFIAParamProvider:
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
-        lengths = list(metadata.seq_lens_list[:self.num_decodes])
+        lengths = list(metadata.seq_lens_list[: self.num_decodes])
         lengths += [1] * (self.num_decodes - len(lengths))
         params = {
             "actual_seq_lengths": [self.query_len] * self.num_decodes,
@@ -600,10 +600,10 @@ class TreeFIAParamProvider:
         if metadata.block_tables is not None:
             tables = metadata.block_tables
             if tables.shape[0] < self.num_decodes:
-                tables = torch.cat((tables, tables.new_zeros(
-                    (self.num_decodes - tables.shape[0], tables.shape[1])
-                )), dim=0)
-            params["block_table"] = tables[:self.num_decodes]
+                tables = torch.cat(
+                    (tables, tables.new_zeros((self.num_decodes - tables.shape[0], tables.shape[1]))), dim=0
+                )
+            params["block_table"] = tables[: self.num_decodes]
         return params
 
 
@@ -743,6 +743,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output_view = output[: attn_metadata.num_actual_tokens]
         if sparse_mode in (3, 4):
             attn_mask = self._tnd_sparse34_mask(attn_mask, query.device)
+            # Tree FULL capture follows the Qwen3 GQA splitfuse mask contract.
+            # Some hybrid GDN/GQA capture gears arrive without the metadata
+            # mask, but CANN requires an explicit mask whenever sparse_mode is
+            # 3/4. Keep the fallback tree-scoped so ordinary GQA is unchanged.
+            if attn_mask is None and tree_spec_enabled():
+                attn_mask = AttentionMaskBuilder(query.device).get_splitfuse_attn_mask()
 
         extra_args = {}
         if self.enable_c8_quant and layer is not None:
@@ -827,11 +833,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
     @staticmethod
     def _tnd_sparse34_mask(attn_mask: torch.Tensor | None, device: torch.device):
         """TND sparse 3/4 is splitfuse; 4D tree mask (Q!=2048) is invalid there."""
-        if (
-            attn_mask is not None
-            and attn_mask.ndim == 4
-            and attn_mask.shape[-2] != 2048
-        ):
+        if attn_mask is not None and attn_mask.ndim == 4 and attn_mask.shape[-2] != 2048:
             return AttentionMaskBuilder(device).get_splitfuse_attn_mask()
         return attn_mask
 
@@ -849,14 +851,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 return None
             q_len = attn_mask.shape[-2]
         device = attn_mask.device if attn_mask is not None else torch.device("cpu")
-        return AttentionMaskBuilder(device).as_bsnd_fia_mask(
-            attn_mask, batch_size, q_len
-        )
+        return AttentionMaskBuilder(device).as_bsnd_fia_mask(attn_mask, batch_size, q_len)
 
     @staticmethod
-    def _tree_fia_bsnd_shape(
-        num_tokens: int, num_decodes: int
-    ) -> tuple[int, int] | None:
+    def _tree_fia_bsnd_shape(num_tokens: int, num_decodes: int) -> tuple[int, int] | None:
         """BSND only when tokens are ``k * (1+budget)`` matching ``num_decodes``.
 
         Other capture gears keep TND + 2D splitfuse; a 4D tree mask with
@@ -882,8 +880,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and attn_metadata.num_decodes > 0
             and attn_metadata.block_tables is not None
             and attn_metadata.attn_state != AscendAttentionState.PrefillNoCache
-            and self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes)
-            is not None
+            and self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes) is not None
         )
 
     def full_graph_tree_fia(
@@ -895,29 +892,23 @@ class AscendAttentionBackendImpl(AttentionImpl):
         output: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
         """Capture tree decode FIA (BSND + custom mask), same topology as eager."""
-        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
-            key, value, attn_metadata
-        )
+        key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(key, value, attn_metadata)
+        key = key.contiguous()
+        value = value.contiguous()
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         bsnd = self._tree_fia_bsnd_shape(num_tokens, attn_metadata.num_decodes)
         if bsnd is None:
             return self.full_graph_fia(query, key, value, attn_metadata, output)
         num_decodes, q_len = bsnd
-        fia_query = query[: num_decodes * q_len].view(
-            num_decodes, q_len, self.num_heads, self.head_size
-        )
-        fia_output = output[: num_decodes * q_len].view(
-            num_decodes, q_len, self.num_heads, self.head_size
-        )
+        fia_query = query[: num_decodes * q_len].view(num_decodes, q_len, self.num_heads, self.head_size)
+        fia_output = output[: num_decodes * q_len].view(num_decodes, q_len, self.num_heads, self.head_size)
         actual_seq_lengths_q = [q_len] * num_decodes
         if isinstance(actual_seq_lengths_kv, torch.Tensor):
             actual_seq_lengths_kv = actual_seq_lengths_kv[:num_decodes]
         else:
             actual_seq_lengths_kv = list(actual_seq_lengths_kv[:num_decodes])
         bt = block_table[:num_decodes] if block_table is not None else None
-        attn_mask = self._bsnd_tree_attn_mask(
-            attn_metadata.attn_mask, num_decodes, q_len
-        )
+        attn_mask = self._bsnd_tree_attn_mask(attn_metadata.attn_mask, num_decodes, q_len)
         softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
         kwargs = {
             "query": fia_query,
@@ -1124,9 +1115,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
             if self._tree_decode_fia_eligible(attn_metadata):
-                attn_output, num_tokens = self.full_graph_tree_fia(
-                    query, key, value, attn_metadata, output
-                )
+                attn_output, num_tokens = self.full_graph_tree_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
             attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
@@ -1166,9 +1155,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 input_layout="TND",
                 pre_tokens=self.sliding_window if self.sliding_window is not None else SWA_INT_MAX,
                 next_tokens=0,
-                atten_mask=self._tnd_sparse34_mask(
-                    attn_metadata.attn_mask, query.device
-                ),
+                atten_mask=self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device),
                 sparse_mode=sparse_mode,
                 softmax_scale=self.scale,
                 block_table=block_table,
@@ -1198,9 +1185,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     query=query,
                     key=key,
                     value=value,
-                    atten_mask=self._tnd_sparse34_mask(
-                        attn_metadata.attn_mask, query.device
-                    ),
+                    atten_mask=self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device),
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
@@ -1228,10 +1213,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             get_current_hardware_profile().supports(HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT)
                             and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
                         )
-                        or (
-                            tree_spec
-                            and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill
-                        )
+                        or (tree_spec and attn_metadata.attn_state == AscendAttentionState.ChunkedPrefill)
                     )
                     and attn_metadata.num_decodes > 0
                     and attn_metadata.num_prefills > 0
@@ -1261,9 +1243,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         query=query,
                         key=key,
                         value=value,
-                        atten_mask=self._tnd_sparse34_mask(
-                            attn_metadata.attn_mask, query.device
-                        ),
+                        atten_mask=self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device),
                         block_table=block_table,
                         input_layout="TND",
                         block_size=block_size,
@@ -1278,8 +1258,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         current_key=key,
                         current_value=passed_value,
                         attn_metadata=attn_metadata,
-                        is_prefill_no_cache=attn_metadata.attn_state
-                        == AscendAttentionState.PrefillNoCache,
+                        is_prefill_no_cache=attn_metadata.attn_state == AscendAttentionState.PrefillNoCache,
                         sparse_mode=3,
                     )
 
@@ -1309,9 +1288,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         use_bsnd = block_table is not None and bsnd is not None
         if use_bsnd:
             num_decodes, q_len = bsnd
-            fia_query = query[: num_decodes * q_len].view(
-                num_decodes, q_len, self.num_heads, self.head_size
-            )
+            fia_query = query[: num_decodes * q_len].view(num_decodes, q_len, self.num_heads, self.head_size)
             input_layout = "BSND"
             actual_seq_q = [q_len] * num_decodes
             sparse_mode = 0
@@ -1402,9 +1379,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     query=query[:num_decode_tokens],
                     key=key,
                     value=value,
-                    atten_mask=self._tnd_sparse34_mask(
-                        attn_metadata.attn_mask, query.device
-                    ),
+                    atten_mask=self._tnd_sparse34_mask(attn_metadata.attn_mask, query.device),
                     block_table=block_table[:num_decodes],
                     input_layout="TND",
                     block_size=block_size,
@@ -1423,9 +1398,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     is_prefill_no_cache=False,
                     sparse_mode=3,
                 )
-                output[:num_decode_tokens] = decode_out.view(
-                    num_decode_tokens, self.num_heads, self.head_size
-                )
+                output[:num_decode_tokens] = decode_out.view(num_decode_tokens, self.num_heads, self.head_size)
 
         # prefill part
         if attn_metadata.num_prefills > 0:

@@ -358,9 +358,14 @@ class NPUModelRunner(GPUModelRunner):
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
         if dflash_tree_spec_enabled(self.vllm_config) and isinstance(self.speculator, AscendTreeSpeculator):
+            from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
             from vllm_ascend.worker.v2.spec_decode.tree.commit import TreeCommitCoordinator
             from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
 
+            if isinstance(self.model_state, AscendMambaHybridModelState):
+                # Model loading resets the target width to K+1. GDN's uniform
+                # FULL capture must use root+budget before graph gears are built.
+                self.decode_query_len = self.speculator.tree_shape.target_query_len
             self.tree_kv_compact = TreeKvCompact(self)
             self.speculator.tree_kv_compact = self.tree_kv_compact
             self.tree_commit = TreeCommitCoordinator(self)
@@ -1517,6 +1522,9 @@ class NPUModelRunner(GPUModelRunner):
             self.block_tables.gather_block_tables(idx_mapping.clamp_min(0), idx_mapping.shape[0])
         if self.tree_commit is not None:
             sampler = self.rejection_sampler
+            path_node_ids = getattr(sampler, "path_node_ids", None)
+            if path_node_ids is not None:
+                self._stage_tree_state_resume_column(path_node_ids, num_sampled, num_rejected)
             if sampler.acceptance is not None:
                 self.tree_commit.commit(idx_mapping, sampler.acceptance)
                 sampler.acceptance = None
@@ -1533,6 +1541,28 @@ class NPUModelRunner(GPUModelRunner):
         # Non-last PP stages receive rejections without owning a speculator.
         if self.speculator is not None or self.sync_spec_pp_cpu_counts:
             self._copy_num_computed_tokens_to_cpu()
+
+    def _stage_tree_state_resume_column(
+        self,
+        path_node_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> None:
+        """Stage the accepted tree leaf for the next GDN state update."""
+        model_state = self.model_state
+        if not hasattr(model_state, "stage_tree_resume_column"):
+            return
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_resume_column,
+            tree_row_mask,
+        )
+
+        model_state.stage_tree_resume_column(
+            compute_tree_resume_column(path_node_ids, num_sampled),
+            path_node_ids,
+            num_sampled,
+            is_tree_row=tree_row_mask(num_sampled, num_rejected),
+        )
 
     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
         super().postprocess_num_computed_tokens(input_batch)

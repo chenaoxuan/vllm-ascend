@@ -258,13 +258,10 @@ class NPUModelRunner(GPUModelRunner):
             # DSV4 topk=1 publishes a K-token chain. Keep request-state storage
             # at that width while tree metadata retains its budget capacity.
             self.req_states.draft_tokens = self.req_states.draft_tokens[:, : self.num_speculative_steps].contiguous()
-        if (
-            isinstance(self.speculator, AscendTreeSpeculator)
-            and not self._dsv4_tree_chain
-            and not self.scheduler_config.async_scheduling
-        ):
-            # Sync scheduling consumes these published rows. Async scheduling
-            # retains its existing K-wide scheduler-owned placeholder contract.
+        if isinstance(self.speculator, AscendTreeSpeculator) and not self._dsv4_tree_chain:
+            # Publish tree rows for both scheduler modes. Async scheduling keeps
+            # the K-wide draft-generation contract, while its scheduler adapter
+            # consumes the handler's S-wide placeholder publication.
             with torch_cuda_wrapper():
                 self.draft_tokens_handler = TreeDraftTokensHandler(self.device, self.req_states, self.speculator)
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.

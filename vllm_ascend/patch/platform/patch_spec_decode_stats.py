@@ -31,14 +31,27 @@ SpecDecodingStats.observe_draft = _observe_draft
 def _tree_verify_width(scheduler) -> int:
     vllm_config = scheduler.vllm_config
     tree_config = get_ascend_config().tree_spec_config
-    if (
-        tree_config.enabled
-        and scheduler.num_spec_tokens > 0
-        and vllm_config.model_config.enforce_eager
-        and dsv4_dspark_draft(vllm_config)
-        and int(tree_config.topk or 0) > 1
-    ):
+    tree_enabled = tree_config.enabled and scheduler.num_spec_tokens > 0 and int(tree_config.topk or 0) > 1
+    # Async scheduling has to reserve tree verification rows for every
+    # tree-backed draft. Keep historical eager DSV4 behavior unchanged.
+    async_tree = tree_enabled and bool(vllm_config.scheduler_config.async_scheduling)
+    eager_dsv4_tree = tree_enabled and vllm_config.model_config.enforce_eager and dsv4_dspark_draft(vllm_config)
+    if async_tree or eager_dsv4_tree:
         return max(scheduler.num_spec_tokens, int(tree_config.budget))
+    return scheduler.num_spec_tokens
+
+
+def _tree_async_placeholder_width(scheduler, verify_width: int) -> int:
+    """Width of async placeholders for a topk>1 tree.
+
+    The worker still proposes K draft depths while the next target reserves
+    the full tree verify width. The worker must later replace this fixed
+    placeholder with the actual selected node width for structured output.
+    """
+    config = scheduler.vllm_config
+    tree_config = get_ascend_config().tree_spec_config
+    if bool(config.scheduler_config.async_scheduling) and tree_config.enabled and int(tree_config.topk or 0) > 1:
+        return verify_width
     return scheduler.num_spec_tokens
 
 
@@ -60,13 +73,14 @@ def _patch_tree_verify_width(scheduler_cls) -> None:
             self.num_spec_tokens = draft_depth
         output.num_spec_tokens_to_schedule = draft_depth
         async_placeholder = getattr(self, "_spec_token_placeholders", None)
-        if async_placeholder is not None and len(async_placeholder) != draft_depth:
-            depth_placeholder = [-1] * draft_depth
-            self._spec_token_placeholders = depth_placeholder
+        placeholder_width = _tree_async_placeholder_width(self, verify_width)
+        if async_placeholder is not None and len(async_placeholder) != placeholder_width:
+            placeholder = [-1] * placeholder_width
+            self._spec_token_placeholders = placeholder
             for req_id in output.num_scheduled_tokens:
                 request = self.requests[req_id]
                 if request.spec_token_ids is async_placeholder:
-                    request.spec_token_ids = depth_placeholder
+                    request.spec_token_ids = placeholder
         return output
 
     schedule._ascend_tree_verify_width = True

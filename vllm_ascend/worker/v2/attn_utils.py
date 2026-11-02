@@ -199,6 +199,27 @@ def _align_hybrid_attention_page_sizes(kv_cache_specs: dict[str, KVCacheSpec]) -
             )
 
 
+_TREE_KERNEL_BLOCK_SIZE = 128
+
+
+def _align_tree_mamba_page_size(page_size: int, spec: MambaSpec, vllm_config: VllmConfig) -> int:
+    """Round a tree-expanded GDN page to the attention kernel block stride.
+
+    The Ascend CUSTOM attention path uses 128-token kernel blocks. The
+    scheduler block may contain several such kernel blocks (for Qwen3.8 it is
+    896 tokens, i.e. seven blocks), and the combined Attention view divides
+    every padded page by that count. Tree-only GDN columns are appended after
+    the platform has selected the scheduler block, so round the expanded page
+    here before it is shared with the Attention cache.
+    """
+    scheduler_block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", None)
+    if not isinstance(scheduler_block_size, int) or scheduler_block_size <= 0:
+        scheduler_block_size = _TREE_KERNEL_BLOCK_SIZE
+    num_kernel_blocks = max(1, scheduler_block_size // _TREE_KERNEL_BLOCK_SIZE)
+    alignment_bytes = math.lcm(num_kernel_blocks * get_dtype_size(spec.dtypes[0]), 4)
+    return math.ceil(page_size / alignment_bytes) * alignment_bytes
+
+
 def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> MambaSpec:
     """Allocate one recurrent state page and conv column per tree node."""
     from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
@@ -222,10 +243,11 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
     conv_dim = max(conv_shape)
     expected_columns = width - 1 + slots
     conv_shape = (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
+    expanded_page_size = spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0])
     return replace(
         spec,
         shapes=(conv_shape, *spec.shapes[1:]),
-        page_size_padded=spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0]),
+        page_size_padded=_align_tree_mamba_page_size(expanded_page_size, spec, vllm_config),
     )
 
 

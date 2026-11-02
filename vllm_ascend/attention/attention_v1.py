@@ -1353,6 +1353,16 @@ class AscendAttentionBackendImpl(AttentionImpl):
         else:
             kv_lens = list(actual_seq_lengths_kv[:num_decodes])
         bt = block_table[:num_decodes] if block_table is not None else None
+        if bt is not None and key.ndim == value.ndim == 3 and (not key.is_contiguous() or not value.is_contiguous()):
+            # Capture warmup executes this eager path before the graph path's
+            # bounded gather. Avoid FIA materializing the entire hybrid pool.
+            dense_key = key.new_empty((bt.numel(), *key.shape[1:]))
+            dense_value = value.new_empty((bt.numel(), *value.shape[1:]))
+            page_indices = bt.reshape(-1, 1)
+            gather_tree_cache_rows(key, page_indices, dense_key)
+            gather_tree_cache_rows(value, page_indices, dense_value)
+            key, value = dense_key, dense_value
+            bt = torch.arange(bt.numel(), dtype=bt.dtype, device=bt.device).view_as(bt)
         if use_bsnd:
             attn_mask = self._bsnd_tree_attn_mask(
                 attn_metadata.attn_mask,

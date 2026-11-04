@@ -45,6 +45,16 @@ public:
         __gm__ uint8_t *cuSeqlens,
         __gm__ uint8_t *seqUsed,
         __gm__ uint8_t *startPos,
+        // Fused tree aggregation phase inputs (unused on this architecture).
+        __gm__ uint8_t *stateReal,
+        __gm__ uint8_t *prefix,
+        __gm__ uint8_t *ancestors,
+        __gm__ uint8_t *depths,
+        __gm__ uint8_t *requests,
+        __gm__ uint8_t *treeAggNorm,
+        __gm__ uint8_t *treeAggCos,
+        __gm__ uint8_t *treeAggSin,
+        __gm__ uint8_t *treeAggTable,
         __gm__ uint8_t *cmpKvOut,
         __gm__ uint8_t *workspace);
     __aicore__ inline void Process();
@@ -132,6 +142,16 @@ __aicore__ inline void CompressorTreeProjectKernelFullLoad<COMP>::Init(
         __gm__ uint8_t *cuSeqlens,
         __gm__ uint8_t *seqUsed,
         __gm__ uint8_t *startPos,
+        // Fused tree aggregation phase inputs (unused on this architecture).
+        __gm__ uint8_t *stateReal,
+        __gm__ uint8_t *prefix,
+        __gm__ uint8_t *ancestors,
+        __gm__ uint8_t *depths,
+        __gm__ uint8_t *requests,
+        __gm__ uint8_t *treeAggNorm,
+        __gm__ uint8_t *treeAggCos,
+        __gm__ uint8_t *treeAggSin,
+        __gm__ uint8_t *treeAggTable,
         __gm__ uint8_t *cmpKvOut,
         __gm__ uint8_t *workspace)
 {

@@ -1234,6 +1234,11 @@ class NPUModelRunner(GPUModelRunner):
                 query_cu = phase.query_start_loc
                 query_cu_cpu = phase.query_start_loc_cpu.numpy()
                 request_rows = phase.request_indices_cpu.tolist()
+            builder = self.speculator.tree_builder
+            selected = builder.num_selected_nodes if builder is not None else 0
+            hidden_slice_ok = 0 <= selected < self.speculator.tree_shape.target_query_len and all(
+                int(query_cu_cpu[i + 1]) - int(query_cu_cpu[i]) - 1 <= selected for i in range(n_req)
+            )
             self.tree_verification_plan = set_tree_chain_layout(
                 parents,
                 counts,
@@ -1247,6 +1252,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.block_tables,
                     self.kv_cache_config,
                 ),
+                hidden_slice_ok=hidden_slice_ok,
             )
             self.tree_verification_plan["graph_requested"] = batch_desc.cg_mode == CUDAGraphMode.FULL
             if mixed is not None:

@@ -127,7 +127,16 @@ def _key(tensor):
 
 
 def set_tree_chain_layout(
-    parents, num_nodes, depths, query_start_loc, *, query_start_loc_cpu, start_pos_cpu, max_depth, host_tables
+    parents,
+    num_nodes,
+    depths,
+    query_start_loc,
+    *,
+    query_start_loc_cpu,
+    start_pos_cpu,
+    max_depth,
+    host_tables,
+    hidden_slice_ok=False,
 ) -> dict:
     global _LAYOUT, _PLAN
     if _PLAN is not None and not _PLAN.get("committed", False):
@@ -144,6 +153,7 @@ def set_tree_chain_layout(
         start_cpu=[int(value) for value in start_pos_cpu],
         max_depth=int(max_depth),
         host_tables=host_tables,
+        hidden_slice_ok=bool(hidden_slice_ok),
     )
     _PLAN = None
     return _LAYOUT
@@ -230,6 +240,7 @@ def _build_plan(num_tokens: int, device) -> dict | None:
     _PLAN = {
         "n": n,
         "n_req": n_req,
+        "hidden_slice_ok": bool(layout.get("hidden_slice_ok", False)),
         "req_cu": qsl,
         "prefixes": prefix_of,
         "req_ids": req_ids,

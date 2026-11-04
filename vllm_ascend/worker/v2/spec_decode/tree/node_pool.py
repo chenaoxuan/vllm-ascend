@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DSV4 node pool. Device data is indexed by immutable tree ancestry."""
 
+import os
 from math import prod
 
 import torch
 from vllm.triton_utils import triton
 
 from vllm_ascend.ops.triton.spec_decode.tree.native_attention import native_attention
-from vllm_ascend.ops.triton.spec_decode.tree.native_compressor import aggregate_native_nodes
 from vllm_ascend.ops.triton.spec_decode.tree.node_commit import commit_node_pages, freeze_node_pages
 
 
@@ -76,16 +76,20 @@ def compress_nodes(module, hidden, state, metadata):
     ratio, head = module.compress_ratio, module.head_dim
     n, device = plan["n"], hidden.device
     nodes = workspace.buffers.acquire("nodes", (n + 1, 1, 1, 2 * module.coff * head), state.dtype, device)
-    projected_hidden = hidden.index_select(0, plan["hidden_ids"])
+    if plan["hidden_slice_ok"] and hidden.size(0) == n and hidden.is_contiguous():
+        projected_hidden = hidden
+    else:
+        projected_hidden = hidden.index_select(0, plan["hidden_ids"])
     key = ("native_projection", ratio)
     residue = plan["query_metadata"].get(key)
     if residue is None:
         residue = ((plan["start"] + plan["depths"]) % ratio).to(torch.int32)
         plan["query_metadata"][key] = residue
-    # Device-only projection: one state row per node, no synthetic page table
-    # or unused linear compression. Every real node is overwritten by the op.
     nodes[:1].zero_()
-    torch.ops._C_ascend.compressor_tree_project(
+    full_cos, full_sin = cache_meta.full_compress_cos, cache_meta.full_compress_sin
+    cos = full_cos.view(full_cos.shape[0], full_cos.shape[-1])
+    sin = full_sin.view(full_sin.shape[0], full_sin.shape[-1])
+    output = torch.ops._C_ascend.compressor_tree_project(
         projected_hidden,
         module.wkv.weight,
         module.wgate.weight,
@@ -93,24 +97,15 @@ def compress_nodes(module, hidden, state, metadata):
         module.ape,
         residue,
         plan["query_cu"],
-    )
-    full_cos, full_sin = cache_meta.full_compress_cos, cache_meta.full_compress_sin
-    cos = full_cos.view(full_cos.shape[0], full_cos.shape[-1])
-    sin = full_sin.view(full_sin.shape[0], full_sin.shape[-1])
-    output = aggregate_native_nodes(
         state,
-        nodes,
-        state_meta.block_table,
-        plan,
+        plan["start"],
+        plan["ancestors"],
+        plan["depths"],
+        plan["req_ids"],
         module.norm.weight,
         cos,
         sin,
-        ratio,
-        head,
-        module.rope_head_dim,
-        module.norm_eps,
-        hidden.dtype,
-        workspace=workspace.buffers,
+        state_meta.block_table,
     )
     # Retain each node once until acceptance. History is never copied per branch.
     record_nodes(plan, state, nodes[1:], state_meta, 1)

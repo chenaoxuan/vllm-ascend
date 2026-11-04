@@ -68,6 +68,25 @@ void CompressorTreeProjectTiling::ConvertOptionalParams(gert::TilingContext &con
     compressor_tree_projectContext.seqUsed.shape = context.GetOptionalInputShape(SEQ_USED_INPUT_INDEX);
     compressor_tree_projectContext.startPos.desc = context.GetOptionalInputDesc(START_POS_INPUT_INDEX);
     compressor_tree_projectContext.startPos.shape = context.GetOptionalInputShape(START_POS_INPUT_INDEX);
+    // Fused tree aggregation phase inputs.
+    compressor_tree_projectContext.stateReal.desc = context.GetOptionalInputDesc(STATE_REAL_INPUT_INDEX);
+    compressor_tree_projectContext.stateReal.shape = context.GetOptionalInputShape(STATE_REAL_INPUT_INDEX);
+    compressor_tree_projectContext.prefix.desc = context.GetOptionalInputDesc(PREFIX_INPUT_INDEX);
+    compressor_tree_projectContext.prefix.shape = context.GetOptionalInputShape(PREFIX_INPUT_INDEX);
+    compressor_tree_projectContext.ancestors.desc = context.GetOptionalInputDesc(ANCESTORS_INPUT_INDEX);
+    compressor_tree_projectContext.ancestors.shape = context.GetOptionalInputShape(ANCESTORS_INPUT_INDEX);
+    compressor_tree_projectContext.depths.desc = context.GetOptionalInputDesc(DEPTHS_INPUT_INDEX);
+    compressor_tree_projectContext.depths.shape = context.GetOptionalInputShape(DEPTHS_INPUT_INDEX);
+    compressor_tree_projectContext.requests.desc = context.GetOptionalInputDesc(REQUESTS_INPUT_INDEX);
+    compressor_tree_projectContext.requests.shape = context.GetOptionalInputShape(REQUESTS_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggNorm.desc = context.GetOptionalInputDesc(TREE_AGG_NORM_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggNorm.shape = context.GetOptionalInputShape(TREE_AGG_NORM_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggCos.desc = context.GetOptionalInputDesc(TREE_AGG_COS_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggCos.shape = context.GetOptionalInputShape(TREE_AGG_COS_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggSin.desc = context.GetOptionalInputDesc(TREE_AGG_SIN_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggSin.shape = context.GetOptionalInputShape(TREE_AGG_SIN_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggTable.desc = context.GetOptionalInputDesc(TREE_AGG_TABLE_INPUT_INDEX);
+    compressor_tree_projectContext.treeAggTable.shape = context.GetOptionalInputShape(TREE_AGG_TABLE_INPUT_INDEX);
 }
 
 ge::graphStatus CompressorTreeProjectTiling::ConvertContext(gert::TilingContext &context, CompressorTreeProjectContext &compressor_tree_projectContext)
@@ -95,6 +114,12 @@ ge::graphStatus CompressorTreeProjectTiling::ConvertContext(gert::TilingContext 
     compressor_tree_projectContext.rotaryMode = attrs->GetAttrPointer<int>(ROTARY_MODE_ATTR_INDEX);
     compressor_tree_projectContext.cacheMode = attrs->GetAttrPointer<int>(CACHE_MODE_ATTR_INDEX);
     compressor_tree_projectContext.stateCacheStrideDim0 = attrs->GetAttrPointer<int>(STATE_CACHE_STRIDE_DIM0_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggMaxDepth = attrs->GetAttrPointer<int>(TREE_AGG_MAX_DEPTH_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggWidth = attrs->GetAttrPointer<int>(TREE_AGG_WIDTH_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggPageStride = attrs->GetAttrPointer<int>(TREE_AGG_PAGE_STRIDE_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggRowStride = attrs->GetAttrPointer<int>(TREE_AGG_ROW_STRIDE_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggCosStride = attrs->GetAttrPointer<int>(TREE_AGG_COS_STRIDE_ATTR_INDEX);
+    compressor_tree_projectContext.treeAggSinStride = attrs->GetAttrPointer<int>(TREE_AGG_SIN_STRIDE_ATTR_INDEX);
 
     OP_CHECK_IF(context.GetWorkspaceSizes(1) == nullptr,
                 OPS_REPORT_VECTOR_INNER_ERR(context.GetNodeName(), "workSpaceSize got from ge is nullptr"),
@@ -153,7 +178,15 @@ ge::graphStatus CompressorTreeProjectTiling::SetBaseInfo()
     baseParams_->stateCacheStrideDim0 = static_cast<uint64_t>(*context_->stateCacheStrideDim0);
     coff = static_cast<uint8_t>(*context_->coff);
     baseParams_->nSize = 2; // 2:每个核处理两个基本块后做全核同步
-    baseParams_->usedCoreNum = aicNum_;
+    // Small-token fast path (decode/tree verify): launch dBasicBlockNum AIC
+    // cores (1 m group, full d coverage) to shrink the MODE0 barrier fanout.
+    if (baseParams_->tokenSize <= 128 && baseParams_->headDim == 128 && aicNum_ > 8) {
+        baseParams_->usedCoreNum = 8;
+    } else if (baseParams_->tokenSize <= 128 && baseParams_->headDim == 512 && aicNum_ > 16) {
+        baseParams_->usedCoreNum = 16;
+    } else {
+        baseParams_->usedCoreNum = aicNum_;
+    }
 
     OP_LOGI(context_->opName, "[TILING] bSize:%u  tSize:%u cmpRatio:%u coff:%u", baseParams_->batchSize,
             baseParams_->tokenSize, baseParams_->cmpRatio, coff);
@@ -170,6 +203,58 @@ ge::graphStatus CompressorTreeProjectTiling::SetPageAttentionInfo()
             context_->stateBlockTable.shape->GetStorageShape().GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1);
     }
 
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::SetTreeAggInfo()
+{
+    // The fused aggregation phase is active when state_real is present; every
+    // other aggregation input must be present as well.
+    bool fused = (context_->stateReal.desc != nullptr);
+    if (fused) {
+        OP_CHECK_IF(context_->prefix.desc == nullptr || context_->ancestors.desc == nullptr ||
+                        context_->depths.desc == nullptr || context_->requests.desc == nullptr ||
+                        context_->treeAggNorm.desc == nullptr || context_->treeAggCos.desc == nullptr ||
+                        context_->treeAggSin.desc == nullptr || context_->treeAggTable.desc == nullptr,
+                    OPS_REPORT_VECTOR_INNER_ERR(context_->opName,
+                                                "tree aggregation inputs must be provided together with state_real"),
+                    return ge::GRAPH_FAILED);
+        OP_CHECK_IF(context_->layout != LayoutType::LAYOUT_TH || context_->dtype != ge::DT_BF16,
+                    OPS_REPORT_VECTOR_INNER_ERR(context_->opName,
+                                                "tree aggregation fusion requires TH BF16 x"),
+                    return ge::GRAPH_FAILED);
+        auto &anc = context_->ancestors.shape->GetStorageShape();
+        auto &state = context_->stateReal.shape->GetStorageShape();
+        auto &table = context_->treeAggTable.shape->GetStorageShape();
+        OP_CHECK_IF(context_->prefix.shape->GetStorageShape().GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_0) !=
+                        baseParams_->batchSize ||
+                    context_->depths.shape->GetStorageShape().GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_0) !=
+                        baseParams_->batchSize ||
+                    context_->requests.shape->GetStorageShape().GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_0) !=
+                        baseParams_->batchSize ||
+                    anc.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_0) != baseParams_->batchSize ||
+                    state.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1) == 0 ||
+                    table.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1) == 0 ||
+                    context_->treeAggNorm.shape->GetStorageShape().GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_0) !=
+                        baseParams_->headDim,
+                    OPS_REPORT_VECTOR_INNER_ERR(context_->opName, "invalid tree aggregation shapes"),
+                    return ge::GRAPH_FAILED);
+        treeAggParams_->fused = 1;
+        // Standalone-op convention: dim is the half-row width (= norm width =
+        // headDim); the full node/state row stride is 2*coff*dim in the kernel.
+        treeAggParams_->dim = baseParams_->headDim;
+        treeAggParams_->block = state.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1);
+        treeAggParams_->width = table.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1);
+        treeAggParams_->maxDepth = anc.GetDim(COMPRESSOR_TREE_PROJECT_DIM_INDEX_1);
+        treeAggParams_->pageStride = static_cast<uint64_t>(*context_->treeAggPageStride);
+        treeAggParams_->rowStride = static_cast<uint64_t>(*context_->treeAggRowStride);
+        treeAggParams_->cosStride = static_cast<uint64_t>(*context_->treeAggCosStride);
+        treeAggParams_->sinStride = static_cast<uint64_t>(*context_->treeAggSinStride);
+        OP_LOGI(context_->opName, "Tree aggregation fused: dim=%u block=%u width=%u maxDepth=%u",
+                treeAggParams_->dim, treeAggParams_->block, treeAggParams_->width, treeAggParams_->maxDepth);
+    } else {
+        treeAggParams_->fused = 0;
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -311,6 +396,7 @@ ge::graphStatus CompressorTreeProjectTiling::RunBigKernelTiling(CompressorTreePr
     this->pageAttentionParams_ = &tilingData->pageAttentionParams;
     this->innerSplitParams_ = &tilingData->innerSplitParams;
     this->workspaceParams_ = &tilingData->workspaceParams;
+    this->treeAggParams_ = &tilingData->treeAggParams;
     using StatusFunction = std::function<ge::graphStatus()>;
     std::vector<StatusFunction> requiredTilingFuncs{std::bind(&CompressorTreeProjectTiling::GetNpuInfo, this),
                                                     std::bind(&CompressorTreeProjectTiling::CheckRequiredParaExistence, this),
@@ -318,6 +404,7 @@ ge::graphStatus CompressorTreeProjectTiling::RunBigKernelTiling(CompressorTreePr
                                                     std::bind(&CompressorTreeProjectTiling::CheckSinglePara, this),
                                                     std::bind(&CompressorTreeProjectTiling::SetBaseInfo, this),
                                                     std::bind(&CompressorTreeProjectTiling::SetPageAttentionInfo, this),
+                                                    std::bind(&CompressorTreeProjectTiling::SetTreeAggInfo, this),
                                                     std::bind(&CompressorTreeProjectTiling::CheckFeature, this),
                                                     std::bind(&CompressorTreeProjectTiling::CheckMultiParaConsistency, this),
                                                     std::bind(&CompressorTreeProjectTiling::CheckBlockDimConstrain, this),
@@ -348,7 +435,7 @@ ge::graphStatus CompressorTreeProjectTiling::RunBigKernelTiling(CompressorTreePr
         }
     }
 
-    context_->blockDim = aicNum_;
+    context_->blockDim = baseParams_->usedCoreNum;
 
     OP_LOGI("Run big kernel");
 
@@ -395,6 +482,11 @@ ge::graphStatus CompressorTreeProjectTiling::CheckSinglePara() const
         ge::GRAPH_SUCCESS != CheckSingleParaRopeSin() || ge::GRAPH_SUCCESS != CheckSingleParaRopeCos() ||
         ge::GRAPH_SUCCESS != CheckSingleParaStateBlockTable() || ge::GRAPH_SUCCESS != CheckSingleParaCuSeqlens() ||
         ge::GRAPH_SUCCESS != CheckSingleParaSeqused() || ge::GRAPH_SUCCESS != CheckSingleParaStartPos() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaStateReal() || ge::GRAPH_SUCCESS != CheckSingleParaPrefix() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaAncestors() || ge::GRAPH_SUCCESS != CheckSingleParaDepths() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaRequests() || ge::GRAPH_SUCCESS != CheckSingleParaTreeAggNorm() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaTreeAggCos() || ge::GRAPH_SUCCESS != CheckSingleParaTreeAggSin() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaTreeAggTable() ||
         ge::GRAPH_SUCCESS != CheckSingleParaCmpKv() || ge::GRAPH_SUCCESS != CheckSingleParaRopeHeadDim() ||
         ge::GRAPH_SUCCESS != CheckSingleParaCmpRatio() || ge::GRAPH_SUCCESS != CheckSingleParaCoff() ||
         ge::GRAPH_SUCCESS != CheckSingleParaNormEps() || ge::GRAPH_SUCCESS != CheckSingleParaRotaryMode() ||
@@ -662,6 +754,114 @@ ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaStartPos() const
     }
     if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->startPos.desc, START_POS_NAME) ||
         ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->startPos.shape, START_POS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaStateReal() const
+{
+    if (context_->stateReal.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->stateReal.desc, STATE_REAL_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->stateReal.shape, STATE_REAL_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaPrefix() const
+{
+    if (context_->prefix.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->prefix.desc, PREFIX_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->prefix.shape, PREFIX_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaAncestors() const
+{
+    if (context_->ancestors.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->ancestors.desc, ANCESTORS_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->ancestors.shape, ANCESTORS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaDepths() const
+{
+    if (context_->depths.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->depths.desc, DEPTHS_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->depths.shape, DEPTHS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaRequests() const
+{
+    if (context_->requests.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->requests.desc, REQUESTS_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->requests.shape, REQUESTS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaTreeAggNorm() const
+{
+    if (context_->treeAggNorm.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->treeAggNorm.desc, TREE_AGG_NORM_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->treeAggNorm.shape, TREE_AGG_NORM_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaTreeAggCos() const
+{
+    if (context_->treeAggCos.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->treeAggCos.desc, TREE_AGG_COS_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->treeAggCos.shape, TREE_AGG_COS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaTreeAggSin() const
+{
+    if (context_->treeAggSin.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->treeAggSin.desc, TREE_AGG_SIN_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->treeAggSin.shape, TREE_AGG_SIN_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus CompressorTreeProjectTiling::CheckSingleParaTreeAggTable() const
+{
+    if (context_->treeAggTable.desc == nullptr) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(context_->treeAggTable.desc, TREE_AGG_TABLE_NAME) ||
+        ge::GRAPH_SUCCESS != CheckDimNumSupport(context_->treeAggTable.shape, TREE_AGG_TABLE_NAME)) {
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;

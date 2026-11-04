@@ -213,6 +213,17 @@ struct ConstInfo {
     uint32_t nSize = 0;
 
     uint32_t dbSize = 0;
+
+    // Fused tree aggregation phase (port of the standalone CompressorTree op).
+    uint32_t treeAggFused = 0;    // 1 when the aggregation phase runs after projection
+    uint32_t treeAggDim = 0;      // half-row width (= norm width = headDim); row stride = 2*coff*dim
+    uint32_t treeAggBlock = 0;    // state page block size
+    uint32_t treeAggWidth = 0;    // block table width
+    uint32_t treeAggMaxDepth = 0; // ancestor table width
+    uint64_t treeAggPageStride = 0;
+    uint64_t treeAggRowStride = 0;
+    uint64_t treeAggCosStride = 0;
+    uint64_t treeAggSinStride = 0;
 };
 
 struct RunInfo {

@@ -59,6 +59,16 @@ public:
         __gm__ uint8_t *cuSeqlens,
         __gm__ uint8_t *seqUsed,
         __gm__ uint8_t *startPos,
+        // Fused tree aggregation phase inputs (nullable).
+        __gm__ uint8_t *stateReal,
+        __gm__ uint8_t *prefix,
+        __gm__ uint8_t *ancestors,
+        __gm__ uint8_t *depths,
+        __gm__ uint8_t *requests,
+        __gm__ uint8_t *treeAggNorm,
+        __gm__ uint8_t *treeAggCos,
+        __gm__ uint8_t *treeAggSin,
+        __gm__ uint8_t *treeAggTable,
         __gm__ uint8_t *cmpKvOut);
     // =================================资源管理=================================
     __aicore__ inline void InitBuffers(TPipe *pipe);
@@ -66,6 +76,12 @@ public:
     __aicore__ inline void FreeEventID();
     // =================================执行计算=================================
     __aicore__ inline void ComputeVec1(const Vec1RunInfo &info);
+    __aicore__ inline void ComputeTreeAggregate();
+    __aicore__ inline bool TreeAggAddress(uint32_t node, int64_t start, int64_t depth, int64_t pos,
+                                          uint32_t half, uint32_t c);
+    __aicore__ inline void TreeAggLoad(LocalTensor<T> &dst, bool score, uint32_t c);
+    template <HardEvent E>
+    __aicore__ inline void TreeAggSync();
     __aicore__ inline uint32_t GetBasicNum();
     __aicore__ inline uint32_t GetScSize();
     __aicore__ inline void GetScIdxInfo(uint32_t bStart, uint32_t scStart, uint32_t dealScSize, uint32_t v2TcStart,
@@ -217,6 +233,34 @@ private:
     GlobalTensor<T> ropeCosGm_;
     GlobalTensor<X_T> cmpKvOutGm_;
 
+    // =======================Fused tree aggregation phase (GM)========================
+    GlobalTensor<T> aggStateGm_;
+    GlobalTensor<T> aggNormGm_;
+    GlobalTensor<T> aggCosGm_;
+    GlobalTensor<T> aggSinGm_;
+    GlobalTensor<int32_t> aggTableGm_;
+    GlobalTensor<int32_t> aggPrefixGm_;
+    GlobalTensor<int64_t> aggAncestorsGm_;
+    GlobalTensor<int64_t> aggDepthsGm_;
+    GlobalTensor<int64_t> aggRequestsGm_;
+    // =======================Fused tree aggregation phase (UB)========================
+    LocalTensor<T> aggScore_;
+    LocalTensor<T> aggKv_;
+    LocalTensor<T> aggMax_;
+    LocalTensor<T> aggDen_;
+    LocalTensor<T> aggValue_;
+    LocalTensor<T> aggTemp_;
+    LocalTensor<T> aggWeight_;
+    LocalTensor<T> aggCosine_;
+    LocalTensor<T> aggSine_;
+    LocalTensor<T> aggPaired_;
+    LocalTensor<T> aggScratch_;
+    LocalTensor<T> aggReduced_;
+    LocalTensor<uint32_t> aggIndices_;
+    LocalTensor<X_T> aggOut_;
+    bool aggIsNode_ = false;
+    uint64_t aggOffset_ = 0;
+
     // ================================Local Buffer区====================================
     // TBuf<TPosition::VECIN> mm1ResUb;
     LocalTensor<T> mm1ResTensor;
@@ -261,6 +305,15 @@ __aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::Init(
     __gm__ uint8_t *cuSeqlens,
     __gm__ uint8_t *seqUsed,
     __gm__ uint8_t *startPos,
+    __gm__ uint8_t *stateReal,
+    __gm__ uint8_t *prefix,
+    __gm__ uint8_t *ancestors,
+    __gm__ uint8_t *depths,
+    __gm__ uint8_t *requests,
+    __gm__ uint8_t *treeAggNorm,
+    __gm__ uint8_t *treeAggCos,
+    __gm__ uint8_t *treeAggSin,
+    __gm__ uint8_t *treeAggTable,
     __gm__ uint8_t *cmpKvOut)
 {
     stateBlockTableGm_.SetGlobalBuffer((__gm__ int32_t *)stateBlockTable);
@@ -281,6 +334,17 @@ __aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::Init(
     if (isExistStartPos) {
         startPosGm_.SetGlobalBuffer((__gm__ int32_t *)startPos);
     }
+    if (stateReal != nullptr) {
+        aggStateGm_.SetGlobalBuffer((__gm__ T *)stateReal);
+        aggPrefixGm_.SetGlobalBuffer((__gm__ int32_t *)prefix);
+        aggAncestorsGm_.SetGlobalBuffer((__gm__ int64_t *)ancestors);
+        aggDepthsGm_.SetGlobalBuffer((__gm__ int64_t *)depths);
+        aggRequestsGm_.SetGlobalBuffer((__gm__ int64_t *)requests);
+        aggNormGm_.SetGlobalBuffer((__gm__ T *)treeAggNorm);
+        aggCosGm_.SetGlobalBuffer((__gm__ T *)treeAggCos);
+        aggSinGm_.SetGlobalBuffer((__gm__ T *)treeAggSin);
+        aggTableGm_.SetGlobalBuffer((__gm__ int32_t *)treeAggTable);
+    }
     coff_ = static_cast<uint32_t>(COMP::coff);
 }
 
@@ -293,6 +357,26 @@ __aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::InitBuffers(T
     pipe->InitBuffer(outputQue1, 1, BUFFER_SIZE_BYTE_16K);
     pipe->InitBuffer(apeBuf, BUFFER_SIZE_BYTE_32K);
     apeUb = apeBuf.Get<T>();
+    if (constInfo_.treeAggFused) {
+        const uint32_t d = constInfo_.treeAggDim;
+        // 12 working rows (24KB at d=512) fit in tmpBuff1 (32KB).
+        LocalTensor<T> all = tmpBuff1.Get<T>();
+        aggScore_ = all;
+        aggKv_ = all[d];
+        aggMax_ = all[2 * d];
+        aggDen_ = all[3 * d];
+        aggValue_ = all[4 * d];
+        aggTemp_ = all[5 * d];
+        aggWeight_ = all[6 * d];
+        aggCosine_ = all[7 * d];
+        aggSine_ = all[8 * d];
+        aggPaired_ = all[9 * d];
+        aggScratch_ = all[10 * d];
+        aggReduced_ = all[11 * d];
+        aggOut_ = tmpBuff2.Get<X_T>();
+        aggIndices_ = tmpBuff2.Get<uint32_t>()[d];
+        PipeBarrier<PIPE_V>();
+    }
     PipeBarrier<PIPE_V>();
 }
 
@@ -1342,6 +1426,176 @@ __aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::UpdateOutputI
     if (outputSStart == curBatchScSize) {
         outputBStart++;
         outputSStart = 0;
+    }
+}
+
+// =======================Fused tree aggregation phase =========================
+// Port of the standalone CompressorTree op (node window merge + RMSNorm +
+// RoPE + per-node BF16 row write). Every AIV core handles one node
+// (node = GetBlockIdx() + k * cores). Phase-1 node rows are already visible:
+// the last ComputeVec1 runs the all-AIV MODE0 barrier on the MTE2 pipe after
+// the final node-row write. The per-core pipe syncs below are intra-core only,
+// so they cannot race the cross-core MODE0/2 protocol of phase 1.
+
+template <typename COMP>
+template <HardEvent E>
+__aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::TreeAggSync()
+{
+    auto id = static_cast<event_t>(GetTPipePtr()->FetchEventID(E));
+    SetFlag<E>(id);
+    WaitFlag<E>(id);
+}
+
+template <typename COMP>
+__aicore__ inline bool CompressorTreeProjectBlockVectorPerf<COMP>::TreeAggAddress(
+    uint32_t node, int64_t start, int64_t depth, int64_t pos, uint32_t half, uint32_t c)
+{
+    if (pos < 0 || pos > start + depth) {
+        return false;
+    }
+    aggIsNode_ = (pos >= start);
+    if (aggIsNode_) {
+        // Node channel: address the FP32 node row of the ancestor at this step
+        // (row 0 is the reserved zero row, so node rows start at +1).
+        const int64_t step = pos - start;
+        if (step >= constInfo_.treeAggMaxDepth) {
+            return false;
+        }
+        const int64_t ancestor =
+            aggAncestorsGm_.GetValue(static_cast<int64_t>(node) * constInfo_.treeAggMaxDepth + step);
+        if (ancestor < 0 || ancestor >= constInfo_.batchSize) {
+            return false;
+        }
+        aggOffset_ = static_cast<uint64_t>(ancestor + 1) * 2 * c * constInfo_.treeAggDim +
+                     static_cast<uint64_t>(half) * constInfo_.treeAggDim;
+    } else {
+        // History channel: address the FP32 paged state row through the block table.
+        const int64_t col = pos / constInfo_.treeAggBlock;
+        if (col >= constInfo_.treeAggWidth) {
+            return false;
+        }
+        const int64_t page =
+            aggTableGm_.GetValue(aggRequestsGm_.GetValue(node) * constInfo_.treeAggWidth + col);
+        if (page < 0) {
+            return false;
+        }
+        aggOffset_ = static_cast<uint64_t>(page) * constInfo_.treeAggPageStride +
+                     static_cast<uint64_t>(pos % constInfo_.treeAggBlock) * constInfo_.treeAggRowStride +
+                     static_cast<uint64_t>(half) * constInfo_.treeAggDim;
+    }
+    return true;
+}
+
+template <typename COMP>
+__aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::TreeAggLoad(
+    LocalTensor<T> &dst, bool score, uint32_t c)
+{
+    // Same C4 interleaving as the native compressor: the previous/current
+    // windows use different projected halves (kv then score).
+    const uint64_t offset = aggOffset_ + (score ? c * constInfo_.treeAggDim : 0);
+    if (aggIsNode_) {
+        DataCopy(dst, stateCacheGm_[offset], constInfo_.treeAggDim);
+    } else {
+        DataCopy(dst, aggStateGm_[offset], constInfo_.treeAggDim);
+    }
+}
+
+template <typename COMP>
+__aicore__ inline void CompressorTreeProjectBlockVectorPerf<COMP>::ComputeTreeAggregate()
+{
+    if (constInfo_.treeAggFused == 0) {
+        return;
+    }
+    const uint32_t d = constInfo_.treeAggDim;
+    const uint32_t c = constInfo_.cmpRatio == 4 ? 2 : 1;
+    const uint32_t n = constInfo_.batchSize;
+    const uint32_t cores = constInfo_.usedCoreNum * 2; // total AIV cores
+
+    // One-shot per-core setup, mirroring the standalone op's Init.
+    for (uint32_t i = 0; i < constInfo_.ropeHeadDim; ++i) {
+        aggIndices_.SetValue(i, (i ^ 1U) * sizeof(float));
+    }
+    TreeAggSync<HardEvent::S_V>();
+    DataCopy(aggWeight_, aggNormGm_[0], d);
+    TreeAggSync<HardEvent::MTE2_V>();
+
+    for (uint32_t node = GetBlockIdx(); node < n; node += cores) {
+        const int64_t start = aggPrefixGm_.GetValue(node);
+        const int64_t depth = aggDepthsGm_.GetValue(node);
+        const int64_t pos = start + depth;
+        Duplicate(aggValue_, 0.0f, d);
+        if ((pos + 1) % constInfo_.cmpRatio == 0) {
+            Duplicate(aggMax_, -3.402823466e+38f, d);
+            Duplicate(aggDen_, 0.0f, d);
+            for (uint32_t w = 0; w < constInfo_.cmpRatio * c; ++w) {
+                const int64_t p = pos + 1 - constInfo_.cmpRatio * c + w / c + (w % c) * constInfo_.cmpRatio;
+                if (!TreeAggAddress(node, start, depth, p, w % c, c)) continue;
+                TreeAggSync<HardEvent::V_MTE2>();
+                TreeAggLoad(aggScore_, true, c);
+                TreeAggSync<HardEvent::MTE2_V>();
+                Max(aggMax_, aggMax_, aggScore_, d);
+                PipeBarrier<PIPE_V>();
+            }
+            for (uint32_t w = 0; w < constInfo_.cmpRatio * c; ++w) {
+                const int64_t p = pos + 1 - constInfo_.cmpRatio * c + w / c + (w % c) * constInfo_.cmpRatio;
+                if (!TreeAggAddress(node, start, depth, p, w % c, c)) continue;
+                TreeAggSync<HardEvent::V_MTE2>();
+                TreeAggLoad(aggScore_, true, c);
+                TreeAggLoad(aggKv_, false, c);
+                TreeAggSync<HardEvent::MTE2_V>();
+                Sub(aggScore_, aggScore_, aggMax_, d);
+                PipeBarrier<PIPE_V>();
+                Exp(aggScore_, aggScore_, d);
+                PipeBarrier<PIPE_V>();
+                Add(aggDen_, aggDen_, aggScore_, d);
+                Mul(aggTemp_, aggScore_, aggKv_, d);
+                PipeBarrier<PIPE_V>();
+                Add(aggValue_, aggValue_, aggTemp_, d);
+                PipeBarrier<PIPE_V>();
+            }
+            Div(aggValue_, aggValue_, aggDen_, d);
+            PipeBarrier<PIPE_V>();
+            // RMSNorm over the merged row.
+            Mul(aggTemp_, aggValue_, aggValue_, d);
+            PipeBarrier<PIPE_V>();
+            ReduceSum(aggReduced_, aggTemp_, aggScratch_, d);
+            TreeAggSync<HardEvent::V_S>();
+            const float mean = aggReduced_.GetValue(0) / d + constInfo_.normEps;
+            Duplicate(aggTemp_, mean, d);
+            PipeBarrier<PIPE_V>();
+            Sqrt(aggTemp_, aggTemp_, d);
+            PipeBarrier<PIPE_V>();
+            Div(aggValue_, aggValue_, aggTemp_, d);
+            PipeBarrier<PIPE_V>();
+            Mul(aggValue_, aggValue_, aggWeight_, d);
+            PipeBarrier<PIPE_V>();
+            // RoPE over the last ropeHeadDim dims at the compressed position.
+            const uint32_t rd = constInfo_.ropeHeadDim;
+            const uint32_t begin = d - rd;
+            const int64_t ropePos = pos + 1 - constInfo_.cmpRatio;
+            TreeAggSync<HardEvent::V_MTE2>();
+            DataCopy(aggCosine_, aggCosGm_[static_cast<uint64_t>(ropePos) * constInfo_.treeAggCosStride], rd);
+            DataCopy(aggSine_, aggSinGm_[static_cast<uint64_t>(ropePos) * constInfo_.treeAggSinStride], rd);
+            TreeAggSync<HardEvent::MTE2_V>();
+            Gather(aggPaired_, aggValue_[begin], aggIndices_, 0U, rd);
+            PipeBarrier<PIPE_V>();
+            TreeAggSync<HardEvent::V_S>();
+            for (uint32_t i = 0; i < rd; ++i) {
+                aggScratch_.SetValue(i, (i % 2 == 0) ? -1.0f : 1.0f);
+            }
+            TreeAggSync<HardEvent::S_V>();
+            Mul(aggPaired_, aggPaired_, aggScratch_, rd);
+            PipeBarrier<PIPE_V>();
+            Mul(aggPaired_, aggPaired_, aggSine_, rd);
+            Mul(aggValue_[begin], aggValue_[begin], aggCosine_, rd);
+            PipeBarrier<PIPE_V>();
+            Add(aggValue_[begin], aggValue_[begin], aggPaired_, rd);
+            PipeBarrier<PIPE_V>();
+        }
+        Cast(aggOut_, aggValue_, RoundMode::CAST_RINT, d);
+        TreeAggSync<HardEvent::V_MTE3>();
+        DataCopy(cmpKvOutGm_[static_cast<uint64_t>(node) * d], aggOut_, d);
+        TreeAggSync<HardEvent::MTE3_V>();
     }
 }
 

@@ -28,7 +28,8 @@ using namespace CompressorTreeProject;
     do {                                                                                                               \
         templateClass<COMPType<__VA_ARGS__>> op(&pipe, tilingData);                                                    \
         op.Init(x, wKv, wGate, stateCache, ape, normWeight, ropeSin, ropeCos, stateBlockTable,  \
-                cuSeqlens, seqUsed, startPos, cmpKvOut, workspace);                                                    \
+                cuSeqlens, seqUsed, startPos, stateReal, prefix, ancestors, depths, requests, \
+                treeAggNorm, treeAggCos, treeAggSin, treeAggTable, cmpKvOut, workspace);                                     \
         op.Process();                                                                                                  \
     } while (0)
 
@@ -46,6 +47,16 @@ __global__ __aicore__ void compressor_tree_project(
     __gm__ uint8_t *cuSeqlens,
     __gm__ uint8_t *seqUsed,
     __gm__ uint8_t *startPos,
+    // Fused tree aggregation phase inputs (nullable; see the op def).
+    __gm__ uint8_t *stateReal,
+    __gm__ uint8_t *prefix,
+    __gm__ uint8_t *ancestors,
+    __gm__ uint8_t *depths,
+    __gm__ uint8_t *requests,
+    __gm__ uint8_t *treeAggNorm,
+    __gm__ uint8_t *treeAggCos,
+    __gm__ uint8_t *treeAggSin,
+    __gm__ uint8_t *treeAggTable,
     __gm__ uint8_t *cmpKvOut,
     __gm__ uint8_t *stateCacheOut,
     __gm__ uint8_t *workspace,

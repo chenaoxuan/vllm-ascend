@@ -63,6 +63,10 @@ struct SwaTempLoopInfo {
     uint64_t actualSeqQPrefixSum = 0;
     uint64_t actualSeqKVPrefixSum = 0;
     uint64_t actualSeqCmpKVPrefixSum = 0;
+
+    // 树兄弟节点窗口共享: 每节点 ori 窗口前导共享 history 行数 + slot 行 0 的逻辑 KV 位置
+    uint32_t oriSparseHistRows = 0;
+    uint32_t oriSparseWinStart = 0;
 };
 
 template <typename SASTreeT>
@@ -150,6 +154,8 @@ private:
     GlobalTensor<int32_t> oriBlockTableGm;
     GlobalTensor<int32_t> cmpBlockTableGm;
     GlobalTensor<int32_t> oriSparseIndicesGm;
+    // 树路径每节点前缀 start_r（logical 位置）, 用于窗口共享 history/树尾切分
+    GlobalTensor<int32_t> treePrefixGm;
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
@@ -464,6 +470,9 @@ __aicore__ inline void SparseAttnSharedkvTreeSwa<SASTreeT>::Init(
     // init global buffer
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
     oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
+    if (treePrefix != nullptr) {
+        treePrefixGm.SetGlobalBuffer((__gm__ int32_t *)treePrefix);
+    }
     if (constInfo.templateMode == CFA_TEMPLATE) {
         cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
     }
@@ -565,6 +574,8 @@ __aicore__ inline void SparseAttnSharedkvTreeSwa<SASTreeT>::CalcParams(uint32_t 
     info.tndCoreStartKVSplitPos = tempLoopInfo.tndCoreStartKVSplitPos;
     info.isBmm2Output = false;
     info.actS1Size = tempLoopInfo.actS1Size;
+    info.oriSparseHistRows = tempLoopInfo.oriSparseHistRows;
+    info.oriSparseWinStart = tempLoopInfo.oriSparseWinStart;
 
     // M方向的尾块
     info.actMBaseSize = tempLoopInfo.mBasicSizeTail;
@@ -732,6 +743,25 @@ __aicore__ inline void SparseAttnSharedkvTreeSwa<SASTreeT>::ProcessBalance()
                 uint32_t sparseOriS2Size = GetOriSparseActualSeqLen();
                 tempLoopInfo.oriMaskLeft = 0;
                 tempLoopInfo.oriMaskRight = sparseOriS2Size == 0 ? -1 : static_cast<int32_t>(sparseOriS2Size - 1U);
+                // 树兄弟节点窗口共享切分: 窗口尾部 (seqused - start_r) = depth+1 行是树祖先 KV
+                // (每节点物理位置不同, 保持逐行 gather); 前导 history 行在请求内所有节点共享,
+                // 走页对齐批量 ND2NZ, 数据在 LLC 内跨节点复用。
+                tempLoopInfo.oriSparseHistRows = 0;
+                tempLoopInfo.oriSparseWinStart = 0;
+                if (constInfo.hasTreeCmpKv && LAYOUT_T == SASTree_LAYOUT::TND &&
+                    KV_LAYOUT_T == SASTree_LAYOUT::PA_ND) {
+                    int32_t seqUsed = tempLoopInfo.actOriS2Size;
+                    int32_t treeStart = treePrefixGm.GetValue(tempLoopInfo.bIdx);
+                    int32_t tailLen = seqUsed - treeStart;
+                    if (tailLen < 0) {
+                        tailLen = 0;
+                    }
+                    if (sparseOriS2Size > static_cast<uint32_t>(tailLen)) {
+                        tempLoopInfo.oriSparseHistRows = sparseOriS2Size - static_cast<uint32_t>(tailLen);
+                        int32_t winStart = seqUsed - static_cast<int32_t>(sparseOriS2Size);
+                        tempLoopInfo.oriSparseWinStart = (winStart > 0) ? static_cast<uint32_t>(winStart) : 0U;
+                    }
+                }
             } else {
                 tempLoopInfo.oriMaskRight = tempLoopInfo.actOriS2Size - tempLoopInfo.actS1Size +
                                             static_cast<int32_t>(tempLoopInfo.s1EndIdx) + constInfo.oriWinRight;

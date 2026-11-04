@@ -73,11 +73,24 @@ namespace optiling {
         uint32_t dbWorkspaceRatio = 1;
     };
 
+    struct CompressorTreeProjectTreeAggParams {
+        uint32_t fused = 0;      // 1 when the aggregation phase runs after projection
+        uint32_t dim = 0;        // half-row width (= norm width = headDim); row stride = 2*coff*dim
+        uint32_t block = 0;      // state page block size
+        uint32_t width = 0;      // block table width
+        uint32_t maxDepth = 0;   // ancestor table width
+        uint64_t pageStride = 0; // state stride dim0
+        uint64_t rowStride = 0;  // state stride dim1
+        uint64_t cosStride = 0;  // cos stride dim0
+        uint64_t sinStride = 0;  // sin stride dim0
+    };
+
     struct CompressorTreeProjectTilingData {
         CompressorTreeProjectBaseParams baseParams;
         CompressorTreeProjectPageAttentionParams pageAttentionParams;
         CompressorTreeProjectInnerSplitParams innerSplitParams;
         CompressorTreeProjectWorkspaceParams workspaceParams;
+        CompressorTreeProjectTreeAggParams treeAggParams;
     };
 } // optiling
 

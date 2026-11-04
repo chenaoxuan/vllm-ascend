@@ -250,6 +250,15 @@ struct RunInfo {
     int64_t cmpS2IdLimit = 0;
     int32_t v0S2DealSize = 0;
     int32_t v0S2Start = 0;
+
+    // 树兄弟节点窗口共享（TND + ori sparse indices 场景）:
+    // oriSparseHistRows = 当前节点 ori 窗口中前导共享 history 行数（slot 下标 [0, oriSparseHistRows)）。
+    // 同一请求内兄弟节点该区间逻辑位置相同, 可走页对齐 ND2NZ 批量搬运, 数据在 LLC 内跨节点复用;
+    // 仅尾部 (depth+1) 行树祖先 KV 需要逐行 sparse gather。
+    // oriSparseWinStart = slot 行 0 对应的逻辑 KV 位置 (= seqused - sparseLen)。
+    // 非树/非 TND/无 sparse indices 路径保持 0, 完全退化为原逐行 sparse gather 行为。
+    uint32_t oriSparseHistRows = 0;
+    uint32_t oriSparseWinStart = 0;
 };
 
 struct ConstInfo {

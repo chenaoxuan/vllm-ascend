@@ -82,6 +82,54 @@ public:
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
+        // Fused tree aggregation phase (optional): when state_real is present
+        // the kernel also runs the CompressorTree node aggregation after the
+        // projection and writes the per-node BF16 rows to cmp_kv.
+        this->Input("state_real")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_FLOAT})
+            .FormatList({ge::FORMAT_ND})
+            .IgnoreContiguous();
+        this->Input("prefix")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_INT32})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("ancestors")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_INT64})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("depths")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_INT64})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("requests")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_INT64})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("tree_agg_norm")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_FLOAT})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
+        this->Input("tree_agg_cos")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_FLOAT})
+            .FormatList({ge::FORMAT_ND})
+            .IgnoreContiguous();
+        this->Input("tree_agg_sin")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_FLOAT})
+            .FormatList({ge::FORMAT_ND})
+            .IgnoreContiguous();
+        this->Input("tree_agg_table")
+            .ParamType(OPTIONAL)
+            .DataTypeList({ge::DT_INT32})
+            .FormatList({ge::FORMAT_ND})
+            .AutoContiguous();
         this->Output("cmp_kv")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})
@@ -97,6 +145,12 @@ public:
         this->Attr("rotary_mode").AttrType(OPTIONAL).Int(ROTARY_MODE_VALUE);
         this->Attr("cache_mode").AttrType(OPTIONAL).Int(CACHE_MODE_VALUE);
         this->Attr("state_cache_stride_dim0").AttrType(OPTIONAL).Int(STATE_CACHE_STRIDE_DIM0);
+        this->Attr("tree_agg_max_depth").AttrType(OPTIONAL).Int(0);
+        this->Attr("tree_agg_width").AttrType(OPTIONAL).Int(0);
+        this->Attr("tree_agg_page_stride").AttrType(OPTIONAL).Int(0);
+        this->Attr("tree_agg_row_stride").AttrType(OPTIONAL).Int(0);
+        this->Attr("tree_agg_cos_stride").AttrType(OPTIONAL).Int(0);
+        this->Attr("tree_agg_sin_stride").AttrType(OPTIONAL).Int(0);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

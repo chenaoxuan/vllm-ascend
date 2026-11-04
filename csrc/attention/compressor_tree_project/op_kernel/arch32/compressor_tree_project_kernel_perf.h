@@ -84,6 +84,16 @@ public:
         __gm__ uint8_t *cuSeqlens,
         __gm__ uint8_t *seqUsed,
         __gm__ uint8_t *startPos,
+        // Fused tree aggregation phase inputs (nullable).
+        __gm__ uint8_t *stateReal,
+        __gm__ uint8_t *prefix,
+        __gm__ uint8_t *ancestors,
+        __gm__ uint8_t *depths,
+        __gm__ uint8_t *requests,
+        __gm__ uint8_t *treeAggNorm,
+        __gm__ uint8_t *treeAggCos,
+        __gm__ uint8_t *treeAggSin,
+        __gm__ uint8_t *treeAggTable,
         __gm__ uint8_t *cmpKvOut,
         __gm__ uint8_t *workspace);
     __aicore__ inline void Process();
@@ -173,6 +183,16 @@ __aicore__ inline void CompressorTreeProjectKernelPerf<COMP>::Init(
         __gm__ uint8_t *cuSeqlens,
         __gm__ uint8_t *seqUsed,
         __gm__ uint8_t *startPos,
+        // Fused tree aggregation phase inputs (nullable).
+        __gm__ uint8_t *stateReal,
+        __gm__ uint8_t *prefix,
+        __gm__ uint8_t *ancestors,
+        __gm__ uint8_t *depths,
+        __gm__ uint8_t *requests,
+        __gm__ uint8_t *treeAggNorm,
+        __gm__ uint8_t *treeAggCos,
+        __gm__ uint8_t *treeAggSin,
+        __gm__ uint8_t *treeAggTable,
         __gm__ uint8_t *cmpKvOut,
         __gm__ uint8_t *workspace)
 {
@@ -227,7 +247,8 @@ __aicore__ inline void CompressorTreeProjectKernelPerf<COMP>::Init(
     } else {
         blockVec_.InitParams(constInfo, tools_);
         blockVec_.Init(x, wKv, wGate, stateCache, ape, normWeight, ropeSin, ropeCos, stateBlockTable,
-                        cuSeqlens, seqUsed, startPos, cmpKvOut);
+                        cuSeqlens, seqUsed, startPos, stateReal, prefix, ancestors, depths, requests,
+                        treeAggNorm, treeAggCos, treeAggSin, treeAggTable, cmpKvOut);
         blockVec_.InitBuffers(pipe_);
 #if __CCE_AICORE__ == 310
         blockVec_.InitVec1GlobalTensor(Vec1InputKvGm, Vec1InputScoreGm, vec1KvCacheGm, vec1ScoreCacheGm, vec1ResGm, vec2InputGm);
@@ -258,6 +279,16 @@ __aicore__ inline void CompressorTreeProjectKernelPerf<COMP>::InitTilingData() {
     constInfo.nSize =  tilingData_->baseParams.nSize;
     constInfo.vec1TailCacheSize = tilingData_->workspaceParams.vec1TailCacheSize;
     constInfo.dbWorkspaceRatio = tilingData_->workspaceParams.dbWorkspaceRatio;
+
+    constInfo.treeAggFused = tilingData_->treeAggParams.fused;
+    constInfo.treeAggDim = tilingData_->treeAggParams.dim;
+    constInfo.treeAggBlock = tilingData_->treeAggParams.block;
+    constInfo.treeAggWidth = tilingData_->treeAggParams.width;
+    constInfo.treeAggMaxDepth = tilingData_->treeAggParams.maxDepth;
+    constInfo.treeAggPageStride = tilingData_->treeAggParams.pageStride;
+    constInfo.treeAggRowStride = tilingData_->treeAggParams.rowStride;
+    constInfo.treeAggCosStride = tilingData_->treeAggParams.cosStride;
+    constInfo.treeAggSinStride = tilingData_->treeAggParams.sinStride;
 }
 
 template <typename COMP>
@@ -650,6 +681,13 @@ __aicore__ inline void CompressorTreeProjectKernelPerf<COMP>::Process()
 
         }
 
+    }
+    // Fused tree aggregation phase: every AIV core merges one node after all
+    // phase-1 node rows are visible (last ComputeVec1 MODE0 barrier).
+    if ASCEND_IS_AIV {
+        if (constInfo.treeAggFused) {
+            blockVec_.ComputeTreeAggregate();
+        }
     }
     FreeEventID();
 }

@@ -38,7 +38,11 @@ public:
                                 __gm__ uint8_t *stateCache, __gm__ uint8_t *ape, __gm__ uint8_t *normWeight,
                                 __gm__ uint8_t *ropeSin, __gm__ uint8_t *ropeCos, __gm__ uint8_t *stateBlockTable,
                                 __gm__ uint8_t *cuSeqlens, __gm__ uint8_t *seqUsed, __gm__ uint8_t *startPos,
-                                __gm__ uint8_t *cmpKvOut, __gm__ uint8_t *workspace);
+                                // Fused tree aggregation phase inputs (unused by the FULL_LOAD template).
+                                __gm__ uint8_t *stateReal, __gm__ uint8_t *prefix, __gm__ uint8_t *ancestors,
+                                __gm__ uint8_t *depths, __gm__ uint8_t *requests, __gm__ uint8_t *treeAggNorm,
+                                __gm__ uint8_t *treeAggCos, __gm__ uint8_t *treeAggSin,
+                                __gm__ uint8_t *treeAggTable, __gm__ uint8_t *cmpKvOut, __gm__ uint8_t *workspace);
     __aicore__ inline void Process();
 
 private:
@@ -115,6 +119,10 @@ CompressorTreeProjectKernelFullLoad<COMP>::Init(__gm__ uint8_t *x, __gm__ uint8_
                                      __gm__ uint8_t *stateCache, __gm__ uint8_t *ape, __gm__ uint8_t *normWeight,
                                      __gm__ uint8_t *ropeSin, __gm__ uint8_t *ropeCos, __gm__ uint8_t *stateBlockTable,
                                      __gm__ uint8_t *cuSeqlens, __gm__ uint8_t *seqUsed, __gm__ uint8_t *startPos,
+                                      // Fused tree aggregation phase inputs (unused by the FULL_LOAD template).
+                                      __gm__ uint8_t *stateReal, __gm__ uint8_t *prefix, __gm__ uint8_t *ancestors,
+                                      __gm__ uint8_t *depths, __gm__ uint8_t *requests, __gm__ uint8_t *treeAggNorm,
+                                      __gm__ uint8_t *treeAggCos, __gm__ uint8_t *treeAggSin, __gm__ uint8_t *treeAggTable,
                                      __gm__ uint8_t *cmpKvOut, __gm__ uint8_t *workspace)
 {
     if ASCEND_IS_AIV {

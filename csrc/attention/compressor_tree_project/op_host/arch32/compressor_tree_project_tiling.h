@@ -55,6 +55,16 @@ constexpr uint32_t STATE_BLOCK_TABLE_INPUT_INDEX = 8;
 constexpr uint32_t CU_SEQ_LEN_INPUT_INDEX = 9;
 constexpr uint32_t SEQ_USED_INPUT_INDEX = 10;
 constexpr uint32_t START_POS_INPUT_INDEX = 11;
+// Fused tree aggregation phase inputs (declared after start_pos in the op def).
+constexpr uint32_t STATE_REAL_INPUT_INDEX = 12;
+constexpr uint32_t PREFIX_INPUT_INDEX = 13;
+constexpr uint32_t ANCESTORS_INPUT_INDEX = 14;
+constexpr uint32_t DEPTHS_INPUT_INDEX = 15;
+constexpr uint32_t REQUESTS_INPUT_INDEX = 16;
+constexpr uint32_t TREE_AGG_NORM_INPUT_INDEX = 17;
+constexpr uint32_t TREE_AGG_COS_INPUT_INDEX = 18;
+constexpr uint32_t TREE_AGG_SIN_INPUT_INDEX = 19;
+constexpr uint32_t TREE_AGG_TABLE_INPUT_INDEX = 20;
 
 // ATTR
 constexpr uint32_t ROPE_HEAD_DIM_ATTR_INDEX = 0;
@@ -64,6 +74,12 @@ constexpr uint32_t NORM_EPS_ATTR_INDEX = 3;
 constexpr uint32_t ROTARY_MODE_ATTR_INDEX = 4;
 constexpr uint32_t CACHE_MODE_ATTR_INDEX = 5;
 constexpr uint32_t STATE_CACHE_STRIDE_DIM0_ATTR_INDEX = 6;
+constexpr uint32_t TREE_AGG_MAX_DEPTH_ATTR_INDEX = 7;
+constexpr uint32_t TREE_AGG_WIDTH_ATTR_INDEX = 8;
+constexpr uint32_t TREE_AGG_PAGE_STRIDE_ATTR_INDEX = 9;
+constexpr uint32_t TREE_AGG_ROW_STRIDE_ATTR_INDEX = 10;
+constexpr uint32_t TREE_AGG_COS_STRIDE_ATTR_INDEX = 11;
+constexpr uint32_t TREE_AGG_SIN_STRIDE_ATTR_INDEX = 12;
 
 // OUTPUT
 constexpr uint32_t CMP_KV_OUTPUT_INDEX = 0;
@@ -105,6 +121,16 @@ static const std::string ROTARY_MODE_NAME = "rotary_mode";
 static const std::string CACHE_MODE_NAME = "cache_mode";
 static const std::string CMP_KV_NAME = "cmp_kv";
 
+static const std::string STATE_REAL_NAME = "state_real";
+static const std::string PREFIX_NAME = "prefix";
+static const std::string ANCESTORS_NAME = "ancestors";
+static const std::string DEPTHS_NAME = "depths";
+static const std::string REQUESTS_NAME = "requests";
+static const std::string TREE_AGG_NORM_NAME = "tree_agg_norm";
+static const std::string TREE_AGG_COS_NAME = "tree_agg_cos";
+static const std::string TREE_AGG_SIN_NAME = "tree_agg_sin";
+static const std::string TREE_AGG_TABLE_NAME = "tree_agg_table";
+
 static std::string DataTypeToSerialString(ge::DataType type);
 
 const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
@@ -120,7 +146,16 @@ const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
     {CU_SEQLENS_NAME,         {ge::DT_INT32}},
     {SEQUSED_NAME,            {ge::DT_INT32}},
     {START_POS_NAME,          {ge::DT_INT32}},
-    {CMP_KV_NAME,             {ge::DT_BF16, ge::DT_FLOAT16}}
+    {CMP_KV_NAME,             {ge::DT_BF16, ge::DT_FLOAT16}},
+    {STATE_REAL_NAME,         {ge::DT_FLOAT}},
+    {PREFIX_NAME,             {ge::DT_INT32}},
+    {ANCESTORS_NAME,          {ge::DT_INT64}},
+    {DEPTHS_NAME,             {ge::DT_INT64}},
+    {REQUESTS_NAME,           {ge::DT_INT64}},
+    {TREE_AGG_NORM_NAME,      {ge::DT_FLOAT}},
+    {TREE_AGG_COS_NAME,       {ge::DT_FLOAT}},
+    {TREE_AGG_SIN_NAME,       {ge::DT_FLOAT}},
+    {TREE_AGG_TABLE_NAME,     {ge::DT_INT32}}
 };
 
 const std::map<std::string, std::vector<uint32_t>> DIM_NUM_MAP = {
@@ -136,7 +171,16 @@ const std::map<std::string, std::vector<uint32_t>> DIM_NUM_MAP = {
     {CU_SEQLENS_NAME,         {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
     {SEQUSED_NAME,            {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
     {START_POS_NAME,          {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
-    {CMP_KV_NAME,             {COMPRESSOR_TREE_PROJECT_DIM_NUM_2, COMPRESSOR_TREE_PROJECT_DIM_NUM_3}}
+    {CMP_KV_NAME,             {COMPRESSOR_TREE_PROJECT_DIM_NUM_2, COMPRESSOR_TREE_PROJECT_DIM_NUM_3}},
+    {STATE_REAL_NAME,         {COMPRESSOR_TREE_PROJECT_DIM_NUM_3, COMPRESSOR_TREE_PROJECT_DIM_NUM_4}},
+    {PREFIX_NAME,             {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
+    {ANCESTORS_NAME,          {COMPRESSOR_TREE_PROJECT_DIM_NUM_2}},
+    {DEPTHS_NAME,             {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
+    {REQUESTS_NAME,           {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
+    {TREE_AGG_NORM_NAME,      {COMPRESSOR_TREE_PROJECT_DIM_NUM_1}},
+    {TREE_AGG_COS_NAME,       {COMPRESSOR_TREE_PROJECT_DIM_NUM_2, COMPRESSOR_TREE_PROJECT_DIM_NUM_3}},
+    {TREE_AGG_SIN_NAME,       {COMPRESSOR_TREE_PROJECT_DIM_NUM_2, COMPRESSOR_TREE_PROJECT_DIM_NUM_3}},
+    {TREE_AGG_TABLE_NAME,     {COMPRESSOR_TREE_PROJECT_DIM_NUM_2}}
 };
 
 static const std::map<std::string, uint32_t> LAYOUT_DIM_MAP = {
@@ -260,6 +304,16 @@ struct CompressorTreeProjectContext {
     OptionalParaInfo cuSeqlens;
     OptionalParaInfo seqUsed;
     OptionalParaInfo startPos;
+    // Fused tree aggregation phase inputs (all optional).
+    OptionalParaInfo stateReal;
+    OptionalParaInfo prefix;
+    OptionalParaInfo ancestors;
+    OptionalParaInfo depths;
+    OptionalParaInfo requests;
+    OptionalParaInfo treeAggNorm;
+    OptionalParaInfo treeAggCos;
+    OptionalParaInfo treeAggSin;
+    OptionalParaInfo treeAggTable;
     RequiredParaInfo cmpKv;
 
     const int *ropeHeadDim;
@@ -269,6 +323,13 @@ struct CompressorTreeProjectContext {
     const int *rotaryMode;
     const int *cacheMode;
     const int *stateCacheStrideDim0;
+    // Fused tree aggregation phase attrs (all optional, default 0).
+    const int *treeAggMaxDepth;
+    const int *treeAggWidth;
+    const int *treeAggPageStride;
+    const int *treeAggRowStride;
+    const int *treeAggCosStride;
+    const int *treeAggSinStride;
     TemplateId templateId;
 
     ge::DataType dtype = ge::DT_BF16;
@@ -294,6 +355,7 @@ private:
     ge::graphStatus GetNpuInfo();
     ge::graphStatus SetBaseInfo();
     ge::graphStatus SetPageAttentionInfo();
+    ge::graphStatus SetTreeAggInfo();
     ge::graphStatus SetWorkSpaceInfo();
     ge::graphStatus SetScenarioInfo();
     ge::graphStatus SetTemplateId();
@@ -331,6 +393,15 @@ private:
     ge::graphStatus CheckSingleParaCuSeqlens() const;
     ge::graphStatus CheckSingleParaSeqused() const;
     ge::graphStatus CheckSingleParaStartPos() const;
+    ge::graphStatus CheckSingleParaStateReal() const;
+    ge::graphStatus CheckSingleParaPrefix() const;
+    ge::graphStatus CheckSingleParaAncestors() const;
+    ge::graphStatus CheckSingleParaDepths() const;
+    ge::graphStatus CheckSingleParaRequests() const;
+    ge::graphStatus CheckSingleParaTreeAggNorm() const;
+    ge::graphStatus CheckSingleParaTreeAggCos() const;
+    ge::graphStatus CheckSingleParaTreeAggSin() const;
+    ge::graphStatus CheckSingleParaTreeAggTable() const;
     ge::graphStatus CheckSingleParaCmpKv() const;
     ge::graphStatus CheckSingleParaRopeHeadDim() const;
     ge::graphStatus CheckSingleParaCmpRatio() const;
@@ -373,6 +444,7 @@ private:
     CompressorTreeProjectPageAttentionParams *pageAttentionParams_ = nullptr;
     CompressorTreeProjectInnerSplitParams *innerSplitParams_ = nullptr;
     CompressorTreeProjectWorkspaceParams *workspaceParams_ = nullptr;
+    CompressorTreeProjectTreeAggParams *treeAggParams_ = nullptr;
 };
 
 } // optiling

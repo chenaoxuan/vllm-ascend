@@ -372,25 +372,58 @@ __aicore__ inline void SASTreeCubeBlock<SASTreeT>::ComputeMm1(const RunInfo &inf
                     uint32_t copyRowCnt = 0;
 
                     if (constInfo.hasOriSparseIndices) {
-                        Position startPos;
-                        startPos.bIdx = info.bIdx;
-                        startPos.n2Idx = info.n2Idx;
-                        startPos.s2Idx = 0;
-                        startPos.dIdx = kL1 * 256;
-                        PAShape shape;
-                        shape.blockSize = constInfo.paOriBlockSize;
-                        shape.headNum = constInfo.kvHeadNum;
-                        shape.headDim = constInfo.headDim;
-                        shape.kvStride = constInfo.oriKvStride;
-                        shape.actHeadDim = 256;
-                        shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
-                        shape.copyRowNum = nL1Size;
-                        shape.copyRowNumAlign = nL1SizeAlign;
+                        // 窗口行范围(slot 下标空间): [rowStart, rowStart + nL1Size)
+                        uint32_t rowStart = info.s2Idx * constInfo.s2BaseSize + nL1 * N_SPLIT_SIZE;
+                        // 树兄弟节点共享: 前导 histRows 行为请求内共享 history(兄弟节点逻辑区间相同),
+                        // 页对齐 ND2NZ 批量搬运, 数据在 LLC 内跨节点复用; 尾部为本节点树祖先行, 保持逐行 gather。
+                        uint32_t histRows = 0;
+                        if (info.oriSparseHistRows > 0) {
+                            uint32_t histEnd = rowStart + nL1Size;
+                            if (info.oriSparseHistRows < histEnd) {
+                                histEnd = info.oriSparseHistRows;
+                            }
+                            histRows = (histEnd > rowStart) ? (histEnd - rowStart) : 0U;
+                        }
+                        uint32_t tailRows = nL1Size - histRows;
                         uint64_t sparseIndexBaseOffset =
                             (info.qTokenOffset * constInfo.kvHeadNum + info.n2Idx) * constInfo.oriSparseIndexWidth;
-                        uint32_t sparseIndexStart = info.s2Idx * constInfo.s2BaseSize + nL1 * N_SPLIT_SIZE;
-                        DataCopyPABySlots<KV_T>(bL1Tensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
-                                                sparseIndexBaseOffset, sparseIndexStart);
+                        if (histRows > 0) {
+                            PAShape shape;
+                            shape.blockSize = constInfo.paOriBlockSize;
+                            shape.headNum = constInfo.kvHeadNum;
+                            shape.headDim = constInfo.headDim;
+                            shape.kvStride = constInfo.oriKvStride;
+                            shape.actHeadDim = 256;
+                            shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
+                            shape.copyRowNum = histRows;
+                            shape.copyRowNumAlign = nL1SizeAlign;
+                            Position startPos;
+                            startPos.bIdx = info.bIdx;
+                            startPos.n2Idx = info.n2Idx;
+                            startPos.s2Idx = info.oriSparseWinStart + rowStart;
+                            startPos.dIdx = kL1 * 256;
+                            DataCopyPA<KV_T>(bL1Tensor, oriKvGm, oriBlockTableGm, shape, startPos);
+                        }
+                        if (tailRows > 0) {
+                            Position startPos;
+                            startPos.bIdx = info.bIdx;
+                            startPos.n2Idx = info.n2Idx;
+                            startPos.s2Idx = 0;
+                            startPos.dIdx = kL1 * 256;
+                            PAShape shape;
+                            shape.blockSize = constInfo.paOriBlockSize;
+                            shape.headNum = constInfo.kvHeadNum;
+                            shape.headDim = constInfo.headDim;
+                            shape.kvStride = constInfo.oriKvStride;
+                            shape.actHeadDim = 256;
+                            shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
+                            shape.copyRowNum = tailRows;
+                            shape.copyRowNumAlign = nL1SizeAlign;
+                            uint32_t sparseIndexStart = rowStart + histRows;
+                            kTensor = bL1Tensor[histRows * 16];
+                            DataCopyPABySlots<KV_T>(kTensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
+                                                    sparseIndexBaseOffset, sparseIndexStart);
+                        }
                     } else {
                         while (copyFinishRowCnt < nL1Size) {
                             // 由于ori_left的存在， 即使第一块搬运也可能并非是pa_block的零点位
@@ -656,26 +689,58 @@ __aicore__ inline void SASTreeCubeBlock<SASTreeT>::ComputeMm2(const RunInfo &inf
                         uint32_t copyFinishRowCnt = 0;
                         uint32_t curS2Offset = info.s2Idx * constInfo.s2BaseSize + info.s2StartPoint;
                         if (constInfo.hasOriSparseIndices) {
-                            Position startPos;
-                            startPos.bIdx = info.bIdx;
-                            startPos.n2Idx = info.n2Idx;
-                            startPos.s2Idx = 0;
-                            startPos.dIdx = nL1 * N_SPLIT_SIZE;
-                            PAShape shape;
-                            shape.blockSize = constInfo.paOriBlockSize;
-                            shape.headNum = constInfo.kvHeadNum;
-                            shape.headDim = constInfo.headDim;
-                            shape.kvStride = constInfo.oriKvStride;
-                            shape.actHeadDim = nL1Size;
-                            shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
-                            shape.copyRowNum = kL0Size;
-                            shape.copyRowNumAlign = kL0SizeAlign;
-                            subvTensor = bL1Tensor[(kL1 - kOffset) * 128 * N_SPLIT_SIZE];
+                            // 窗口行范围(slot 下标空间): [rowStart, rowStart + kL0Size)
+                            uint32_t rowStart = info.s2Idx * constInfo.s2BaseSize + kL1 * 128;
+                            // 树兄弟节点共享: 前导 histRows 行走页对齐批量 ND2NZ, 尾部树祖先行逐行 gather
+                            uint32_t histRows = 0;
+                            if (info.oriSparseHistRows > 0) {
+                                uint32_t histEnd = rowStart + kL0Size;
+                                if (info.oriSparseHistRows < histEnd) {
+                                    histEnd = info.oriSparseHistRows;
+                                }
+                                histRows = (histEnd > rowStart) ? (histEnd - rowStart) : 0U;
+                            }
+                            uint32_t tailRows = kL0Size - histRows;
                             uint64_t sparseIndexBaseOffset =
                                 (info.qTokenOffset * constInfo.kvHeadNum + info.n2Idx) * constInfo.oriSparseIndexWidth;
-                            uint32_t sparseIndexStart = info.s2Idx * constInfo.s2BaseSize + kL1 * 128;
-                            DataCopyPABySlots<KV_T>(subvTensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
-                                                    sparseIndexBaseOffset, sparseIndexStart);
+                            if (histRows > 0) {
+                                PAShape shape;
+                                shape.blockSize = constInfo.paOriBlockSize;
+                                shape.headNum = constInfo.kvHeadNum;
+                                shape.headDim = constInfo.headDim;
+                                shape.kvStride = constInfo.oriKvStride;
+                                shape.actHeadDim = nL1Size;
+                                shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
+                                shape.copyRowNum = histRows;
+                                shape.copyRowNumAlign = kL0SizeAlign;
+                                Position startPos;
+                                startPos.bIdx = info.bIdx;
+                                startPos.n2Idx = info.n2Idx;
+                                startPos.s2Idx = info.oriSparseWinStart + rowStart;
+                                startPos.dIdx = nL1 * N_SPLIT_SIZE;
+                                subvTensor = bL1Tensor[(kL1 - kOffset) * 128 * N_SPLIT_SIZE];
+                                DataCopyPA<KV_T>(subvTensor, oriKvGm, oriBlockTableGm, shape, startPos);
+                            }
+                            if (tailRows > 0) {
+                                Position startPos;
+                                startPos.bIdx = info.bIdx;
+                                startPos.n2Idx = info.n2Idx;
+                                startPos.s2Idx = 0;
+                                startPos.dIdx = nL1 * N_SPLIT_SIZE;
+                                PAShape shape;
+                                shape.blockSize = constInfo.paOriBlockSize;
+                                shape.headNum = constInfo.kvHeadNum;
+                                shape.headDim = constInfo.headDim;
+                                shape.kvStride = constInfo.oriKvStride;
+                                shape.actHeadDim = nL1Size;
+                                shape.maxblockNumPerBatch = constInfo.oriMaxBlockNumPerBatch;
+                                shape.copyRowNum = tailRows;
+                                shape.copyRowNumAlign = kL0SizeAlign;
+                                uint32_t sparseIndexStart = rowStart + histRows;
+                                subvTensor = bL1Tensor[(kL1 - kOffset) * 128 * N_SPLIT_SIZE + histRows * 16];
+                                DataCopyPABySlots<KV_T>(subvTensor, oriKvGm, oriSparseIndicesGm, shape, startPos,
+                                                        sparseIndexBaseOffset, sparseIndexStart);
+                            }
                         } else {
                             while (copyFinishRowCnt < kL0Size) {
                                 copyRowCnt = constInfo.paOriBlockSize - curS2Offset % constInfo.paOriBlockSize;

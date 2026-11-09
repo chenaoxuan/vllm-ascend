@@ -559,7 +559,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         if slots <= GDN_RECURRENT_MAX_VERIFY_TOKENS or not self.use_full_cuda_graph:
             return
-        self.spec_verify_plan_buffers = allocate_tree_verify_plan_buffers(slots, self.decode_cudagraph_max_bs, device)
+        self.spec_verify_plan_buffers = allocate_tree_verify_plan_buffers(
+            slots, self.decode_cudagraph_max_bs, device, width=slots)
 
     def _build_tree_verify_plan(
         self,

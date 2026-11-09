@@ -33,6 +33,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculat
 from vllm.model_executor.utils import replace_parameter
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
+
+from vllm_ascend.ops.gdn_tree_triton import (
+    npu_recurrent_gated_delta_rule_tree_triton as _gdn_tree_op,
+)
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -340,24 +344,26 @@ def _chunked_tree_verify(
         dtype=value.dtype,
         device=value.device,
     )
-    for chunk in plan.chunks:
-        index = chunk.token_indices
-        chunk_out = torch.ops._C_ascend.npu_recurrent_gated_delta_rule_tree(
-            query=query.index_select(1, index).squeeze(0),
-            key=key.index_select(1, index).squeeze(0),
-            value=value.index_select(1, index).squeeze(0),
-            g=g.index_select(1, index).squeeze(0),
-            beta=beta.index_select(1, index).squeeze(0),
-            state=ssm_state,
-            scale=scale,
-            actual_seq_lengths=chunk.cu_seqlens,
-            ssm_state_indices=chunk.state_indices,
-            num_accepted_tokens=num_accepted_tokens,
-            init_state_indices=chunk.init_state_indices,
-        )
-        # Padding cells are scattered past the layer's real tokens, so the
-        # undefined output of a skipped row can never reach a verified token.
-        out.index_copy_(0, chunk.out_indices, chunk_out)
+    # Triton op has no 16-token per-call limit; the verify plan is always a
+    # single whole-tree chunk: one gather / one call / one scatter.
+    chunk = plan.chunks[0]
+    index = chunk.token_indices
+    chunk_out = _gdn_tree_op(
+        query=query.index_select(1, index).squeeze(0),
+        key=key.index_select(1, index).squeeze(0),
+        value=value.index_select(1, index).squeeze(0),
+        g=g.index_select(1, index).squeeze(0),
+        beta=beta.index_select(1, index).squeeze(0),
+        state=ssm_state,
+        scale=scale,
+        actual_seq_lengths=chunk.cu_seqlens,
+        ssm_state_indices=chunk.state_indices,
+        num_accepted_tokens=num_accepted_tokens,
+        init_state_indices=chunk.init_state_indices,
+    )
+    # Padding cells are scattered past the layer's real tokens, so the
+    # undefined output of a skipped row can never reach a verified token.
+    out.index_copy_(0, chunk.out_indices, chunk_out)
     return out[:tokens]
 
 
@@ -896,7 +902,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ).unsqueeze(0)
             elif init_state_indices is not None:
                 recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
-                core_attn_out_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule_tree(
+                core_attn_out_spec = _gdn_tree_op(
                     query=query_spec.squeeze(0),
                     key=key_spec.squeeze(0),
                     value=value_spec.squeeze(0),

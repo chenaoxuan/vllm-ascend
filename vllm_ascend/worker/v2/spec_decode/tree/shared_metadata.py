@@ -97,7 +97,7 @@ class SharedGDNTreeMetadata:
         if geometry is not None:
             return geometry
         device = self.init_state_columns.device
-        width = GDN_RECURRENT_MAX_VERIFY_TOKENS
+        width = self.slots
         cells = torch.arange(width, dtype=torch.long, device=device)
         scratch = cells + scratch_base
         chunks = []
@@ -132,6 +132,7 @@ class SharedGDNTreeMetadata:
         width = GDN_RECURRENT_MAX_VERIFY_TOKENS
         if self.slots <= width:
             return None
+        width = self.slots  # single whole-tree chunk (triton has no per-call limit)
         if scratch_base < 0:
             raise ValueError(f"The output scratch base must be non-negative, got {scratch_base}.")
         flat_state = state_indices.reshape(-1)

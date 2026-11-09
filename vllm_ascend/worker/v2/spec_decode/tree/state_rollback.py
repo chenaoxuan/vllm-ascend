@@ -657,6 +657,8 @@ def compute_tree_verify_plan(
     rows, slots = state_indices.shape
     if slots <= width:
         return None
+    # Triton op has no per-call token limit -- single whole-tree chunk
+    width = slots
     if scratch_base < 0:
         raise ValueError(f"the output scratch base must be non-negative, got {scratch_base}.")
     device = state_indices.device

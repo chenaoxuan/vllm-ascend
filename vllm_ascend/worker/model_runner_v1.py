@@ -101,6 +101,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -541,6 +542,7 @@ class NPUModelRunner(GPUModelRunner):
             | AscendExtractHiddenStatesProposer
             | None
         ) = None
+        self.asd_verifier = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
         if self.speculative_config:
@@ -555,7 +557,14 @@ class NPUModelRunner(GPUModelRunner):
                 elif self.speculative_config.method == "extract_hidden_states":
                     assert isinstance(self.drafter, AscendExtractHiddenStatesProposer)
                     self.use_aux_hidden_state_outputs = True
-                self.rejection_sampler = AscendRejectionSampler(self.sampler)
+                if ascend_envs.VLLM_ASCEND_ENABLE_ASD:
+                    from vllm_ascend.sample.asd import ASDVerifier, validate_asd_config
+
+                    validate_asd_config(self.speculative_config)
+                    if self.ascend_config.enable_reduce_sample:
+                        raise ValueError("ASD requires full-vocabulary target logits; disable enable_reduce_sample")
+                    self.asd_verifier = ASDVerifier(self.max_num_reqs, self.device, self.model_config.get_vocab_size())
+                self.rejection_sampler = AscendRejectionSampler(self.sampler, self.asd_verifier)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
 
@@ -1747,6 +1756,8 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
+                if self.asd_verifier is not None:
+                    self.asd_verifier.drop_finished(scheduler_output.finished_req_ids)
                 deferred_state_corrections_fn = self._update_states(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
@@ -2330,11 +2341,18 @@ class NPUModelRunner(GPUModelRunner):
         if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
             max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
             self.rejection_sampler.prepare_sampling(max_topk)
+        asd_kwargs = {}
+        if getattr(self.rejection_sampler, "asd", None) is not None:
+            asd_kwargs["asd_context"] = (
+                self.input_batch.req_ids[: self.input_batch.num_reqs],
+                self.discard_request_indices.np[: self.num_discarded_requests],
+            )
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
             logits,
             sampling_metadata,
+            **asd_kwargs,
         )
         return sampler_output
 

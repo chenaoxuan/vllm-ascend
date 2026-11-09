@@ -22,6 +22,14 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _asd_enabled() -> bool:
+    value = os.getenv("VLLM_ASCEND_ENABLE_ASD", "0")
+    if value not in ("0", "1"):
+        raise ValueError("VLLM_ASCEND_ENABLE_ASD must be 0 or 1")
+    return value == "1"
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -66,6 +74,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # In this case, developers need to set this value to "0.9.0" to make sure
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
+    # Enable approximate acceptance for greedy single-chain speculation (0 or 1, not sensitive).
+    "VLLM_ASCEND_ENABLE_ASD": _asd_enabled,
+    # ASD request-wide regret budget, finite and nonnegative (not sensitive).
+    "VLLM_ASCEND_ASD_RISK_BUDGET": lambda: float(os.getenv("VLLM_ASCEND_ASD_RISK_BUDGET", "8")),
+    # ASD maximum regret per remaining draft position, finite and nonnegative (not sensitive).
+    "VLLM_ASCEND_ASD_MAX_REGRET_PER_VALUE": lambda: float(os.getenv("VLLM_ASCEND_ASD_MAX_REGRET_PER_VALUE", "0.25")),
+    # ASD mismatch cap per draft block, a nonnegative integer (not sensitive).
+    "VLLM_ASCEND_ASD_MAX_RELAXED_TOKENS_PER_BLOCK": lambda: int(
+        os.getenv("VLLM_ASCEND_ASD_MAX_RELAXED_TOKENS_PER_BLOCK", "2")
+    ),
     # Whether to enable MatmulAllReduce fusion kernel when tensor parallel is enabled.
     # this feature is supported in A2, and eager mode will get better performance.
     "VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_MATMUL_ALLREDUCE", "0"))),

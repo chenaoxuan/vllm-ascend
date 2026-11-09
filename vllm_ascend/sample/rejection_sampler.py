@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.distributed.parallel_state import get_tp_group
@@ -28,6 +30,9 @@ from vllm_ascend.ops.triton.reject_sample import (
 )
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.sample.sampler import apply_top_k_top_p
+
+if TYPE_CHECKING:
+    from vllm_ascend.sample.asd import ASDVerifier
 
 
 class AscendRejectionSampler(RejectionSampler):
@@ -75,11 +80,12 @@ class AscendRejectionSampler(RejectionSampler):
         else:
             self.top_k = None
 
-    def __init__(self, sampler):
+    def __init__(self, sampler, asd: "ASDVerifier | None" = None):
         super().__init__(sampler)
         # Store Ascend-specific optimizations
         self._ascend_optimizations_enabled = True
         self.top_k = None
+        self.asd = asd
 
     def forward(
         self,
@@ -89,6 +95,8 @@ class AscendRejectionSampler(RejectionSampler):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        *,
+        asd_context: tuple[Sequence[str], Iterable[int]] | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -113,6 +121,8 @@ class AscendRejectionSampler(RejectionSampler):
                 requested.
         """
         assert metadata.max_spec_len <= MAX_SPEC_LEN
+        if self.asd is not None and not sampling_metadata.all_greedy:
+            raise ValueError("ASD requires greedy sampling (temperature=0)")
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
 
@@ -148,23 +158,24 @@ class AscendRejectionSampler(RejectionSampler):
             # apply_logits_processors modifies the tensor in-place.
             target_logits = target_logits.clone()
         target_logits = self.apply_logits_processors(target_logits, sampling_metadata, metadata)
-        # [num_tokens, vocab_size]
-        # NOTE(woosuk): `target_logits` can be updated in place inside the
-        # `apply_sampling_constraints` function.
-        target_logits = apply_sampling_constraints(
-            target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
-        )
-
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
-        )
+        if self.asd is not None:
+            assert asd_context is not None
+            output_token_ids = self.asd.verify(metadata, target_logits, bonus_token_ids, *asd_context)
+        else:
+            # Sampling constraints can update the target logits in place.
+            target_logits = apply_sampling_constraints(
+                target_logits, metadata.cu_num_draft_tokens, sampling_metadata, self.top_k
+            )
+            output_token_ids = rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:

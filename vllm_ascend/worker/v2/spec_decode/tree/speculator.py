@@ -658,6 +658,16 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         self._store_hidden_states(input_batch.num_tokens, last_hidden_states, aux_hidden_states)
         self.prepare_context_anchor(input_batch.num_reqs, input_batch.query_start_loc, num_rejected)
         self._precompute_context_kv(0, input_batch.num_tokens, dummy_run)
+        # In-place-updatable draft backends (FA3) refresh their device inputs
+        # here: with supports_decode_metadata_update the core speculator
+        # skips the eager draft metadata rebuild in FULL graph mode, and the
+        # runner-owned length buffers the graph reads are already refreshed
+        # in place, so only the FA3 tiling needs an explicit per-replay
+        # recompute.
+        for groups in self.attn_groups:
+            for group in groups:
+                if group.supports_draft_decode_metadata_update:
+                    group.get_metadata_builder().update_draft_decode_metadata()
 
     def _prepare_dflash2_graph_attention(self) -> None:
         if self.tree_builder is None or getattr(self.tree_builder.scorer, "name", None) != "dflash2":

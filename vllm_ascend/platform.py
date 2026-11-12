@@ -258,6 +258,17 @@ class NPUPlatform(Platform):
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
+        # DFlash2 draft attention: device-side FA3 tiling replaces the dense
+        # backend's host-side FIA tiling (Python length lists) on the propose
+        # path, removing the per-step host block from the draft loop.
+        if (
+            not attn_selector_config.use_pcp
+            and backend_key == (False, False, False)
+            and _validate_draft_fa3_backend(attn_selector_config)
+        ):
+            # vLLM resolves this import path to the backend class.
+            return "vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"
+
         # PCP keeps its distributed backend; eligible local draft layers use CANN FlashAttn.
         if not attn_selector_config.use_pcp and _validate_flash_attn_backend(backend_key, attn_selector_config):
             # vLLM resolves this import path to the backend class.
@@ -1624,6 +1635,39 @@ def _disable_expandable_segments() -> None:
     if updated_configs != npu_alloc_configs:
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = updated_configs
         logger.info("Removed expandable_segments from PYTORCH_NPU_ALLOC_CONF: %s", updated_configs)
+
+
+def _validate_draft_fa3_backend(selector) -> bool:
+    """Select the device-tiling FA3 backend for DFlash2 draft attention."""
+    from vllm.compilation import backends
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    spec = config.speculative_config
+    if spec is None:
+        return False
+    # V2 keeps the target model_config while loading the draft; read the live
+    # loader tag rather than a runner_type convention.
+    if backends.model_tag != "dflash_head":
+        return False
+    if "DFlash2DraftModel" not in (spec.draft_model_config.architectures or []):
+        return False
+    if spec.method != "dflash":
+        return False
+    return (
+        # FA3 requires FP16/BF16 Q and unquantized KV.
+        selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_rswa
+            or selector.use_batch_invariant
+            or selector.use_per_head_quant_scales
+        )
+    )
 
 
 def _validate_flash_attn_backend(backend_key, selector) -> bool:

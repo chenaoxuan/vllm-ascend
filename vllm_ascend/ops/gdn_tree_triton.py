@@ -26,6 +26,21 @@ cu_seqlens convention (matches fork/AscendC):
     zero-width graph padding rows only at the end -- the fork's
     _pack_tree_rows_to_tokens layout relies on this.)
 
+Fused token indirection (HAS_IDX):
+    The verify plan addresses its tokens as a padded ``rows * width`` grid, so
+    the caller used to gather q/k/v/g/beta into that order with five
+    ``index_select`` calls and scatter the result back with one
+    ``index_copy_``.  With ``HAS_IDX`` the kernel does both itself from two
+    integer tables: ``tok_ptr[p]`` is the packed token the op's position ``p``
+    reads and ``out_tok_ptr[p]`` the output row it writes.  The plan already
+    carries exactly these two tables (``TreeVerifyChunk.token_indices`` /
+    ``out_indices``), so no gather, no scatter, no intermediate allocation and
+    no extra launch per layer per step.  ``p`` is the same position the kernel
+    already uses for ``ssm_ptr``/``init_ptr``, so the fused reads and writes
+    stay consistent with the state pages of the same token, and the table loads
+    sit on the same independent GM-load path, i.e. they pipeline with the
+    recurrence instead of serializing it.
+
 -1 sentinel (fork's malformed-plan protection, removed in v3.3 per user):
     The fork's plan fills padding cells and malformed-plan markers with -1.
     This kernel never reads those cells on a valid plan (the loop only walks
@@ -43,6 +58,9 @@ Optimizations over the AscendC version:
     4. int64 state-page addressing, dtype-generic state (fp32/bf16).
     5. No 16-token per-call limit (T is a pure runtime loop bound) --
        whole-tree single-call verification.
+    6. Fused token indirection (HAS_IDX): the caller's padded-grid tables drive
+       both the operand reads and the output rows, replacing five
+       ``index_select`` calls plus one ``index_copy_`` per layer per step.
 (v3.2: removed test instrumentation -- kernel atomics and Python event pairs;
        v3.3: removed -1 sentinel guards.)
 """
@@ -57,7 +75,8 @@ _CK_CACHE = {}
 
 
 def _validate_inputs(query, key, value, state, beta, g, gk,
-                     actual_seq_lengths, ssm_state_indices, init_state_indices, scale):
+                     actual_seq_lengths, ssm_state_indices, init_state_indices, scale,
+                     token_indices=None, out_indices=None):
     """Full input validation (fast path runs this once per specialization)."""
     assert scale is not None, "scale cannot be empty"
     assert beta is not None, "beta is required"
@@ -85,6 +104,12 @@ def _validate_inputs(query, key, value, state, beta, g, gk,
     assert beta.shape[0] >= T and (g is None or g.shape[0] >= T)
     assert NV % NK == 0, "GQA requires NV to be an integer multiple of NK"
     assert ssm_state_indices.numel() >= T and init_state_indices.numel() >= T
+    if token_indices is not None:
+        assert out_indices is not None, "token indirection needs the output table too"
+        assert token_indices.dtype in (torch.int32, torch.int64), "the token table must be integer"
+        assert out_indices.dtype in (torch.int32, torch.int64), "the output table must be integer"
+        assert token_indices.numel() >= T and out_indices.numel() >= T, \
+            "the indirection tables must cover every token position of the call"
 
 
 _raw_stream_fn = None
@@ -106,11 +131,12 @@ def recurrent_gated_delta_rule_tree_kernel(
     q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr,
     state_ptr, out_ptr,
     cu_ptr, ssm_ptr, init_ptr,
+    tok_ptr, out_tok_ptr,
     scale,
     NK, DK, NV, DV,
     PAGE_STRIDE, GQA,
     BLOCK_V: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr,
-    HAS_G: tl.constexpr, SYNC_RELOAD: tl.constexpr,
+    HAS_G: tl.constexpr, SYNC_RELOAD: tl.constexpr, HAS_IDX: tl.constexpr,
 ):
     pid_v = tl.program_id(0)   # v-dim tile
     head = tl.program_id(1)    # NV-dim head
@@ -148,10 +174,22 @@ def recurrent_gated_delta_rule_tree_kernel(
         for t in range(0, T):
             # Direct scalar reads (independent of the recurrence chain, pipelinable)
             tok_t = seq_start + t
-            tok_t64 = tok_t.to(tl.int64)
             ssm_t = tl.load(ssm_ptr + tok_t)
             init_t = tl.load(init_ptr + tok_t)
-            beta_t = tl.load(beta_ptr + tok_t * NV + head).to(tl.float32)
+            if HAS_IDX:
+                # ``tok_t`` is a cell of the caller's padded grid. The tables
+                # carry the packed token this cell reads (q/k/v/g/beta stay
+                # ungathered) and the output row it writes (no scatter). Cells
+                # outside a row's prefix are never reached: the loop stops at
+                # the row's ``cu_seqlens`` length.
+                src_t = tl.load(tok_ptr + tok_t)
+                dst_t = tl.load(out_tok_ptr + tok_t)
+            else:
+                src_t = tok_t
+                dst_t = tok_t
+            src_t64 = src_t.to(tl.int64)
+            dst_t64 = dst_t.to(tl.int64)
+            beta_t = tl.load(beta_ptr + src_t * NV + head).to(tl.float32)
 
             # Tree branch: parent page != previous token's write page -> reload from parent
             if (t > 0) & (init_t != ssm_prev):
@@ -164,15 +202,15 @@ def recurrent_gated_delta_rule_tree_kernel(
             ssm_prev = ssm_t
 
             # Current token's q/k/v vectors
-            qk_base = tok_t64 * (NK * DK) + khead * DK
+            qk_base = src_t64 * (NK * DK) + khead * DK
             q_t = tl.load(q_ptr + qk_base + k_offs64, mask=m_k, other=0.0).to(tl.float32) * scale
             k_t = tl.load(k_ptr + qk_base + k_offs64, mask=m_k, other=0.0).to(tl.float32)
-            v_t = tl.load(v_ptr + tok_t64 * (NV * DV) + head64 * DV + v_offs64,
+            v_t = tl.load(v_ptr + src_t64 * (NV * DV) + head64 * DV + v_offs64,
                           mask=m_v, other=0.0).to(tl.float32)
 
             # ---- GDN recurrence (all fp32) ----
             if HAS_G:
-                g_t = tl.exp(tl.load(g_ptr + tok_t * NV + head))
+                g_t = tl.exp(tl.load(g_ptr + src_t * NV + head))
                 state = state * g_t
             kS = tl.sum(state * k_t[None, :], axis=1)
             delta = (v_t - kS) * beta_t
@@ -181,7 +219,7 @@ def recurrent_gated_delta_rule_tree_kernel(
 
             # Write out
             tl.store(
-                out_ptr + tok_t64 * (NV * DV) + head64 * DV + v_offs64,
+                out_ptr + dst_t64 * (NV * DV) + head64 * DV + v_offs64,
                 o_t.to(out_ptr.dtype.element_ty), mask=m_v,
             )
             tl.store(
@@ -195,6 +233,7 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     query, key, value, state, *,
     beta=None, scale=None, actual_seq_lengths=None, ssm_state_indices=None,
     num_accepted_tokens=None, g=None, gk=None, init_state_indices=None,
+    token_indices=None, out_indices=None,
     out=None, BLOCK_V=64, BLOCK_B=64, SYNC_RELOAD=True, fast=True, strict=False,
 ):
     """Triton replacement for torch.ops._C_ascend.npu_recurrent_gated_delta_rule_tree.
@@ -203,6 +242,16 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     accumulates row starts; matches fork/AscendC convention; zero-width
     padding rows only allowed at the end).
     Updates state in-place; returns [query.rows, NV, DV] bf16.
+
+    ``token_indices``/``out_indices`` (optional, both or neither) let the kernel
+    address q/k/v/g/beta and the output through integer tables instead of
+    pre-gathered copies: position ``p`` of this call reads ``token_indices[p]``
+    of the caller's packed q/k/v/g/beta and writes output row ``out_indices[p]``,
+    while ``state``/``ssm_state_indices``/``init_state_indices`` stay in this
+    call's own token order. They let a caller run the op directly on a padded
+    token grid -- the GDN tree verify plan's ``token_indices``/``out_indices`` --
+    with no gather, no scatter and no intermediate buffer. ``out`` must then
+    span every row ``out_indices`` names.
     """
     # Layout fix-up (every call; is_contiguous is cheap)
     if not query.is_contiguous():
@@ -221,7 +270,19 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     B = actual_seq_lengths.numel() - 1
     assert B <= BLOCK_B, f"cu_seqlens rows {B} exceeds BLOCK_B={BLOCK_B}"
 
-    if out is None:
+    has_idx = token_indices is not None or out_indices is not None
+    if has_idx:
+        if token_indices is None or out_indices is None:
+            raise ValueError("token_indices and out_indices must be given together")
+        if out is None:
+            raise ValueError("token indirection writes caller-owned output rows, so out is required")
+        # The plan slices its tables off stable buffers; keep them dense for the
+        # kernel's flat indexing without copying in the common case.
+        if not token_indices.is_contiguous():
+            token_indices = token_indices.contiguous()
+        if not out_indices.is_contiguous():
+            out_indices = out_indices.contiguous()
+    elif out is None:
         out = torch.empty((T, NV, DV), dtype=torch.bfloat16, device=value.device)
 
     BLOCK_K = triton.next_power_of_2(DK)
@@ -233,11 +294,13 @@ def npu_recurrent_gated_delta_rule_tree_triton(
         beta,
         state, out,
         actual_seq_lengths, ssm_state_indices, init_state_indices,
+        token_indices if has_idx else beta,      # never dereferenced when HAS_IDX=0
+        out_indices if has_idx else beta,        # ditto
         float(scale),
         NK, DK, NV, DV,
         state.stride(0), NV // NK,
     )
-    spec_key = (BLOCK_V, BLOCK_K, BLOCK_B, has_g, SYNC_RELOAD,
+    spec_key = (BLOCK_V, BLOCK_K, BLOCK_B, has_g, SYNC_RELOAD, has_idx,
                 NK, DK, NV, DV, state.stride(0), NV // NK,
                 query.dtype, state.dtype, beta.dtype,
                 actual_seq_lengths.dtype, ssm_state_indices.dtype)
@@ -245,12 +308,13 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     if strict or not fast:
         _validate_inputs(query, key, value, state, beta, g, gk,
                          actual_seq_lengths, ssm_state_indices,
-                         init_state_indices, scale)
+                         init_state_indices, scale,
+                         token_indices, out_indices)
         if not fast:
             recurrent_gated_delta_rule_tree_kernel[grid](
                 *args,
                 BLOCK_V=BLOCK_V, BLOCK_K=BLOCK_K, BLOCK_B=BLOCK_B,
-                HAS_G=has_g, SYNC_RELOAD=SYNC_RELOAD,
+                HAS_G=has_g, SYNC_RELOAD=SYNC_RELOAD, HAS_IDX=has_idx,
             )
             return out
 
@@ -258,11 +322,12 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     if ck is None:
         _validate_inputs(query, key, value, state, beta, g, gk,
                          actual_seq_lengths, ssm_state_indices,
-                         init_state_indices, scale)
+                         init_state_indices, scale,
+                         token_indices, out_indices)
         ck = recurrent_gated_delta_rule_tree_kernel.warmup(
             *args, grid=grid,
             BLOCK_V=BLOCK_V, BLOCK_K=BLOCK_K, BLOCK_B=BLOCK_B,
-            HAS_G=has_g, SYNC_RELOAD=SYNC_RELOAD,
+            HAS_G=has_g, SYNC_RELOAD=SYNC_RELOAD, HAS_IDX=has_idx,
         )
         _CK_CACHE[spec_key] = ck
 
@@ -271,7 +336,7 @@ def npu_recurrent_gated_delta_rule_tree_triton(
     stream = _raw_stream(device)
     ck.run(grid[0], grid[1], grid[2], stream, ck.function, ck.packed_metadata,
            None, None, None,
-           *args, BLOCK_V, BLOCK_K, BLOCK_B, has_g, SYNC_RELOAD)
+           *args, BLOCK_V, BLOCK_K, BLOCK_B, has_g, SYNC_RELOAD, has_idx)
     return out
 
 

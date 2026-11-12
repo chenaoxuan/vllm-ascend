@@ -55,6 +55,10 @@ from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.ops.triton.spec_decode.tree.conv_state import scatter_tree_conv_pages_
+from vllm_ascend.ops.triton.spec_decode.tree.tree_conv import (
+    tree_causal_conv1d_triton,
+    tree_conv_triton_ready,
+)
 
 _PACKED_CONV_WEIGHT_NAME = "ascend_conv1d_weight"
 
@@ -238,7 +242,31 @@ def tree_causal_conv1d(
     ``window_rows``/``prefix_src`` come from ``state_rollback.compute_tree_conv_rows``;
     zero-length rows (full-graph padding) are skipped. The committed history is
     re-anchored on the accepted node before it is read. Returns ``[T, conv_dim]``.
+
+    The fused kernel below (:func:`tree_causal_conv1d_triton`) performs the same
+    anchor, window resolution and activation write-back in a single launch; the
+    Torch chain stays as the fallback for shapes it cannot express.
     """
+    if tree_conv_triton_ready(
+        x,
+        weight,
+        conv_state,
+        cache_indices,
+        query_start_loc,
+        window_rows,
+        prefix_src,
+    ):
+        return tree_causal_conv1d_triton(
+            x,
+            weight,
+            conv_state,
+            cache_indices,
+            query_start_loc,
+            window_rows,
+            prefix_src,
+            bias,
+            activation,
+        )
     width = weight.shape[1]
     conv_dim = weight.shape[0]
     starts = query_start_loc.to(torch.long).reshape(-1)
@@ -294,6 +322,26 @@ def tree_causal_conv1d(
     return out
 
 
+def _tree_verify_can_fuse_token_indices(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+) -> bool:
+    """Whether the recurrent op can address the step's tokens itself.
+
+    The fused path lets the kernel read q/k/v/g/beta through the plan's token
+    table instead of five gathered copies, so it indexes them at
+    ``token * heads * head_dim`` -- their dense token-major layout. A view whose
+    token dim is not dense (``_split_head_first_conv_output`` keeps the
+    convolution output head-first) has a different stride per token and needs
+    the gather. The answer is a property of the tensor layouts alone, which
+    stay fixed across a graph's capture and its replays.
+    """
+    return all(t.is_contiguous() for t in (query, key, value, g, beta))
+
+
 def _chunked_tree_verify(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -320,6 +368,12 @@ def _chunked_tree_verify(
     Each chunk is a padded ``rows * width`` token grid whose padding cells are
     skipped through ``cu_seqlens``, so every recorded call has the same shape.
 
+    The op consumes the grid through the chunk's own ``token_indices`` /
+    ``out_indices`` tables, so the grid is never materialized: no gather of
+    q/k/v/g/beta, no scatter of the result. Only a layout the kernel cannot
+    stride over (see ``_tree_verify_can_fuse_token_indices``) falls back to
+    gathering the five operands and scattering the output.
+
     Args:
         query: ``[1, tokens, nk, dk]`` in the packed token order of the step (the
             same for ``key``), ``value`` ``[1, tokens, nv, dv]``, ``g``/``beta``
@@ -339,14 +393,36 @@ def _chunked_tree_verify(
             "rebuilt on every step."
         )
     tokens = query.shape[1]
+    # The padding cells are scattered past the layer's real tokens, so the
+    # undefined output of a skipped row can never reach a verified token: the
+    # plan is built with ``scratch_base == num_actual_tokens``, so this buffer
+    # spans every row its ``out_indices`` names.
     out = torch.empty(
         (num_actual_tokens + plan.rows * plan.width, *value.shape[2:]),
         dtype=value.dtype,
         device=value.device,
     )
     # Triton op has no 16-token per-call limit; the verify plan is always a
-    # single whole-tree chunk: one gather / one call / one scatter.
+    # single whole-tree chunk: one call.
     chunk = plan.chunks[0]
+    if _tree_verify_can_fuse_token_indices(query, key, value, g, beta):
+        verify_out = _gdn_tree_op(
+            query=query.squeeze(0),
+            key=key.squeeze(0),
+            value=value.squeeze(0),
+            g=g.squeeze(0),
+            beta=beta.squeeze(0),
+            state=ssm_state,
+            scale=scale,
+            actual_seq_lengths=chunk.cu_seqlens,
+            ssm_state_indices=chunk.state_indices,
+            num_accepted_tokens=num_accepted_tokens,
+            init_state_indices=chunk.init_state_indices,
+            token_indices=chunk.token_indices,
+            out_indices=chunk.out_indices,
+            out=out,
+        )
+        return verify_out[:tokens]
     index = chunk.token_indices
     chunk_out = _gdn_tree_op(
         query=query.index_select(1, index).squeeze(0),
@@ -361,8 +437,6 @@ def _chunked_tree_verify(
         num_accepted_tokens=num_accepted_tokens,
         init_state_indices=chunk.init_state_indices,
     )
-    # Padding cells are scattered past the layer's real tokens, so the
-    # undefined output of a skipped row can never reach a verified token.
     out.index_copy_(0, chunk.out_indices, chunk_out)
     return out[:tokens]
 

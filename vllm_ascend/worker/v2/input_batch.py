@@ -104,6 +104,11 @@ class AscendInputBatch(InputBatch):
     attn_state: AscendAttentionState | None = None
     is_dummy: bool = False
     is_cpp_profile: bool = False
+    # True when the runner's side-stream num_computed_tokens snapshot kept
+    # seq_lens_np (the CPU mirror of device seq_lens) exact for this batch,
+    # i.e. _update_seq_lens_cpu consumed a fresh snapshot this step. Attention
+    # builders may then read seq_lens_cpu without a device->host sync.
+    seq_lens_host_exact: bool = False
 
     @staticmethod
     def _prepare_cpp_profile_dummy(

@@ -573,6 +573,7 @@ class AscendModelState(DefaultModelState):
             parallel_config=self.vllm_config.parallel_config,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_host_exact=getattr(input_batch, "seq_lens_host_exact", False),
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,

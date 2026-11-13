@@ -102,6 +102,7 @@ class AttentionMaskBuilder:
         # Contiguous [B, Q, KV] for FIA BSND + sparse_mode=0. Capture weak-refs
         # this buffer; do not return a temporary cat/contiguous tensor.
         self._tree_fia_bsnd: torch.Tensor | None = None
+        self._tree_mask_done: tuple | None = None
 
     def configure_tree_mask(
         self, max_num_decode: int, query_len: int, kv_len: int
@@ -196,6 +197,7 @@ class AttentionMaskBuilder:
                            num_decode: int = 0,
                            num_tokens: int = 0,
                            for_capture: bool = False,
+                           common_attn_metadata=None,
                            ):
         if not causal:
             # FIA applies any provided mask as defaultMask (sparse_mode=0),
@@ -228,7 +230,8 @@ class AttentionMaskBuilder:
                 if for_capture and not tree_shaped:
                     return self.get_splitfuse_attn_mask()
                 return self.get_tree_attention_mask(
-                    tree_visibility, seq_lens, num_decode
+                    tree_visibility, seq_lens, num_decode, for_capture=for_capture,
+                    common_attn_metadata=common_attn_metadata,
                 )
 
         if model_config.runner_type == "pooling":
@@ -238,7 +241,9 @@ class AttentionMaskBuilder:
 
     def get_tree_attention_mask(self, tree_visibility: torch.Tensor,
                                 seq_lens: torch.Tensor,
-                                num_decode):
+                                num_decode,
+                                for_capture: bool = False,
+                                common_attn_metadata=None):
         max_nodes = tree_visibility.shape[-1]
         query_len = 1 + max_nodes
         max_caps = self._resolved_tree_caps()
@@ -274,6 +279,23 @@ class AttentionMaskBuilder:
         attn_mask = self._tree_attn_mask[:num_decode, :, :query_len, :cap_kv]
         # Triton needs a contiguous bool→int8 view; sliced caps (kv_len < cap)
         # are non-contiguous and must stay on the torch path.
+        qsl = (
+            common_attn_metadata.query_start_loc
+            if common_attn_metadata is not None
+            else None
+        )
+        done = self._tree_mask_done
+        if (
+            done is not None
+            and qsl is not None
+            and done[0] is tree_visibility
+            and done[1] is qsl
+            and done[2] == num_decode
+            and done[3] == query_len
+            and done[4] == for_capture
+            and done[5] == seq_lens.data_ptr()
+        ):
+            return attn_mask
         mask_slice = attn_mask[:num_mask]
         if mask_slice.device.type == "npu" and mask_slice.is_contiguous():
             from vllm_ascend.ops.triton.spec_decode.tree.attention_mask import (
@@ -290,6 +312,11 @@ class AttentionMaskBuilder:
             if num_decode > num_mask:
                 attn_mask[num_mask:].fill_(True)
             self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
+            if qsl is not None:
+                self._tree_mask_done = (
+                    tree_visibility, qsl, num_decode, query_len, for_capture,
+                    seq_lens.data_ptr(),
+                )
             return attn_mask
         attn_mask.fill_(True)
         for i in range(num_mask):
@@ -302,4 +329,9 @@ class AttentionMaskBuilder:
             draft_start = prev_kv_len + 1
             req_mask[1:, draft_start : draft_start + max_nodes] = ~tree_visibility[i]
         self._sync_tree_fia_bsnd(num_decode, query_len, cap_kv)
+        if qsl is not None:
+            self._tree_mask_done = (
+                tree_visibility, qsl, num_decode, query_len, for_capture,
+                seq_lens.data_ptr(),
+            )
         return attn_mask

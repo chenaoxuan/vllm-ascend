@@ -34,7 +34,7 @@ through its optional ``init_state_indices`` input. Node ``t`` therefore loads
 its parent's page and writes its own, both indexed by the same slot table.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 
@@ -288,14 +288,23 @@ def _tree_conv_tap_rows(
     committed history, which keeps the window of shallow nodes identical to the
     linear-chain window.
     """
-    taps = []
-    for tap in range(width - 1):
-        # Tap ``width - 2`` is the parent, ``width - 3`` the grandparent, ...
-        ancestor = node_row_table[request_ids, chain[:, width - 2 - tap].clamp(min=0)]
-        committed = history_base[request_ids] + (depths + tap).clamp(max=width - 2)
-        taps.append(torch.where(depths >= (width - 1 - tap), ancestor, committed))
-    taps.append(own_rows)
-    return torch.stack(taps, dim=1)
+    taps = width - 1
+    tap_ids = torch.arange(taps, device=chain.device).unsqueeze(0)  # [1, K]
+    # Result column j is tap j (oldest first), which walks the (width - 1 - j)
+    # -th ancestor, i.e. chain column width - 2 - j: the walk-up table is read
+    # with its columns reversed (column 0 of the reversed table is the deepest
+    # ancestor). Clamped in range where the ancestor is missing (those entries
+    # are discarded by the depth mask below).
+    ancestor = node_row_table[
+        request_ids.unsqueeze(1).expand(-1, taps),
+        chain.flip(dims=[1]).clamp(min=0),
+    ]
+    # committed[n, j] = the committed-history row tap j lands on when the
+    # chain of n runs past the root.
+    committed = history_base[request_ids].unsqueeze(1) + (depths.unsqueeze(1) + tap_ids).clamp(max=width - 2)
+    owned = depths.unsqueeze(1) >= width - 1 - tap_ids
+    window = torch.where(owned, ancestor, committed)
+    return torch.cat((window, own_rows.unsqueeze(1)), dim=1)
 
 
 def compute_tree_conv_rows(
@@ -539,29 +548,46 @@ class TreeVerifyPlan:
         buffers live in the builder).
         """
         size = self.chunk_tokens
-        chunks = []
         for index, chunk in enumerate(self.chunks):
-            token_indices = buffers.token_indices[index][:size]
-            token_indices.copy_(chunk.token_indices)
-            state_indices = buffers.state_indices[index][:size]
-            state_indices.copy_(chunk.state_indices)
-            init_state_indices = buffers.init_state_indices[index][:size]
-            init_state_indices.copy_(chunk.init_state_indices)
-            out_indices = buffers.out_indices[index][:size]
-            out_indices.copy_(chunk.out_indices)
-            cu_seqlens = buffers.cu_seqlens[index][: self.rows + 1]
-            cu_seqlens.copy_(chunk.cu_seqlens)
-            chunks.append(
-                replace(
-                    chunk,
-                    token_indices=token_indices,
-                    state_indices=state_indices,
-                    init_state_indices=init_state_indices,
-                    out_indices=out_indices,
-                    cu_seqlens=cu_seqlens,
+            buffers.token_indices[index][:size].copy_(chunk.token_indices)
+            buffers.state_indices[index][:size].copy_(chunk.state_indices)
+            buffers.init_state_indices[index][:size].copy_(chunk.init_state_indices)
+            buffers.out_indices[index][:size].copy_(chunk.out_indices)
+            buffers.cu_seqlens[index][: self.rows + 1].copy_(chunk.cu_seqlens)
+        return TreeVerifyPlan.views_from_buffers(buffers, self.rows, self.slots, self.width, self.num_chunks)
+
+    @staticmethod
+    def views_from_buffers(
+        buffers: "TreeVerifyPlanBuffers",
+        rows: int,
+        slots: int,
+        width: int,
+        num_chunks: int,
+    ) -> "TreeVerifyPlan":
+        """Per-chunk plan views over stable buffers (no device work).
+
+        Each view slices chunk row ``index`` of a stable buffer down to the live
+        ``rows * width`` prefix (``cu_seqlens`` down to ``rows + 1``). Both
+        :meth:`copy_into` and the stacked shared-tree binding end here, so the
+        per-chunk views have one definition.
+        """
+        size = rows * width
+        return TreeVerifyPlan(
+            rows=rows,
+            slots=slots,
+            width=width,
+            chunks=tuple(
+                TreeVerifyChunk(
+                    token_indices=buffers.token_indices[index][:size],
+                    state_indices=buffers.state_indices[index][:size],
+                    init_state_indices=buffers.init_state_indices[index][:size],
+                    out_indices=buffers.out_indices[index][:size],
+                    cu_seqlens=buffers.cu_seqlens[index][: rows + 1],
+                    width=width,
                 )
-            )
-        return TreeVerifyPlan(rows=self.rows, slots=self.slots, width=self.width, chunks=tuple(chunks))
+                for index in range(num_chunks)
+            ),
+        )
 
 
 @dataclass

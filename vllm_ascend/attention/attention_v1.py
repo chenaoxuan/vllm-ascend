@@ -397,10 +397,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decode=num_decodes,
             num_tokens=common_attn_metadata.num_actual_tokens,
             for_capture=common_attn_metadata.for_cudagraph_capture,
+            common_attn_metadata=common_attn_metadata,
         )
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        _qsl_device = common_attn_metadata.query_start_loc
+        if _qsl_device.device == self.device:
+            query_start_loc = _qsl_device[: num_reqs + 1]
+        else:
+            query_start_loc = query_start_loc_cpu.pin_memory().to(
+                self.device, non_blocking=True
+            )
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         if self.tree_spec_enabled:
@@ -441,7 +447,23 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                     and common_attn_metadata.num_input_tokens > actual_seq_lengths_q[-1]
                 ):
                     actual_seq_lengths_q = actual_seq_lengths_q + [common_attn_metadata.num_input_tokens]
-        seq_lens_list = seq_lens.tolist()
+        if getattr(common_attn_metadata, "seq_lens_host_exact", False):
+            seq_lens_list = common_attn_metadata.seq_lens_cpu[:num_reqs].tolist()
+        else:
+            _qsl_for_cache = common_attn_metadata.query_start_loc
+            _seq_lens_list_cache = getattr(self.attn_mask_builder, "_seq_lens_list_cache", None)
+            if (
+                _seq_lens_list_cache is not None
+                and _seq_lens_list_cache[0] is _qsl_for_cache
+                and _seq_lens_list_cache[1] == seq_lens.data_ptr()
+                and _seq_lens_list_cache[2] == tuple(seq_lens.shape)
+            ):
+                seq_lens_list = _seq_lens_list_cache[3]
+            else:
+                seq_lens_list = seq_lens.tolist()
+                self.attn_mask_builder._seq_lens_list_cache = (
+                    _qsl_for_cache, seq_lens.data_ptr(), tuple(seq_lens.shape), seq_lens_list,
+                )
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the

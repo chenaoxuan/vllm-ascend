@@ -562,6 +562,54 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             commit_tree_snapshot_metadata(previous_path, previous_sampled, idx_mapping, path, num_sampled, tree_rows)
         super().postprocess_state(idx_mapping, resume_column, num_computed_tokens)
 
+    def _prepare_shared_gdn_tree(self, metadata: "AscendMambaHybridAttnMetadata", attn_groups) -> None:
+        """Create the shared draft-tree geometry before the layer loop.
+
+        ``get_extra_attn_kwargs`` otherwise creates it lazily on the first GDN
+        group, which lands after the leading FIA group builds of the step and
+        leaves the device idle right after the tree mask kernel. Creating it
+        here moves the step's first device ops to the front; the lazy branch
+        then finds ``metadata.shared_gdn_tree`` already populated.
+        """
+        if (
+            metadata.tree_parents is None
+            or metadata.tree_num_nodes is None
+            or metadata.tree_depths is None
+            or metadata.tree_prev_path is None
+            or metadata.tree_prev_num_sampled is None
+            or metadata.num_accepted_tokens is None
+        ):
+            return
+        # Lazy imports to keep the model-state <-> attention-builder cycle
+        # out of the module level (same reason as get_extra_attn_kwargs).
+        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
+
+        conv_width = None
+        for cache_group in attn_groups:
+            for attn_group in cache_group:
+                builder = attn_group.get_metadata_builder(0)
+                if (
+                    isinstance(builder, AscendGDNAttentionMetadataBuilder)
+                    and builder.spec_tree_slots == metadata.tree_parents.shape[1] + 1
+                    and builder.spec_conv_width is not None
+                ):
+                    conv_width = builder.spec_conv_width
+                    break
+            if conv_width is not None:
+                break
+        if conv_width is None:
+            return
+        metadata.shared_gdn_tree = SharedGDNTreeMetadata.create(
+            metadata.tree_parents,
+            metadata.tree_num_nodes,
+            metadata.tree_depths,
+            metadata.num_accepted_tokens,
+            metadata.tree_prev_path,
+            metadata.tree_prev_num_sampled,
+            conv_width,
+        )
+
     def prepare_attn(
         self,
         input_batch: AscendInputBatch,
@@ -687,6 +735,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                 and not bool(is_prefilling[0])
             ),
         )
+        if model_specific_metadata.share_tree_metadata:
+            self._prepare_shared_gdn_tree(model_specific_metadata, attn_groups)
         # The Mamba model state builds its own complete attention metadata.
         # The optional argument is accepted to match AscendModelState's API.
         self.attn_metadata = build_attn_metadata(
@@ -707,6 +757,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             parallel_config=self.vllm_config.parallel_config,
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_host_exact=getattr(input_batch, "seq_lens_host_exact", False),
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,

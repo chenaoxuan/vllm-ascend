@@ -16,6 +16,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
@@ -55,6 +56,53 @@ _GDN_CUMSUM_WORKING_SET = 2**18
 # Accepted-token counts are one-based. The zero-length query segment makes
 # graph-padding rows no-ops, while 1 keeps their count valid for GDN kernels.
 _GDN_GRAPH_DUMMY_ACCEPTED_TOKEN_COUNT = 1
+
+# Per-step shared spec-split bookkeeping; see _get_shared_spec_setup.
+_SHARED_SPEC_SETUP: tuple | None = None
+
+
+def _get_shared_spec_setup(
+    query_start_loc_cpu: torch.Tensor,
+    num_decode_draft_tokens_cpu: torch.Tensor,
+    num_reqs: int,
+) -> dict:
+    """Host-side speculative-decode split, computed once per step from CPU inputs."""
+    global _SHARED_SPEC_SETUP
+    qsl_np = query_start_loc_cpu.numpy()
+    draft_np = num_decode_draft_tokens_cpu.numpy()
+    key = (qsl_np.tobytes(), draft_np.tobytes())
+    cached = _SHARED_SPEC_SETUP
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    # Requests that carry at least one draft token take the speculative path.
+    # A batch whose active rows all carry zero drafts keeps the plain
+    # prefill/decode split (mirrors the previous ge/sum/item semantics).
+    active = draft_np[draft_np >= 0]
+    mask_np = draft_np >= 0 if active.size > 0 and active.sum() > 0 else np.zeros(num_reqs, dtype=bool)
+    num_spec_decodes = int(mask_np.sum())
+    query_lens_np = np.diff(qsl_np)
+    non_spec_lens_np = query_lens_np[~mask_np]
+    num_decodes = int((non_spec_lens_np == 1).sum())
+    num_zero_len = int((non_spec_lens_np == 0).sum())
+    num_prefills = int(non_spec_lens_np.size) - num_decodes - num_zero_len
+    num_decode_tokens = num_decodes
+    num_prefill_tokens = int(non_spec_lens_np.sum()) - num_decode_tokens
+    num_spec_decode_tokens = int(query_lens_np.sum()) - num_prefill_tokens - num_decode_tokens
+    setup = {
+        "mask_np": mask_np,
+        "num_spec_decodes": num_spec_decodes,
+        "num_decodes": num_decodes,
+        "num_zero_len": num_zero_len,
+        "num_prefills": num_prefills,
+        "num_decode_tokens": num_decode_tokens,
+        "num_prefill_tokens": num_prefill_tokens,
+        "num_spec_decode_tokens": num_spec_decode_tokens,
+        "total_tokens": int(qsl_np[-1]),
+        "spec_indices_np": np.nonzero(mask_np)[0].astype(np.int64) if num_spec_decodes else None,
+        "non_spec_indices_np": np.nonzero(~mask_np)[0].astype(np.int64) if num_spec_decodes else None,
+    }
+    _SHARED_SPEC_SETUP = (key, setup)
+    return setup
 
 
 def _stable_argsort_for_npu(tensor: torch.Tensor) -> torch.Tensor:
@@ -271,7 +319,11 @@ def _materialize_graph_request_tensor(
         values[:actual_request_count],
         non_blocking=True,
     )
-    materialized[actual_request_count:].fill_(padding_value)
+    tail = materialized[actual_request_count:]
+    # Steady-state graph replay keeps actual == graph row count, so the tail is
+    # empty and the fill would be a pure no-op dispatch.
+    if tail.numel() > 0:
+        tail.fill_(padding_value)
     return materialized
 
 
@@ -592,18 +644,53 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if init_state_indices is None or self.spec_tree_slots is None:
             return None
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            GDN_RECURRENT_MAX_VERIFY_TOKENS,
             compute_tree_verify_plan,
         )
 
-        if shared_gdn_tree is None:
-            plan = compute_tree_verify_plan(
-                row_widths,
-                state_indices,
-                init_state_indices,
-                scratch_base,
-            )
-        else:
-            plan = shared_gdn_tree.bind_verify_plan(state_indices, init_state_indices, scratch_base)
+        if shared_gdn_tree is not None:
+            # Trees fitting one recurrent-op call need no plan.
+            if shared_gdn_tree.slots <= GDN_RECURRENT_MAX_VERIFY_TOKENS:
+                return None
+            if self.use_full_cuda_graph:
+                if self.spec_verify_plan_buffers is None:
+                    raise RuntimeError(
+                        "a full CUDA graph replays the recorded verify chunks by address, "
+                        "so a draft tree wider than one recurrent-op call needs the stable "
+                        "chunk buffers of _allocate_tree_verify_plan_buffers."
+                    )
+                # Views are pure Python over stable buffers: build once, reuse every step.
+                plan_views = getattr(self, "_spec_verify_plan_views", None)
+                if plan_views is None:
+                    from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+                        TreeVerifyPlan,
+                        tree_verify_chunk_count,
+                    )
+                    # The Triton tree op has no per-call token limit: the verify
+                    # plan is a SINGLE whole-tree chunk (width == slots), so the
+                    # views slice exactly one chunk row of the stable buffers.
+                    plan_views = TreeVerifyPlan.views_from_buffers(
+                        self.spec_verify_plan_buffers,
+                        1,
+                        shared_gdn_tree.slots,
+                        shared_gdn_tree.slots,
+                        tree_verify_chunk_count(shared_gdn_tree.slots, shared_gdn_tree.slots),
+                    )
+                    self._spec_verify_plan_views = plan_views
+                return shared_gdn_tree.bind_and_copy_into(
+                    state_indices,
+                    init_state_indices,
+                    scratch_base,
+                    self.spec_verify_plan_buffers,
+                    plan_views,
+                )
+            return shared_gdn_tree.bind_plan(state_indices, init_state_indices, scratch_base)
+        plan = compute_tree_verify_plan(
+            row_widths,
+            state_indices,
+            init_state_indices,
+            scratch_base,
+        )
         if plan is None:
             return None
         if self.use_full_cuda_graph:
@@ -770,21 +857,30 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self,
         spec_sequence_masks_cpu: torch.Tensor,
         num_spec_decodes: int,
+        spec_indices_np: np.ndarray | None = None,
+        non_spec_indices_np: np.ndarray | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_reqs = spec_sequence_masks_cpu.numel()
         num_non_spec_decodes = num_reqs - num_spec_decodes
 
         spec_indices_cpu = self.spec_sequence_indices_cpu[:num_spec_decodes]
-        spec_indices_cpu.copy_(
-            torch.nonzero(spec_sequence_masks_cpu, as_tuple=True)[0],
-        )
+        if spec_indices_np is not None:
+            # Shared per-step numpy result (see _get_shared_spec_setup).
+            spec_indices_cpu.numpy()[:] = spec_indices_np
+        else:
+            spec_indices_cpu.copy_(
+                torch.nonzero(spec_sequence_masks_cpu, as_tuple=True)[0],
+            )
         spec_indices = self.spec_sequence_indices[:num_spec_decodes]
         spec_indices.copy_(spec_indices_cpu, non_blocking=True)
 
         non_spec_indices_cpu = self.non_spec_sequence_indices_cpu[:num_non_spec_decodes]
-        non_spec_indices_cpu.copy_(
-            torch.nonzero(~spec_sequence_masks_cpu, as_tuple=True)[0],
-        )
+        if non_spec_indices_np is not None:
+            non_spec_indices_cpu.numpy()[:] = non_spec_indices_np
+        else:
+            non_spec_indices_cpu.copy_(
+                torch.nonzero(~spec_sequence_masks_cpu, as_tuple=True)[0],
+            )
         non_spec_indices = self.non_spec_sequence_indices[:num_non_spec_decodes]
         non_spec_indices.copy_(non_spec_indices_cpu, non_blocking=True)
 
@@ -988,14 +1084,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         non_spec_token_count = attn_metadata.non_spec_token_indx.size(0)
         spec_token_count = attn_metadata.spec_token_indx.size(0)
-        self.non_spec_token_indx[:non_spec_token_count].copy_(
-            attn_metadata.non_spec_token_indx,
-            non_blocking=True,
-        )
-        self.spec_token_indx[:spec_token_count].copy_(
-            attn_metadata.spec_token_indx,
-            non_blocking=True,
-        )
+        # A pure-spec graph batch has no non-spec tokens: skip the 0-element
+        # copy dispatches.
+        if non_spec_token_count > 0:
+            self.non_spec_token_indx[:non_spec_token_count].copy_(
+                attn_metadata.non_spec_token_indx,
+                non_blocking=True,
+            )
+        if spec_token_count > 0:
+            self.spec_token_indx[:spec_token_count].copy_(
+                attn_metadata.spec_token_indx,
+                non_blocking=True,
+            )
         attn_metadata.non_spec_token_indx = self.non_spec_token_indx[:non_spec_token_count]
         attn_metadata.spec_token_indx = self.spec_token_indx[:spec_token_count]
 
@@ -1110,21 +1210,25 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
+            spec_setup = None
         else:
             num_reqs = num_decode_draft_tokens_cpu.numel()
+            # One shared numpy pass per step instead of an aten dispatch
+            # chain (ge/sum/item/nonzero) per cache group.
+            spec_setup = _get_shared_spec_setup(
+                query_start_loc_cpu,
+                num_decode_draft_tokens_cpu,
+                num_reqs,
+            )
             spec_sequence_masks_cpu = self.spec_sequence_masks_cpu[:num_reqs]
-            runtime_draft_tokens = num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
-            if runtime_draft_tokens.sum().item() > 0:
-                torch.ge(
-                    num_decode_draft_tokens_cpu,
-                    0,
-                    out=spec_sequence_masks_cpu,
-                )
+            mask_np = spec_setup["mask_np"]
+            if bool(mask_np.any()):
+                spec_sequence_masks_cpu.numpy()[:] = mask_np
             else:
                 # Dynamic speculative decoding can be enabled while this batch
                 # carries no draft tokens. Keep the normal prefill/decode split.
-                spec_sequence_masks_cpu.zero_()
-            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+                spec_sequence_masks_cpu.numpy()[:].fill(False)
+            num_spec_decodes = spec_setup["num_spec_decodes"]
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
@@ -1134,6 +1238,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
                     spec_sequence_masks_cpu,
                     num_spec_decodes,
+                    spec_setup["spec_indices_np"],
+                    spec_setup["non_spec_indices_np"],
                 )
 
         spec_init_state_indices: torch.Tensor | None = None
@@ -1156,19 +1262,22 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
         else:
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            # CPU phase counts come from the per-step shared numpy setup; only
+            # the device query lengths below are still per-group work, and the
+            # pure-spec branch does not need them at all.
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             assert spec_sequence_masks_cpu is not None
             assert spec_sequence_indices is not None
             assert non_spec_sequence_indices is not None
+            assert spec_setup is not None
 
-            non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-            num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
-            num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
-            num_decode_tokens = num_decodes
-            num_prefill_tokens = non_spec_query_lens_cpu.sum().item() - num_decode_tokens
-            num_spec_decode_tokens = query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+            num_decodes = spec_setup["num_decodes"]
+            num_zero_len = spec_setup["num_zero_len"]
+            num_prefills = spec_setup["num_prefills"]
+            num_decode_tokens = spec_setup["num_decode_tokens"]
+            num_prefill_tokens = spec_setup["num_prefill_tokens"]
+            num_spec_decode_tokens = spec_setup["num_spec_decode_tokens"]
+            total_tokens = spec_setup["total_tokens"]
 
             if num_decodes > 0 and num_spec_decodes > 0:
                 num_prefills += num_decodes
@@ -1179,13 +1288,22 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = min(
                     num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc_cpu[-1].item(),
+                    total_tokens,
                 )
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
+                # Per-step shared device source. spec_setup's fingerprint key
+                # hits only on byte-identical inputs (see
+                # _get_shared_spec_setup), so the cached arange stays valid on
+                # a hit (it depends only on the key-derived row count and the
+                # fixed spec width): the first cache group materializes it,
+                # the others reuse it. The accepted-token rows are NOT shared:
+                # they vary per step while the key does not in steady state.
+                if "spec_token_arange" not in spec_setup:
+                    spec_setup["spec_token_arange"] = torch.arange(
+                        num_spec_decodes * (self.num_spec + 1),
+                        dtype=torch.int32,
+                        device=query_start_loc.device,
+                    )
+                spec_token_indx = spec_setup["spec_token_arange"][:spec_token_size]
                 non_spec_token_indx = torch.empty(
                     0,
                     dtype=torch.int32,
@@ -1200,10 +1318,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
+                query_lens = query_start_loc[1:] - query_start_loc[:-1]
                 spec_token_masks = torch.repeat_interleave(
                     spec_sequence_masks,
                     query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
+                    output_size=total_tokens,
                 )
                 index = _stable_argsort_for_npu(spec_token_masks)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
@@ -1262,11 +1381,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = torch.index_select(
-                num_accepted_tokens,
-                0,
-                spec_sequence_indices,
-            )
+            if num_prefills == 0 and num_decodes == 0 and spec_setup["num_zero_len"] == 0:
+                # Every row is a speculative row, so the spec selection is the
+                # identity: the leading rows already are the spec rows. A view
+                # keeps the current step's values (the accepted counts change
+                # every step) without a dispatch.
+                num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+            else:
+                num_accepted_tokens = torch.index_select(
+                    num_accepted_tokens,
+                    0,
+                    spec_sequence_indices,
+                )
             # Tokens each speculative request verifies; a row may be shorter
             # than the tree width, see _build_tree_init_state_indices.
             spec_row_widths = query_lens_cpu[spec_sequence_masks_cpu]

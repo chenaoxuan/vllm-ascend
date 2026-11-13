@@ -137,7 +137,6 @@ from vllm_ascend.worker.v2.utils import (
     torch_cuda_wrapper,
 )
 
-
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
@@ -367,6 +366,63 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator.tree_kv_compact = self.tree_kv_compact
             self.tree_commit = TreeCommitCoordinator(self)
             self.speculator.tree_commit = self.tree_commit
+
+        if dflash_tree_spec_enabled(self.vllm_config):
+            self._warmup_fused_spec_prep()
+
+    def _warmup_fused_spec_prep(self) -> None:
+        """One-shot startup launch of the fused spec prep kernel.
+
+        Triton compiles lazily on first launch; if the fused kernel's first
+        launch happened inside the benchmarked window, its (second-scale) JIT
+        compilation leaks into TPOT. Launching it here with scratch tensors
+        forces compilation during model load, before capture and before any
+        request. Scratch tensors only — the real input buffers are untouched.
+        """
+        try:
+            from vllm.triton_utils import triton
+
+            from vllm_ascend.ops.triton.v2.spec_decode.fused_spec_prep import (
+                launch_fused_tree_spec_prep,
+            )
+        except ImportError:
+            logger.warning_once(
+                "C1 fused spec prep kernel module missing "
+                "(vllm_ascend/ops/triton/v2/spec_decode/fused_spec_prep.py); "
+                "falling back to the original per-kernel prep launches.",
+            )
+            return
+        device = self.device
+        qlen = self.decode_query_len
+        idx_mapping = torch.tensor([0], dtype=torch.int64, device=device)
+        cu_num_logits = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        num_computed = torch.zeros(1, dtype=torch.int32, device=device)
+        prefill_len = torch.zeros(1, dtype=torch.int32, device=device)
+        last_sampled = torch.zeros(1, dtype=torch.int32, device=device)
+        draft_tokens = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        tree_depths = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        positions = torch.zeros(qlen, dtype=torch.int64, device=device)
+        slot_positions = torch.zeros(qlen, dtype=torch.int64, device=device)
+        seq_lens = torch.zeros(1, dtype=torch.int32, device=device)
+        input_ids = torch.zeros(qlen, dtype=torch.int32, device=device)
+        launch_fused_tree_spec_prep(
+            idx_mapping,
+            cu_num_logits,
+            query_start_loc,
+            num_computed,
+            prefill_len,
+            last_sampled,
+            draft_tokens,
+            tree_depths,
+            positions,
+            slot_positions,
+            seq_lens,
+            input_ids,
+            total_num_logits=1,
+            num_new_sampled_tokens=1,
+            block_t=triton.next_power_of_2(qlen),
+        )
 
     def _restore_replicated_draft_target_states(self) -> None:
         """Restore target states consumed by a replicated PCP draft."""
@@ -1046,11 +1102,6 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc = self.input_buffers.query_start_loc
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
-        if draft_tokens:
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
-            )
-
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
         self.eplb.set_batch_phase(batch_req_state.has_prefill)
@@ -1083,30 +1134,84 @@ class NPUModelRunner(GPUModelRunner):
             and self.ascend_config.tree_spec_config.topk is not None
             and self.ascend_config.tree_spec_config.topk > 1
         )
-        if use_tree_pos:
-            is_prefilling = async_copy_to_gpu(
-                torch.from_numpy(batch_req_state.is_prefilling_np),
-                device=self.device,
-            )
-            prepare_tree_spec_pos_seq_lens(
+        # one fused triton launch replacing expand_idx_mapping +
+        # prepare_tree_spec_pos_seq_lens + combine_sampled_and_draft_tokens
+        # (plus the is_prefilling H2D) for decode-only tree-spec steps,
+        # removing three eager launches (and their per-op bubbles). Gated to
+        # decode-only steps: prefill rows need the standalone kernel, and no
+        # draft tokens means nothing for the fused kernel to combine.
+        use_fused_spec_prep = (
+            use_tree_pos
+            and bool(draft_tokens)
+            and not batch_req_state.has_prefill
+        )
+        if use_fused_spec_prep:
+            try:
+                from vllm.triton_utils import triton
+
+                from vllm_ascend.ops.triton.v2.spec_decode.fused_spec_prep import (
+                    launch_fused_tree_spec_prep,
+                )
+            except ImportError:
+                # Deployment without the new file: degrade gracefully to the
+                # original kernels (C1-①②③ still apply).
+                use_fused_spec_prep = False
+                logger.warning_once(
+                    "C1 fused spec prep kernel module missing "
+                    "(vllm_ascend/ops/triton/v2/spec_decode/fused_spec_prep.py); "
+                    "falling back to the original per-kernel prep launches.",
+                )
+        if use_fused_spec_prep:
+            (
+                expanded_idx_mapping,
+                expanded_local_pos,
+                logits_indices,
+            ) = launch_fused_tree_spec_prep(
                 idx_mapping,
+                cu_num_logits,
                 query_start_loc,
-                is_prefilling,
                 self.req_states.num_computed_tokens.gpu,
+                self.req_states.prefill_len.gpu,
+                self.req_states.last_sampled_tokens,
+                self.req_states.draft_tokens,
                 tree_depths,
                 self.input_buffers.positions,
                 self.input_buffers.slot_positions,
                 self.input_buffers.seq_lens,
+                self.input_buffers.input_ids,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+                block_t=triton.next_power_of_2(self.decode_query_len),
             )
         else:
-            # Prepare positions and seq_lens.
-            prepare_pos_seq_lens(
-                idx_mapping,
-                query_start_loc,
-                self.req_states.num_computed_tokens.gpu,
-                self.input_buffers.positions,
-                self.input_buffers.seq_lens,
-            )
+            if draft_tokens:
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+                )
+            if use_tree_pos:
+                is_prefilling = async_copy_to_gpu(
+                    torch.from_numpy(batch_req_state.is_prefilling_np),
+                    device=self.device,
+                )
+                prepare_tree_spec_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    is_prefilling,
+                    self.req_states.num_computed_tokens.gpu,
+                    tree_depths,
+                    self.input_buffers.positions,
+                    self.input_buffers.slot_positions,
+                    self.input_buffers.seq_lens,
+                )
+            else:
+                # Prepare positions and seq_lens.
+                prepare_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.input_buffers.positions,
+                    self.input_buffers.seq_lens,
+                )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
@@ -1120,18 +1225,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        if not use_fused_spec_prep:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.
@@ -1187,6 +1293,10 @@ class NPUModelRunner(GPUModelRunner):
             prompt_lens=prompt_lens,
             # extra attributes for ascend npus.
             seq_lens_np=self.input_buffers.seq_lens_np,
+            seq_lens_host_exact=(
+                (self.speculator is not None or self.sync_spec_pp_cpu_counts)
+                and not self._can_skip_spec_cpu_length_sync()
+            ),
             attn_state=attn_state,
         )
 

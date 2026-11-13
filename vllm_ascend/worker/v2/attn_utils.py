@@ -473,6 +473,7 @@ def build_attn_metadata(
     common_metadata_callback=None,
     tree_visibility: torch.Tensor | None = None,
     slot_positions: torch.Tensor | None = None,
+    seq_lens_host_exact: bool = False,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -607,6 +608,7 @@ def build_attn_metadata(
             tree_visibility=tree_visibility,
             slot_positions=slot_positions,
             for_cudagraph_capture=for_cudagraph_capture,
+            seq_lens_host_exact=seq_lens_host_exact,
             **common_attn_metadata_extra_kwargs,
         )
         if common_metadata_callback is not None:

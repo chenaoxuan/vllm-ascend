@@ -46,6 +46,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
 
 
 class ProfilingChunkScheduler(Scheduler):
@@ -1150,6 +1153,9 @@ class ProfilingChunkScheduler(Scheduler):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+
+_patch_tree_verify_width(ProfilingChunkScheduler)
 
 
 class ProfilingChunkAsyncScheduler(AsyncScheduler, ProfilingChunkScheduler):

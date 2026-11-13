@@ -30,6 +30,9 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import DyntraLBConfig
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerBase
@@ -1212,3 +1215,6 @@ class AsyncDyntraLBScheduler(DyntraLBScheduler, AsyncScheduler):
     """DyntraLB scheduler with vLLM's asynchronous scheduling semantics."""
 
     pass
+
+
+_patch_tree_verify_width(DyntraLBScheduler)

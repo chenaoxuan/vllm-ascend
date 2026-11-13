@@ -29,6 +29,30 @@ from vllm_ascend.worker.v2.aclgraph_utils import collect_sorted_captured_token_s
 from vllm_ascend.worker.v2.utils import communicator_switch
 
 
+def merge_draft_aclgraph_capture_sizes(
+    capture_sizes: list[int] | None,
+    decode_query_len: int,
+    max_num_reqs: int,
+    max_cudagraph_capture_size: int | None,
+) -> list[int]:
+    """Add ``k * decode_query_len`` gears the shared capture list may omit.
+
+    Target verify uses ``1+budget`` (e.g. 49) while DFlash/Domino draft uses
+    ``num_query_per_req`` (16 with shift_label, else ``1+spec``). Upstream
+    rounds each shared size up to ``decode_query_len`` and drops anything
+    that needs more than ``max_num_seqs`` requests, so ``[17, 49]`` with
+    query length 16 and ``max_num_seqs=1`` captures no draft graph.
+    """
+    extra: list[int] = []
+    if decode_query_len > 0 and max_cudagraph_capture_size is not None:
+        extra = [
+            decode_query_len * k
+            for k in range(1, max_num_reqs + 1)
+            if decode_query_len * k <= max_cudagraph_capture_size
+        ]
+    return sorted(set(list(capture_sizes or []) + extra))
+
+
 class DFlashAclGraphManager(DFlashCudaGraphManager):
     def __init__(
         self,
@@ -59,6 +83,23 @@ class DFlashAclGraphManager(DFlashCudaGraphManager):
         # both capture and replay to keep them consistent).
         if super().needs_capture():
             set_draft_graph_params(self.capture_sizes)
+
+    def _init_candidates(self) -> None:
+        from vllm_ascend.attention.tree_spec import tree_spec_enabled
+
+        if not tree_spec_enabled(self.vllm_config):
+            return super()._init_candidates()
+        orig = self.compilation_config.cudagraph_capture_sizes
+        self.compilation_config.cudagraph_capture_sizes = merge_draft_aclgraph_capture_sizes(
+            orig,
+            self.decode_query_len,
+            self.max_num_reqs,
+            self.compilation_config.max_cudagraph_capture_size,
+        )
+        try:
+            super()._init_candidates()
+        finally:
+            self.compilation_config.cudagraph_capture_sizes = orig
 
     def capture(
         self,

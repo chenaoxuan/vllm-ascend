@@ -124,12 +124,15 @@ from vllm_ascend.worker.v2.attn_utils import (
     skip_ring_state_update,
 )
 from vllm_ascend.worker.v2.eplb import AscendEPLBController
-from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers, prepare_tree_spec_pos_seq_lens
 from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
 from vllm_ascend.worker.v2.kvpp import KVPPRuntime
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
-from vllm_ascend.worker.v2.spec_decode import init_speculator
+from vllm_ascend.worker.v2.spec_decode import dflash_tree_spec_enabled, init_speculator, tree_target_query_len
+from vllm_ascend.worker.v2.spec_decode.tree.draft_tokens import TreeDraftTokensHandler
+from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+from vllm_ascend.worker.v2.spec_decode.tree.speculator import AscendTreeSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import (
     AscendV2KVBlockZeroer,
@@ -224,6 +227,8 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.update_stream = None
+        self.tree_kv_compact = None
+        self.tree_commit = None
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             self.update_stream = torch.npu.Stream()
 
@@ -238,6 +243,9 @@ class NPUModelRunner(GPUModelRunner):
 
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
+        # Non-last PP ranks also prepare tree metadata, although only the last
+        # rank owns a drafter and sampler.
+        self.tree_shape = TreeShape.from_config(self.vllm_config)
         self.req_states: AscendRequestState = AscendRequestState(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
@@ -245,6 +253,7 @@ class NPUModelRunner(GPUModelRunner):
             num_speculative_steps=self.num_speculative_steps,
             vocab_size=self.vocab_size,
             device=self.device,
+            tree_shape=self.tree_shape,
             use_dense_all_token_ids=(
                 self.speculative_config is not None and self.speculative_config.method in ("ngram", "ngram_gpu")
             ),
@@ -258,6 +267,12 @@ class NPUModelRunner(GPUModelRunner):
             self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
             # Share the update stream between the target and draft graph managers.
             self.speculator.update_stream = self.update_stream
+        if isinstance(self.speculator, AscendTreeSpeculator):
+            # Publish tree rows for both scheduler modes. Async scheduling keeps
+            # the K-wide draft-generation contract, while its scheduler adapter
+            # consumes the handler's S-wide placeholder publication.
+            with torch_cuda_wrapper():
+                self.draft_tokens_handler = TreeDraftTokensHandler(self.device, self.req_states, self.speculator)
         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
         # so reinitialize input_buffers here.
         self.input_buffers: AscendInputBuffers = AscendInputBuffers(
@@ -277,9 +292,12 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=True,
         )
 
-        # NOTE: In GPUModelRunner, decode_query_len is initialized in load_model(),
-        # +1 is hardcoded here but not in vllm.
-        self.decode_query_len = self.num_speculative_steps + 1
+        # Target verification reserves the root plus the tree budget.
+        if dflash_tree_spec_enabled(vllm_config):
+            qlen = tree_target_query_len(vllm_config)
+            self.decode_query_len = qlen if qlen is not None else self.num_speculative_steps + 1
+        else:
+            self.decode_query_len = self.num_speculative_steps + 1
         # Set _mc2_tokens_capacity and _reserved_mc2_mask for MoE communication optimization.
         # TODO: remove set_cos_and_sin (together with update_cos_sin) when mla can properly handle cos/sin internally
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.decode_query_len, self.dtype, self.device)
@@ -337,6 +355,76 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        if dflash_tree_spec_enabled(self.vllm_config) and isinstance(self.speculator, AscendTreeSpeculator):
+            from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
+            from vllm_ascend.worker.v2.spec_decode.tree.commit import TreeCommitCoordinator
+            from vllm_ascend.worker.v2.spec_decode.tree.kv_project import TreeKvCompact
+
+            if isinstance(self.model_state, AscendMambaHybridModelState):
+                # Model loading resets the target width to K+1. GDN's uniform
+                # FULL capture must use root+budget before graph gears are built.
+                self.decode_query_len = self.speculator.tree_shape.target_query_len
+            self.tree_kv_compact = TreeKvCompact(self)
+            self.speculator.tree_kv_compact = self.tree_kv_compact
+            self.tree_commit = TreeCommitCoordinator(self)
+            self.speculator.tree_commit = self.tree_commit
+
+        if dflash_tree_spec_enabled(self.vllm_config):
+            self._warmup_fused_spec_prep()
+
+    def _warmup_fused_spec_prep(self) -> None:
+        """One-shot startup launch of the fused spec prep kernel.
+
+        Triton compiles lazily on first launch; if the fused kernel's first
+        launch happened inside the benchmarked window, its (second-scale) JIT
+        compilation leaks into TPOT. Launching it here with scratch tensors
+        forces compilation during model load, before capture and before any
+        request. Scratch tensors only — the real input buffers are untouched.
+        """
+        try:
+            from vllm.triton_utils import triton
+
+            from vllm_ascend.ops.triton.spec_decode.fused_spec_prep import (
+                launch_fused_tree_spec_prep,
+            )
+        except ImportError:
+            logger.warning_once(
+                "C1 fused spec prep kernel module missing "
+                "(vllm_ascend/ops/triton/spec_decode/fused_spec_prep.py); "
+                "falling back to the original per-kernel prep launches.",
+            )
+            return
+        device = self.device
+        qlen = self.decode_query_len
+        idx_mapping = torch.tensor([0], dtype=torch.int64, device=device)
+        cu_num_logits = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+        num_computed = torch.zeros(1, dtype=torch.int32, device=device)
+        prefill_len = torch.zeros(1, dtype=torch.int32, device=device)
+        last_sampled = torch.zeros(1, dtype=torch.int32, device=device)
+        draft_tokens = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        tree_depths = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        positions = torch.zeros(qlen, dtype=torch.int64, device=device)
+        slot_positions = torch.zeros(qlen, dtype=torch.int64, device=device)
+        seq_lens = torch.zeros(1, dtype=torch.int32, device=device)
+        input_ids = torch.zeros(qlen, dtype=torch.int32, device=device)
+        launch_fused_tree_spec_prep(
+            idx_mapping,
+            cu_num_logits,
+            query_start_loc,
+            num_computed,
+            prefill_len,
+            last_sampled,
+            draft_tokens,
+            tree_depths,
+            positions,
+            slot_positions,
+            seq_lens,
+            input_ids,
+            total_num_logits=1,
+            num_new_sampled_tokens=1,
+            block_t=triton.next_power_of_2(qlen),
+        )
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
@@ -360,6 +448,16 @@ class NPUModelRunner(GPUModelRunner):
         self._lmhead_pad_size = self._get_lmhead_pad_size(state) if state is not None and lmhead_tp_enable() else None
         output = super().sample_tokens(grammar_output)
         self._lmhead_pad_size = None
+        if self.is_last_pp_rank and isinstance(self.speculator, AscendTreeSpeculator):
+            tree = self.speculator.tree
+            input_batch = self.speculator.input_batch
+            idx = input_batch.idx_mapping
+            self.req_states.tree_depths[idx] = tree.depths
+            self.req_states.tree_parents[idx] = tree.parents
+            self.req_states.tree_visibility[idx] = tree.visibility
+            self.req_states.tree_num_nodes[idx] = tree.num_nodes
+            self.req_states.tree_first_child[idx] = tree.first_child
+            self.req_states.tree_next_sibling[idx] = tree.next_sibling
         # Close the per-step msprobe dump cycle on the normal last-PP-rank
         # path (v1 parity: v1 finalizes at the end of sample_tokens).
         self._finalize_dump_data()
@@ -983,11 +1081,6 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc = self.input_buffers.query_start_loc
             async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
-        if draft_tokens:
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
-                idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
-            )
-
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = query_start_loc[: num_reqs_padded + 1]
         self.eplb.set_batch_phase(batch_req_state.has_prefill)
@@ -1007,14 +1100,89 @@ class NPUModelRunner(GPUModelRunner):
                 self.req_states.num_computed_tokens.gpu,
             )
 
-        # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
-            idx_mapping,
-            query_start_loc,
-            self.req_states.num_computed_tokens.gpu,
-            self.input_buffers.positions,
-            self.input_buffers.seq_lens,
+        tree_depths = self.req_states.tree_depths if dflash_tree_spec_enabled(self.vllm_config) else None
+        # topk>1 packed tree: RoPE from depth, KV from unique slot_positions.
+        # Tree nodes use logical depth positions; linear positions make siblings
+        # look like a chain and tanks acceptance. topk=1 stays linear.
+        use_tree_pos = (
+            tree_depths is not None
+            and self.ascend_config.tree_spec_config.topk is not None
+            and self.ascend_config.tree_spec_config.topk > 1
         )
+        # one fused triton launch replacing expand_idx_mapping +
+        # prepare_tree_spec_pos_seq_lens + combine_sampled_and_draft_tokens
+        # (plus the is_prefilling H2D) for decode-only tree-spec steps,
+        # removing three eager launches (and their per-op bubbles). Gated to
+        # decode-only steps: prefill rows need the standalone kernel, and no
+        # draft tokens means nothing for the fused kernel to combine.
+        use_fused_spec_prep = use_tree_pos and bool(draft_tokens) and not batch_req_state.has_prefill
+        if use_fused_spec_prep:
+            try:
+                from vllm.triton_utils import triton
+
+                from vllm_ascend.ops.triton.spec_decode.fused_spec_prep import (
+                    launch_fused_tree_spec_prep,
+                )
+            except ImportError:
+                # Deployment without the new file: degrade gracefully to the
+                # original kernels (C1-①②③ still apply).
+                use_fused_spec_prep = False
+                logger.warning_once(
+                    "C1 fused spec prep kernel module missing "
+                    "(vllm_ascend/ops/triton/spec_decode/fused_spec_prep.py); "
+                    "falling back to the original per-kernel prep launches.",
+                )
+        if use_fused_spec_prep:
+            (
+                expanded_idx_mapping,
+                expanded_local_pos,
+                logits_indices,
+            ) = launch_fused_tree_spec_prep(
+                idx_mapping,
+                cu_num_logits,
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.prefill_len.gpu,
+                self.req_states.last_sampled_tokens,
+                self.req_states.draft_tokens,
+                tree_depths,
+                self.input_buffers.positions,
+                self.input_buffers.slot_positions,
+                self.input_buffers.seq_lens,
+                self.input_buffers.input_ids,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+                block_t=triton.next_power_of_2(self.decode_query_len),
+            )
+        else:
+            if draft_tokens:
+                expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                    idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+                )
+            if use_tree_pos:
+                is_prefilling = async_copy_to_gpu(
+                    torch.from_numpy(batch_req_state.is_prefilling_np),
+                    device=self.device,
+                )
+                prepare_tree_spec_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    is_prefilling,
+                    self.req_states.num_computed_tokens.gpu,
+                    tree_depths,
+                    self.input_buffers.positions,
+                    self.input_buffers.slot_positions,
+                    self.input_buffers.seq_lens,
+                )
+            else:
+                # Prepare positions and seq_lens.
+                prepare_pos_seq_lens(
+                    idx_mapping,
+                    query_start_loc,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.input_buffers.positions,
+                    self.input_buffers.seq_lens,
+                )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
         if adaptive_verification_active and self.use_fia:
             self.input_buffers.seq_lens_np[:num_reqs] = seq_lens[:num_reqs].cpu().numpy()
@@ -1028,18 +1196,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
-            self.input_buffers.input_ids,
-            idx_mapping,
-            self.req_states.last_sampled_tokens,
-            query_start_loc,
-            seq_lens,
-            self.req_states.prefill_len.gpu,
-            self.req_states.draft_tokens,
-            cu_num_logits,
-            total_num_logits,
-            self.model_state.num_new_sampled_tokens_per_step,
-        )
+        if not use_fused_spec_prep:
+            logits_indices = combine_sampled_and_draft_tokens(
+                self.input_buffers.input_ids,
+                idx_mapping,
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                cu_num_logits,
+                total_num_logits,
+                self.model_state.num_new_sampled_tokens_per_step,
+            )
 
         # CPU upper bound on seq_lens (num_computed_tokens + num_scheduled_tokens).
         # Added by vLLM PR #40654 to avoid GPU->CPU sync for seq_lens.
@@ -1096,8 +1265,24 @@ class NPUModelRunner(GPUModelRunner):
             prompt_lens=prompt_lens,
             # extra attributes for ascend npus.
             seq_lens_np=self.input_buffers.seq_lens_np,
+            seq_lens_host_exact=(
+                (self.speculator is not None or self.sync_spec_pp_cpu_counts)
+                and not self._can_skip_spec_cpu_length_sync()
+            ),
             attn_state=attn_state,
         )
+
+        if tree_depths is not None:
+            input_batch.tree_visibility = self.req_states.tree_visibility[idx_mapping]
+            input_batch.tree_num_nodes = self.req_states.tree_num_nodes[idx_mapping]
+            input_batch.tree_tokens = self.req_states.draft_tokens[idx_mapping]
+            input_batch.tree_depths = tree_depths[idx_mapping]
+            input_batch.tree_parents = self.req_states.tree_parents[idx_mapping]
+            input_batch.tree_first_child = self.req_states.tree_first_child[idx_mapping]
+            input_batch.tree_next_sibling = self.req_states.tree_next_sibling[idx_mapping]
+            if use_tree_pos:
+                input_batch.slot_positions = self.input_buffers.slot_positions[:num_tokens_after_padding]
+
         # vLLM main (#57980) dropped the module-level maybe_partition_pcp_batch
         # helper; PCPManager.partition_batch now takes the batch descriptor.
         if self.pcp_manager is not None:
@@ -1135,6 +1320,25 @@ class NPUModelRunner(GPUModelRunner):
             # The parent already filled the entire persistent slot buffer.
             slot_mappings = self.block_tables.slot_mappings[:, : input_batch.num_tokens_after_padding]
         return slot_mappings
+
+    def prepare_attn(self, input_batch):
+        """Use unique slot_positions for tree spec KV mapping; RoPE stays on positions."""
+        if self.pcp_manager is not None:
+            return self.pcp_manager.prepare_attn(input_batch)
+
+        block_tables = self.block_tables.gather_block_tables(
+            input_batch.idx_mapping,
+            num_reqs_padded=input_batch.num_reqs_after_padding,
+        )
+        slot_pos = input_batch.slot_positions
+        positions = slot_pos if slot_pos is not None else input_batch.positions
+        slot_mappings = self.block_tables.compute_slot_mappings(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            positions,
+            num_tokens_padded=input_batch.num_tokens_after_padding,
+        )
+        return block_tables, slot_mappings
 
     def _lmhead_tp_max_num_logits(self) -> int:
         """Logits row capacity every rank agrees on (config-derived:
@@ -1418,6 +1622,13 @@ class NPUModelRunner(GPUModelRunner):
             # Restore its rows before Mamba aligns the accepted recurrent state.
             # Postprocess skips -1 (freed/unsampled) rows; gather needs valid indices.
             self.block_tables.gather_block_tables(idx_mapping.clamp_min(0), idx_mapping.shape[0])
+        if self.tree_commit is not None:
+            sampler = self.rejection_sampler
+            if sampler.acceptance is not None:
+                self.tree_commit.commit(idx_mapping, sampler.acceptance, num_rejected=num_rejected)
+                sampler.acceptance = None
+                sampler.path_node_ids = None
+
         if draft_tokens is None:
             super().postprocess_sampled(
                 idx_mapping,
@@ -1523,6 +1734,7 @@ class NPUModelRunner(GPUModelRunner):
             # topology between capture and replay.
             num_reqs_padded = descriptor_num_reqs
 
+        last_loc = int(query_start_loc_np[num_reqs])
         if has_uniform_decode_query_lens and num_tokens_padded == num_reqs_padded * query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
             assert num_reqs <= num_reqs_padded
@@ -1531,11 +1743,10 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = (
                 np.arange(1, num_reqs_padded + 1 - num_reqs) * query_len + last_loc
             )
-        else:
-            # Mixed-batch case: num_reqs must equal num_reqs_padded
-            assert num_reqs == num_reqs_padded
-
-            # Insert a dummy request instead of setting query_start_loc[num_reqs] = num_tokens_padded directly
+        elif last_loc < num_tokens_padded:
+            # Short prefill (or mixed) padded to a decode-sized graph, e.g.
+            # 16 tokens → 17-token FULL gear. Treating that as uniform decode
+            # leaves actual_seq_q[-1]==16 while queryT==17 and FIA tiling dies.
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 

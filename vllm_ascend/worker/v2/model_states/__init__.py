@@ -80,10 +80,14 @@ def _resolve_ascend_model_state_cls(
 
             return AscendHybridEncoderModelState
 
+        from vllm_ascend.attention.tree_spec import tree_spec_enabled
         from vllm_ascend.worker.v2.model_states.mamba_hybrid import (
             AscendMambaHybridModelState,
+            AscendTreeMambaHybridModelState,
         )
 
+        if tree_spec_enabled(vllm_config):
+            return AscendTreeMambaHybridModelState
         return AscendMambaHybridModelState
 
     if not get_current_hardware_profile().supports(HardwareCapability.STANDARD_WORKER_PATCHES):

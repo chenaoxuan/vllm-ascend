@@ -601,6 +601,14 @@ class AscendConfig:
                     "dynamic_max_step": 256
                 }
             },
+            "tree_spec_config": {
+                "enabled": false,
+                "budget": null,
+                "topk": null,
+                "candidate_size": 64,
+                "depth_penalty": null,
+                "keep_origin_chain": false
+            },
             "sparse_kv_offload_config": {
                 "enabled": false,
                 "topk_buffer_size": -1,
@@ -708,6 +716,7 @@ class AscendConfig:
     xlite_graph_config: XliteGraphConfig = dataclasses.field(default_factory=lambda: XliteGraphConfig())
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
+    tree_spec_config: TreeSpecConfig = dataclasses.field(default_factory=lambda: TreeSpecConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1423,6 +1432,66 @@ class AscendConfig:
 
 
 @config
+class TreeSpecConfig:
+    """Shared tree policy; the loaded draft model supplies its scoring adapter.
+
+    ``budget`` counts non-root nodes and ``topk`` bounds each retained level.
+    ``candidate_size`` controls Domino's base Top-C shortlist and defaults to
+    64. Set it to None to retain the historical C=topk behavior. The setting
+    is ignored by DSpark and DFlash without a Domino correction head, which
+    continue to score their complete draft vocabulary.
+    ``depth_penalty`` controls the depth penalty applied during global budget
+    pruning. When None (the default), each scorer keeps its existing value:
+    0.2 for DFlash/Domino and 0.0 for DSpark/Markov. An explicit value
+    overrides that scorer default for every backend.
+    ``keep_origin_chain`` preserves the draft model's per-step argmax chain
+    during global budget pruning.
+    Draft depth remains speculative_config.num_speculative_tokens.
+    """
+
+    enabled: bool = False
+    budget: int | None = None
+    topk: int | None = None
+    candidate_size: int | None = 64
+    depth_penalty: float | None = None
+    keep_origin_chain: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_options(cls, value):
+        options = value.kwargs if isinstance(value, ArgsKwargs) else value
+        if isinstance(options, dict) and ("method" in options or "params" in options):
+            raise ValueError(
+                "tree_spec_config.method/params were removed: the draft model selects "
+                "the scorer; set candidate_size directly in tree_spec_config"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.enabled and (self.budget is None or self.topk is None):
+            raise ValueError("tree_spec_config.budget and topk are required when enabled")
+        if self.budget is not None and (self.budget < 0 or (self.enabled and self.budget == 0)):
+            raise ValueError("tree_spec_config.budget must be positive when enabled")
+        if self.topk is not None and self.topk < 1:
+            raise ValueError("tree_spec_config.topk must be >= 1")
+        if self.candidate_size is not None and self.candidate_size < 1:
+            raise ValueError("tree_spec_config.candidate_size must be >= 1")
+        if self.depth_penalty is not None and (not math.isfinite(self.depth_penalty) or self.depth_penalty < 0):
+            raise ValueError("tree_spec_config.depth_penalty must be finite and >= 0")
+        return self
+
+    def _validate_backend(self, vllm_config):
+        spec = vllm_config.speculative_config
+        if not self.enabled or spec is None:
+            return
+        if not (spec.use_dspark() or spec.use_dflash()):
+            raise ValueError("Tree speculation requires a DSpark or DFlash draft model")
+        if self.budget < spec.num_speculative_tokens:
+            raise ValueError("tree_spec_config.budget must be >= num_speculative_tokens")
+
+
+@config
 class FinegrainedTPConfig:
     """Configuration Object for ``additional_config["finegrained_tp_config"]``.
 
@@ -2060,6 +2129,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
     new_config.rl_config.apply(new_config)
     new_config.finegrained_tp_config._validate_preconditions(vllm_config)
     new_config.xlite_graph_config._validate_preconditions(vllm_config)
+    new_config.tree_spec_config._validate_backend(vllm_config)
     if _is_ascend_config_initialized(new_config):
         _ASCEND_CONFIG = new_config
         _INIT_VLLM_CONFIG = vllm_config

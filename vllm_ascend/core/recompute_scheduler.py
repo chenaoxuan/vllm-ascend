@@ -46,6 +46,9 @@ from vllm_ascend.core.dyntra_lb_scheduler import (
     DyntraLBPolicyMixin,
     print_scheduler_summary,
 )
+from vllm_ascend.patch.platform.patch_spec_decode_stats import (
+    _patch_tree_verify_width,
+)
 from vllm_ascend.utils import get_ascend_config
 
 
@@ -1078,3 +1081,6 @@ class AsyncDyntraLBRecomputeScheduler(
     AsyncRecomputeScheduler,
 ):
     pass
+
+
+_patch_tree_verify_width(RecomputeScheduler)

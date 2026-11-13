@@ -24,6 +24,7 @@ import torch
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker import mamba_utils
@@ -40,6 +41,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ops.triton.spec_decode.tree.state_commit import commit_tree_snapshot_metadata
 from vllm_ascend.utils import model_uses_kimi_kda, model_uses_kpool_indexer
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
@@ -47,6 +49,9 @@ from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+    from vllm_ascend.worker.v2.spec_decode.tree.acceptance import TreeAcceptance
+    from vllm_ascend.worker.v2.spec_decode.tree.metrics import TreeGraphStats
+    from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
 
 # Copy block size used by the upstream fused mamba kernels.
 _COPY_BLOCK_SIZE = 1024
@@ -68,6 +73,96 @@ class _LayerwiseMambaCopyState:
     num_reqs: int
     idx_mapping: torch.Tensor
     pending_layers: set[str]
+
+
+def _pad_batch_rows(table: torch.Tensor, num_reqs: int) -> torch.Tensor:
+    """Extend a per-request draft-tree table to the padded batch size.
+
+    The runner builds the tree tables for the requests it verified, while the
+    attention metadata carries the padded batch and the builder selects table
+    rows by batch row (FULL cudagraph replay). Zero is the neutral filler: a
+    padded row reads as a linear row (``tree_num_nodes == 0``) and owns no
+    verified token, so its entries never become a node of a draft tree.
+    """
+    if table.shape[0] >= num_reqs:
+        return table[:num_reqs]
+    filler = table.new_zeros((num_reqs - table.shape[0], *table.shape[1:]))
+    return torch.cat((table, filler), dim=0)
+
+
+@dataclass
+class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
+    """Mamba metadata that also carries the draft-tree layout.
+
+    ``AscendGDNAttentionMetadataBuilder`` needs the tree parent ids to point each
+    node's recurrent state init at its parent's slot; every other builder ignores
+    them.
+    """
+
+    tree_parents: torch.Tensor | None = None
+    tree_num_nodes: torch.Tensor | None = None
+    # Accepted draft nodes of the *previous* step and its sampled token count,
+    # both ``[num_reqs]``-sized batches. The short conv needs them to rebuild the
+    # committed history from the node the sampler accepted; ``None`` (or
+    # ``num_sampled == 0``) keeps the history the previous op left behind.
+    tree_prev_path: torch.Tensor | None = None
+    tree_prev_num_sampled: torch.Tensor | None = None
+    tree_depths: torch.Tensor | None = None
+    share_tree_metadata: bool = False
+    shared_gdn_tree: "SharedGDNTreeMetadata | None" = None
+
+    def get_extra_attn_kwargs(
+        self,
+        attn_metadata_builder: Any,
+        num_reqs: int,
+    ) -> dict[str, Any]:
+        kwargs = super().get_extra_attn_kwargs(attn_metadata_builder, num_reqs)
+        if not kwargs or self.tree_parents is None:
+            return kwargs
+        # Lazy import to avoid a model-state <-> attention-builder cycle.
+        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+
+        if not isinstance(attn_metadata_builder, AscendGDNAttentionMetadataBuilder):
+            # Mamba2 / short-conv have no draft-tree state rollback.
+            return kwargs
+        # The runner copies the tree layout of the requests it verified; a FULL
+        # graph replays with padded rows, which the builder selects by batch row
+        # as well, so the tables have to cover the padded batch. A padded row
+        # reads as a linear row (``tree_num_nodes == 0``) and owns no token, so
+        # the extra entries are never used as a node.
+        kwargs["tree_parents"] = _pad_batch_rows(self.tree_parents, num_reqs)
+        if self.tree_num_nodes is not None:
+            kwargs["tree_num_nodes"] = _pad_batch_rows(self.tree_num_nodes, num_reqs)
+        if self.tree_prev_path is not None and self.tree_prev_num_sampled is not None:
+            kwargs["prev_path_node_ids"] = self.tree_prev_path[:num_reqs]
+            kwargs["prev_num_sampled"] = self.tree_prev_num_sampled[:num_reqs]
+        if (
+            self.share_tree_metadata
+            and self.tree_depths is not None
+            and self.tree_num_nodes is not None
+            and self.tree_prev_path is not None
+            and self.tree_prev_num_sampled is not None
+            and self.num_accepted_tokens is not None
+            and attn_metadata_builder.spec_tree_slots == self.tree_parents.shape[1] + 1
+            and attn_metadata_builder.spec_conv_width is not None
+        ):
+            # Per-step logical topology is shared,
+            # while each attention group still binds its own physical pages.
+            from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
+
+            if self.shared_gdn_tree is None:
+                self.shared_gdn_tree = SharedGDNTreeMetadata.create(
+                    self.tree_parents,
+                    self.tree_num_nodes,
+                    self.tree_depths,
+                    self.num_accepted_tokens,
+                    self.tree_prev_path,
+                    self.tree_prev_num_sampled,
+                    attn_metadata_builder.spec_conv_width,
+                )
+            if self.shared_gdn_tree.conv_width == attn_metadata_builder.spec_conv_width:
+                kwargs["shared_gdn_tree"] = self.shared_gdn_tree
+        return kwargs
 
 
 class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
@@ -450,6 +545,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         if cudagraph_mode == CUDAGraphMode.PIECEWISE and input_batch.is_dummy:
             num_input_tokens = input_batch.num_tokens_after_padding
 
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import tree_state_slot_count
+
+        tree_slots = tree_state_slot_count(self.vllm_config)
+        target_query_len = tree_slots or self.vllm_config.num_speculative_tokens + 1
         is_prefilling_np = input_batch.is_prefilling_np[: input_batch.num_reqs]
         if input_batch.prefill_runs_as_decode_np is not None:
             # vLLM #58400 runs one-token prompt tails as decodes. Their
@@ -473,11 +572,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             # Match upstream request-state classification. Adaptive verification
             # changes query lengths independently of the scheduled draft count.
             scheduled_tokens = input_batch.num_scheduled_tokens[: input_batch.num_reqs]
-            spec_decode_mask = (
-                ~is_prefilling_np
-                & (scheduled_tokens > 0)
-                & (scheduled_tokens <= self.vllm_config.num_speculative_tokens + 1)
-            )
+            spec_decode_mask = ~is_prefilling_np & (scheduled_tokens > 0) & (scheduled_tokens <= target_query_len)
             spec_config = getattr(self.vllm_config, "speculative_config", None)
             if not (spec_config and getattr(spec_config, "enable_adaptive_verification", False)):
                 # Static graphs retain the native recurrent operator and its
@@ -491,16 +586,61 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             )
             if cudagraph_mode == CUDAGraphMode.FULL and num_reqs > input_batch.num_reqs and spec_decode_mask.all():
                 padded_query_lens = np.diff(input_batch.query_start_loc_np[: num_reqs + 1])[input_batch.num_reqs :]
-                expected_query_len = self.vllm_config.num_speculative_tokens + 1
+                expected_query_len = (
+                    tree_state_slot_count(self.vllm_config) or self.vllm_config.num_speculative_tokens + 1
+                )
                 if np.all(padded_query_lens == expected_query_len):
                     num_decode_draft_tokens_np[input_batch.num_reqs :] = padded_query_lens - 1
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
-        model_specific_metadata = MambaHybridAttnMetadata(
+        tree_prev_path = None
+        tree_prev_num_sampled = None
+        if tree_slots is not None:
+            # Batch-order view of the paths recorded at the end of the previous
+            # step. A padded or path-less request keeps 0, which leaves the
+            # committed conv history untouched.
+            path_buffer, num_sampled_buffer = self._tree_buffers(
+                self.num_accepted_tokens_gpu.device,
+            )
+            tree_prev_path = torch.zeros(
+                (num_reqs, tree_slots - 1),
+                dtype=torch.int32,
+                device=path_buffer.device,
+            )
+            tree_prev_path[: input_batch.num_reqs] = path_buffer[input_batch.idx_mapping]
+            tree_prev_num_sampled = torch.zeros(
+                (num_reqs,),
+                dtype=torch.int32,
+                device=num_sampled_buffer.device,
+            )
+            tree_prev_num_sampled[: input_batch.num_reqs] = num_sampled_buffer[input_batch.idx_mapping]
+
+        model_specific_metadata = AscendMambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            # ``None`` unless the runner populated the draft-tree layout.
+            tree_parents=getattr(input_batch, "tree_parents", None),
+            tree_num_nodes=getattr(input_batch, "tree_num_nodes", None),
+            tree_prev_path=tree_prev_path,
+            tree_prev_num_sampled=tree_prev_num_sampled,
+            tree_depths=getattr(input_batch, "tree_depths", None),
+            # Only a real, complete BS1 FULL verify uses this fast path.
+            # Capture/dummy/prefill/truncated rows retain the existing builder.
+            share_tree_metadata=(
+                tree_slots is not None
+                and not for_capture
+                and not input_batch.is_dummy
+                and cudagraph_mode == CUDAGraphMode.FULL
+                and input_batch.num_reqs == num_reqs == 1
+                and input_batch.num_tokens == num_tokens == tree_slots
+                and num_decode_draft_tokens_cpu is not None
+                and int(num_decode_draft_tokens_cpu[0]) == tree_slots - 1
+                and not bool(is_prefilling[0])
+            ),
         )
+        if model_specific_metadata.share_tree_metadata:
+            self._prepare_shared_gdn_tree(model_specific_metadata, attn_groups)
         # Varlen graphs capture evenly split dummy rows (possibly one token
         # each), but must allow the descriptor's full K+1 replay query bound.
         max_query_len = getattr(input_batch, "max_query_len", None)
@@ -524,10 +664,196 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             parallel_config=self.vllm_config.parallel_config,
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_host_exact=getattr(input_batch, "seq_lens_host_exact", False),
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,
             pcp_context=pcp_context,
             full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
+            # Tree GQA must receive the same visibility mask as Qwen3-8B;
+            # GDN only adds recurrent state transport and must not alter the
+            # ordinary GQA path when the field is absent.
+            tree_visibility=getattr(input_batch, "tree_visibility", None),
             for_cudagraph_capture=for_capture,
+        )
+
+
+class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
+    """Tree-specific state snapshots; native chains keep upstream postprocessing."""
+
+    # GDN state slot the next step has to resume from, staged by the model
+    # commit coordinator while verifying a draft tree (see ``tree.state_rollback``); ``None``
+    # means the linear-chain convention (``num_sampled``) applies.
+    _tree_resume_column: torch.Tensor | None = None
+    # Accepted draft path of the step being committed, in batch order, plus its
+    # sampled token count; kept per request so the next step can re-anchor the
+    # short-conv history (``0`` marks a request without a fresh tree path).
+    _tree_path: torch.Tensor | None = None
+    _tree_num_sampled: torch.Tensor | None = None
+    # Which rows of that batch the tree op actually verified (see
+    # ``tree_row_mask``); a row it did not verify was committed by the linear
+    # operator, which leaves the committed columns where they are.
+    _tree_is_tree_row: torch.Tensor | None = None
+    _tree_prev_path: torch.Tensor | None = None
+    _tree_prev_num_sampled: torch.Tensor | None = None
+    tree_graph_stats: "TreeGraphStats | None" = None
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        """Reset the tree-side bookkeeping of a request slot."""
+        super().add_request(req_index, new_req_data)
+        # The path stored here belongs to the request that occupied this slot
+        # before. A new request prefills its own conv state, so its first tree
+        # step must keep the history the prefill left (``0``) instead of
+        # re-anchoring from the previous occupant's accepted nodes.
+        if self._tree_prev_num_sampled is not None:
+            self._tree_prev_num_sampled[req_index] = 0
+        if self._tree_prev_path is not None:
+            self._tree_prev_path[req_index] = 0
+
+    def stage_tree_acceptance(self, acceptance: "TreeAcceptance", num_rejected: torch.Tensor) -> None:
+        """Stage the accepted GDN leaf through the common tree commit boundary."""
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            compute_tree_resume_column,
+            tree_row_mask,
+        )
+
+        self._tree_resume_column = compute_tree_resume_column(acceptance.path_node_ids, acceptance.num_sampled)
+        self._tree_path = acceptance.path_node_ids
+        self._tree_num_sampled = acceptance.num_sampled
+        self._tree_is_tree_row = tree_row_mask(acceptance.num_sampled, num_rejected)
+
+    def _tree_buffers(self, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-request storage of the previous step's accepted draft path.
+
+        The buffers are sized by the tree width (``budget``, the widest path the
+        sampler can hand over) so that they survive the step: the sampler's
+        narrower path is copied into their leading columns by
+        ``postprocess_state``. Sizing them by that narrower path instead would
+        re-create (and zero) them on every step, which silently disables the
+        short-conv re-anchor.
+        """
+        # Imported here to keep the model state import graph flat.
+        from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
+            tree_state_slot_count,
+        )
+
+        slots = tree_state_slot_count(self.vllm_config)
+        assert slots is not None, "draft-tree buffers need an active tree_spec_config"
+        path_width = slots - 1
+        # Per-request storage: ``idx_mapping`` values address the request slots
+        # of the persistent spec-decode state.
+        num_reqs = self.num_accepted_tokens_gpu.shape[0]
+        path = self._tree_prev_path
+        if path is None or path.shape != (num_reqs, path_width) or path.device != device:
+            path = torch.zeros((num_reqs, path_width), dtype=torch.int32, device=device)
+            self._tree_prev_num_sampled = torch.zeros((num_reqs,), dtype=torch.int32, device=device)
+            self._tree_prev_path = path
+        assert self._tree_prev_num_sampled is not None
+        return path, self._tree_prev_num_sampled
+
+    def postprocess_state(
+        self,
+        idx_mapping: torch.Tensor,
+        num_sampled: torch.Tensor | int,
+        num_computed_tokens: torch.Tensor | None = None,
+    ) -> None:
+        resume_column = self._tree_resume_column
+        path = self._tree_path
+        # Native chain decoding retains the upstream state lifecycle.
+        if resume_column is None and path is None and self._tree_prev_path is None:
+            super().postprocess_state(idx_mapping, num_sampled, num_computed_tokens)
+            return
+
+        committed = False
+        if (
+            resume_column is not None
+            and idx_mapping.device.type == "npu"
+            and path is not None
+            and self._tree_num_sampled is not None
+            and not self.vllm_config.speculative_config.enforce_eager
+            and self.vllm_config.compilation_config.cudagraph_mode
+            in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
+        ):
+            from vllm_ascend.worker.v2.spec_decode.tree.qwen_state_graph import QwenTreeStateGraphs
+
+            graphs = getattr(self, "_tree_state_graphs", None)
+            if graphs is None:
+                graphs = self._tree_state_graphs = QwenTreeStateGraphs(self, stats=self.tree_graph_stats)
+            committed = graphs.run(
+                idx_mapping,
+                resume_column,
+                path,
+                self._tree_num_sampled,
+                self._tree_is_tree_row,
+                num_computed_tokens,
+            )
+        if not committed:
+            self._postprocess_tree_state_tensors(
+                idx_mapping,
+                resume_column if resume_column is not None else num_sampled,
+                path,
+                self._tree_num_sampled,
+                self._tree_is_tree_row,
+                num_computed_tokens,
+            )
+        self._tree_resume_column = None
+        self._tree_path = None
+        self._tree_num_sampled = None
+        self._tree_is_tree_row = None
+
+    def _postprocess_tree_state_tensors(
+        self, idx_mapping, resume_column, path, num_sampled, tree_rows, num_computed_tokens
+    ) -> None:
+        """The same accepted-state computation is used eagerly and in a graph."""
+        if path is not None or self._tree_prev_path is not None:
+            previous_path, previous_sampled = self._tree_buffers(idx_mapping.device)
+            commit_tree_snapshot_metadata(previous_path, previous_sampled, idx_mapping, path, num_sampled, tree_rows)
+        super().postprocess_state(idx_mapping, resume_column, num_computed_tokens)
+
+    def _prepare_shared_gdn_tree(self, metadata: "AscendMambaHybridAttnMetadata", attn_groups) -> None:
+        """Create the shared draft-tree geometry before the layer loop.
+
+        ``get_extra_attn_kwargs`` otherwise creates it lazily on the first GDN
+        group, which lands after the leading FIA group builds of the step and
+        leaves the device idle right after the tree mask kernel. Creating it
+        here moves the step's first device ops to the front; the lazy branch
+        then finds ``metadata.shared_gdn_tree`` already populated.
+        """
+        if (
+            metadata.tree_parents is None
+            or metadata.tree_num_nodes is None
+            or metadata.tree_depths is None
+            or metadata.tree_prev_path is None
+            or metadata.tree_prev_num_sampled is None
+            or metadata.num_accepted_tokens is None
+        ):
+            return
+        # Lazy imports to keep the model-state <-> attention-builder cycle
+        # out of the module level (same reason as get_extra_attn_kwargs).
+        from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionMetadataBuilder
+        from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
+
+        conv_width = None
+        for cache_group in attn_groups:
+            for attn_group in cache_group:
+                builder = attn_group.get_metadata_builder(0)
+                if (
+                    isinstance(builder, AscendGDNAttentionMetadataBuilder)
+                    and builder.spec_tree_slots == metadata.tree_parents.shape[1] + 1
+                    and builder.spec_conv_width is not None
+                ):
+                    conv_width = builder.spec_conv_width
+                    break
+            if conv_width is not None:
+                break
+        if conv_width is None:
+            return
+        metadata.shared_gdn_tree = SharedGDNTreeMetadata.create(
+            metadata.tree_parents,
+            metadata.tree_num_nodes,
+            metadata.tree_depths,
+            metadata.num_accepted_tokens,
+            metadata.tree_prev_path,
+            metadata.tree_prev_num_sampled,
+            conv_width,
         )

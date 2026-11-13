@@ -326,6 +326,17 @@ class NPUPlatform(Platform):
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
+        # DFlash2 draft attention: device-side FA3 tiling replaces the dense
+        # backend's host-side FIA tiling (Python length lists) on the propose
+        # path, removing the per-step host block from the draft loop.
+        if (
+            not attn_selector_config.use_pcp
+            and backend_key == (False, False, False)
+            and _validate_draft_fa3_backend(attn_selector_config)
+        ):
+            # vLLM resolves this import path to the backend class.
+            return "vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"
+
         # PCP keeps its distributed backend; eligible local draft layers use CANN FlashAttn.
         if not attn_selector_config.use_pcp and _validate_flash_attn_backend(backend_key, attn_selector_config):
             # vLLM resolves this import path to the backend class.
@@ -1755,6 +1766,43 @@ def _is_supported_flash_attn_draft(spec: SpeculativeConfig, model_tag: str) -> b
     return False
 
 
+def _validate_draft_fa3_backend(selector) -> bool:
+    """Select the device-tiling FA3 backend for DFlash2 draft attention."""
+    from vllm.compilation import backends
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    from vllm_ascend.attention.tree_spec import tree_spec_enabled
+
+    if not tree_spec_enabled(config):
+        return False
+    spec = config.speculative_config
+    if spec is None:
+        return False
+    # V2 keeps the target model_config while loading the draft; read the live
+    # loader tag rather than a runner_type convention.
+    if backends.model_tag != "dflash_head":
+        return False
+    if "DFlash2DraftModel" not in (spec.draft_model_config.architectures or []):
+        return False
+    if spec.method != "dflash":
+        return False
+    return (
+        # FA3 requires FP16/BF16 Q and unquantized KV.
+        selector.dtype in (torch.float16, torch.bfloat16)
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_rswa
+            or selector.use_batch_invariant
+            or selector.use_per_head_quant_scales
+        )
+    )
+
+
 def _validate_flash_attn_backend(backend_key, selector) -> bool:
     """Select CANN FlashAttn for A5 GLM DFlash2 and GLM/MiniMax DSpark drafts."""
     # backend_key is (use_mla, use_sparse, use_compress).
@@ -1849,7 +1897,14 @@ def _get_reduced_cg_cap(vllm_config: VllmConfig) -> int | None:
     decode_query_len = 1
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config and speculative_config.num_speculative_tokens:
-        decode_query_len += speculative_config.num_speculative_tokens
+        from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
+        # Platform defaults precede AscendConfig initialization. Shape resolution
+        # reads this VllmConfig directly, so capture and runtime use one rule.
+        tree_shape = TreeShape.from_config(vllm_config)
+        decode_query_len = (
+            tree_shape.target_query_len if tree_shape is not None else 1 + speculative_config.num_speculative_tokens
+        )
 
     return min(max_num_seqs * decode_query_len, 512)
 

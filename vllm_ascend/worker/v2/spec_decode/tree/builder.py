@@ -267,7 +267,8 @@ def create_tree_builder(
             # Import here because its subclass reuses TreeBuilder workspaces.
             from vllm_ascend.worker.v2.spec_decode.tree.dflash2_builder import DFlash2BeamTreeBuilder
 
-            scorer = DFlash2Scorer(draft_model)
+            shortlist_size = topk if candidate_size is None else candidate_size
+            scorer = DFlash2Scorer(draft_model, shortlist_size)
             builder_type = DFlash2BeamTreeBuilder
         else:
             scorer = IndependentScorer()

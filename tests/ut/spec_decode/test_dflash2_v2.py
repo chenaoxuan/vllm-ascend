@@ -30,6 +30,7 @@ from vllm.forward_context import is_forward_context_available, override_forward_
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 import vllm_ascend.worker.v2.spec_decode.dflash.speculator as dflash_module
+from vllm_ascend.models import qwen3_dflash2
 from vllm_ascend.ops.vocab_parallel_embedding import VocabParallelMode
 from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
@@ -37,6 +38,7 @@ from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
     AscendDFlash2Speculator,
     _selector_walk_kernel_ascend,
 )
+from vllm_ascend.worker.v2.spec_decode.tree.builder import create_tree_builder
 
 try:
     from vllm.v1.worker.gpu.spec_decode.lilicorr.speculator import LiLiCorrSpeculator
@@ -55,6 +57,45 @@ else:
     HAS_LILICORR = True
 
 REQUIRES_LILICORR = pytest.mark.skipif(not HAS_LILICORR, reason="LiLiCorr is not supported by the paired vLLM version")
+
+
+@pytest.mark.parametrize("candidate_size,expected", [(None, 8), (4, 4), (64, 64), (256, 128)])
+def test_tree_resolves_dflash2_candidate_width(candidate_size, expected):
+    selector = SimpleNamespace(top_k=16, predecessor_codebook=None, successor_codebook=None, hidden_projection=None)
+    draft = SimpleNamespace(candidate_selector=selector, lm_head=SimpleNamespace(org_vocab_size=128))
+    builder = create_tree_builder(32, 8, "dflash", draft_model=draft, candidate_size=candidate_size)
+
+    assert builder.scorer.top_k == expected
+    assert selector.top_k == 16
+
+
+@pytest.mark.parametrize("requested,expected_ids", [(None, [6, 0]), (5, [6, 0, 4, 1, 2])])
+def test_dflash2_candidate_override_merges_tp_shards(monkeypatch, requested, expected_ids):
+    draft = SimpleNamespace(
+        model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=2)),
+        lm_head=SimpleNamespace(
+            quant_method=qwen3_dflash2.UnquantizedEmbeddingMethod(),
+            shard_indices=SimpleNamespace(num_org_vocab_padding=0, org_vocab_start_index=0),
+        ),
+        output_multiplier=1.0,
+        final_logit_softcapping=None,
+    )
+    local_logits = torch.tensor([[9.0, 4.0, 3.0, 0.0]])
+    remote_logits = torch.tensor([[8.0, 2.0, 10.0, float("-inf")]])
+
+    def gather(local, dim):
+        values, ids = remote_logits.topk(local.shape[-1], dim=dim)
+        return torch.cat((local, ids + 4 if local.dtype == torch.long else values), dim=dim)
+
+    monkeypatch.setattr(draft.lm_head.quant_method, "apply", lambda *_args, **_kwargs: local_logits)
+    monkeypatch.setattr(qwen3_dflash2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(qwen3_dflash2, "tensor_model_parallel_all_gather", gather)
+
+    ids, scores = qwen3_dflash2.DFlash2Qwen3ForCausalLM.compute_candidates(draft, torch.empty(1, 1), top_k=requested)
+
+    assert ids.tolist() == [expected_ids]
+    all_logits = torch.cat((local_logits, remote_logits), dim=-1)
+    torch.testing.assert_close(scores, all_logits[:, expected_ids])
 
 
 @pytest.mark.parametrize("causal", [False, True])

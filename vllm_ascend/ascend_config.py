@@ -1436,10 +1436,12 @@ class TreeSpecConfig:
     """Shared tree policy; the loaded draft model supplies its scoring adapter.
 
     ``budget`` counts non-root nodes and ``topk`` bounds each retained level.
-    ``candidate_size`` controls Domino's base Top-C shortlist and defaults to
-    64. Set it to None to retain the historical C=topk behavior. The setting
-    is ignored by DSpark and DFlash without a Domino correction head, which
-    continue to score their complete draft vocabulary.
+    ``candidate_size`` controls the unary shortlist before correction for
+    Domino and DFlash2 and defaults to 64. None uses ``topk``. Domino
+    keeps at least ``topk`` candidates. DFlash2 caps the shortlist at the
+    vocabulary size and uses a narrower frontier when the shortlist is
+    smaller than ``topk``. DSpark and plain DFlash score their full
+    draft vocabulary.
     ``depth_penalty`` controls the depth penalty applied during global budget
     pruning. When None (the default), each scorer keeps its existing value:
     0.2 for DFlash/Domino and 0.0 for DSpark/Markov. An explicit value

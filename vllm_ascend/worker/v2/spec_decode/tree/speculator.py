@@ -250,6 +250,8 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             depth_penalty=self.depth_penalty,
             keep_origin_chain=self.keep_origin_chain,
         )
+        if self.tree_builder.scorer.name == "dflash2":
+            logger.info("DFlash2 Tree unary candidate width: %d", self.tree_builder.scorer.top_k)
         logger.info(
             "Tree correction heads: markov=%s domino=%s prefix_len=%s shift_label=%s",
             draft_model is not None,
@@ -433,13 +435,13 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
         draft_candidate_ids = None
         if self.draft_backend == "dspark":
             logits = self.model.compute_draft_logits(sample_hidden_states)
-        elif hasattr(getattr(self.model, "model", self.model), "candidate_selector") and hasattr(
-            self.model, "compute_candidates"
-        ):
+        elif self.tree_builder.scorer.name == "dflash2":
             # DFlash2's selector head corrects the target-LM top-k lattice. Keep
             # the candidate IDs alongside the unary logits so the tree scorer
             # can evaluate edges against the actual frontier at each depth.
-            draft_candidate_ids, logits = self.model.compute_candidates(sample_hidden_states)
+            draft_candidate_ids, logits = self.model.compute_candidates(
+                sample_hidden_states, top_k=self.tree_builder.scorer.top_k
+            )
         else:
             logits = self.model.compute_logits(sample_hidden_states)
         logits = logits.view(num_reqs, self.num_speculative_steps, -1)

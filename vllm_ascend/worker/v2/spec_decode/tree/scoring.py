@@ -123,14 +123,14 @@ class DFlash2Scorer:
     depth_penalty = default_depth_penalty
     requires_candidate_ids = True
 
-    def __init__(self, model):
+    def __init__(self, model, candidate_size: int):
         selector = getattr(getattr(model, "model", model), "candidate_selector", None)
         if selector is None:
             raise ValueError("DFlash2 tree scoring requires model.candidate_selector")
         self.predecessor_codebook = selector.predecessor_codebook
         self.successor_codebook = selector.successor_codebook
         self.hidden_projection = selector.hidden_projection
-        self.top_k = int(selector.top_k)
+        self.top_k = min(candidate_size, model.lm_head.org_vocab_size)
 
     def reserve(self, num_reqs, num_nodes, device):
         del num_reqs, num_nodes, device
@@ -150,9 +150,7 @@ class DFlash2Scorer:
         if hidden is None or hidden.shape[:2] != candidate_ids.shape[:2]:
             raise ValueError("DFlash2 candidate lattice and draft hidden states have mismatched depth")
         if candidate_ids.shape[-1] != self.top_k:
-            raise ValueError(
-                f"DFlash2 candidate width must be selector_top_k={self.top_k}, got {candidate_ids.shape[-1]}"
-            )
+            raise ValueError(f"DFlash2 candidate width must be {self.top_k}, got {candidate_ids.shape[-1]}")
         # Match CandidateSelector.forward: the Ascend unquantized GEMM path
         # requires a 2-D input during graph capture, then restores [R, L, rank].
         projected = self.hidden_projection(hidden.flatten(0, 1))

@@ -1,0 +1,5 @@
+pr: 3
+entries:
+  - category: performance
+    text: Added opt-in MegaTree v0.1 construction for single-request DFlash2 Tree decoding on Ascend.
+    hardware: [A2]

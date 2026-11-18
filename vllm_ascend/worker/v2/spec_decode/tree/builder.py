@@ -252,6 +252,7 @@ def create_tree_builder(
     correction_scorer=None,
     prefix_len=0,
     candidate_size=64,
+    use_mega_tree=False,
     depth_penalty=None,
     keep_origin_chain=False,
 ):
@@ -269,7 +270,12 @@ def create_tree_builder(
 
             shortlist_size = topk if candidate_size is None else candidate_size
             scorer = DFlash2Scorer(draft_model, shortlist_size)
-            builder_type = DFlash2BeamTreeBuilder
+            if use_mega_tree:
+                from vllm_ascend.worker.v2.spec_decode.tree.mega_tree_builder import MegaTreeBuilder
+
+                builder_type = MegaTreeBuilder
+            else:
+                builder_type = DFlash2BeamTreeBuilder
         else:
             scorer = IndependentScorer()
     else:

@@ -368,3 +368,13 @@ convolution allocates its output separately.
 Small prefix match units can increase checkpoint traffic.
 
 Validate correctness, quality and performance on the deployment hardware before deploying in production.
+
+## DFlash2 MegaTree v0.1
+
+Set `additional_config.tree_spec_config.use_mega_tree` to `true` to enable
+best-first construction on a single-request DFlash2 tree with draft depth 15,
+candidate size 64, budget 32 or 48, zero depth penalty and no forced origin
+chain. Other shapes and policies keep the existing builder. The default is
+`false`. MegaTree normalizes over all 64 candidates and searches the best
+prefixes up to the budget, independently of the ordinary beam's `topk`.
+Its node ordering and generated sequences can differ from ordinary Tree.

@@ -247,6 +247,7 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             correction_scorer=self._domino_scorer,
             prefix_len=self._domino_prefix_len,
             candidate_size=self.candidate_size,
+            use_mega_tree=get_ascend_config().tree_spec_config.use_mega_tree,
             depth_penalty=self.depth_penalty,
             keep_origin_chain=self.keep_origin_chain,
         )

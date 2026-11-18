@@ -1455,6 +1455,7 @@ class TreeSpecConfig:
     budget: int | None = None
     topk: int | None = None
     candidate_size: int | None = 64
+    use_mega_tree: bool = False
     depth_penalty: float | None = None
     keep_origin_chain: bool = False
 

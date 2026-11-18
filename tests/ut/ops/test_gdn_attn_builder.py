@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -2203,9 +2203,16 @@ def test_full_tree_graph_inputs_across_cache_groups(monkeypatch):
         for group, builder in enumerate(builders):
             pages = (starts.to(torch.int32) + 100 * step + 1000 * group)[None, :]
             common.block_table_tensor = pages
-            meta = builder.build(
-                0, common, accepted, torch.tensor([slots - 1]), num_actual_reqs=1, shared_gdn_tree=tree
-            )
+            meta = builder.try_refresh_tree_group(pages, common.seq_lens, tree, accepted)
+            if step == 1:
+                assert meta is None
+                meta = builder.build(
+                    0, common, accepted, torch.tensor([slots - 1]), num_actual_reqs=1, shared_gdn_tree=tree
+                )
+            else:
+                assert meta is not None
+                other_request = replace(tree, request_id="next")
+                assert builder.try_refresh_tree_group(pages, common.seq_lens, other_request, accepted) is None
             spec = meta.spec_decode_metadata
             chunk = spec.verify_plan.chunks[0]
             assert chunk.state_indices.data_ptr() == meta.spec_state_indices_tensor.data_ptr()

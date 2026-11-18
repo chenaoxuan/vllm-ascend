@@ -41,6 +41,7 @@ from vllm.v1.worker.mamba_utils import (
 )
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePageBatch, GDNTreePagePointers
 from vllm_ascend.ops.triton.spec_decode.tree.state_commit import commit_tree_snapshot_metadata
 from vllm_ascend.utils import model_uses_kimi_kda, model_uses_kpool_indexer
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
@@ -48,6 +49,7 @@ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
 if TYPE_CHECKING:
+    from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
     from vllm_ascend.worker.v2.spec_decode.tree.acceptance import TreeAcceptance
     from vllm_ascend.worker.v2.spec_decode.tree.metrics import TreeGraphStats
@@ -194,21 +196,25 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
 
     def _select_gdn_tree_graph_inputs(
         self, attn_groups: list[list[AttentionGroup]], full_row: bool, tree_slots: int
-    ) -> None:
+    ) -> dict[int, "AscendGDNHostMetadataBuilder"]:
         previous = getattr(self, "_gdn_tree_graph_groups", None)
-        if previous is not None and previous[0] is attn_groups and previous[1:] == (full_row, tree_slots):
-            return
+        if previous is not None and previous[0] is attn_groups and previous[1:3] == (full_row, tree_slots):
+            return previous[3]
         from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
 
         pools = getattr(self, "_gdn_tree_graph_pools", None)
         if pools is None:
             pools = self._gdn_tree_graph_pools = {}
-        for groups in attn_groups:
+        refresh_builders = {}
+        for index, groups in enumerate(attn_groups):
             for group in groups:
                 builder = group.get_metadata_builder(0)
                 if type(builder) is AscendGDNHostMetadataBuilder:
                     builder.select_full_tree_inputs(full_row and builder.spec_tree_slots == tree_slots, pools)
-        self._gdn_tree_graph_groups = (attn_groups, full_row, tree_slots)
+                    if full_row and tree_slots == GDNTreePageBatch.SLOTS and len(groups) == 1:
+                        refresh_builders[index] = builder
+        self._gdn_tree_graph_groups = (attn_groups, full_row, tree_slots, refresh_builders)
+        return refresh_builders
 
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the
@@ -568,6 +574,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import tree_state_slot_count
 
         tree_slots = tree_state_slot_count(self.vllm_config)
+        refresh_builders = None
         if (
             tree_slots is not None
             and self.vllm_config.parallel_config.pipeline_parallel_size == 1
@@ -582,7 +589,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
                 and input_batch.num_tokens_after_padding == tree_slots
                 and (input_batch.num_reqs == 0 or (input_batch.num_reqs == 1 and input_batch.num_tokens == tree_slots))
             )
-            self._select_gdn_tree_graph_inputs(attn_groups, full_row, tree_slots)
+            refresh_builders = self._select_gdn_tree_graph_inputs(attn_groups, full_row, tree_slots)
         target_query_len = tree_slots or self.vllm_config.num_speculative_tokens + 1
         is_prefilling_np = input_batch.is_prefilling_np[: input_batch.num_reqs]
         if input_batch.prefill_runs_as_decode_np is not None:
@@ -682,7 +689,32 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         max_query_len = getattr(input_batch, "max_query_len", None)
         if max_query_len is None:
             max_query_len = input_batch.num_scheduled_tokens.max().item()
-        return build_attn_metadata(
+        # Validate the shared row once. Only groups with a warm descriptor for
+        # this same request can bypass common metadata construction below.
+        tree = model_specific_metadata.shared_gdn_tree
+        refresh_group = None
+        if (
+            refresh_builders
+            and tree is not None
+            and tree.request_id is not None
+            and tree.request_id == model_specific_metadata.tree_request_id
+            and pcp_context is None
+            and num_tokens == num_input_tokens == max_query_len == tree.slots
+            and input_batch.query_start_loc_np.shape == (2,)
+            and tuple(input_batch.query_start_loc_np) == (0, tree.slots)
+            and num_accepted_tokens is not None
+            and num_accepted_tokens.shape == (1,)
+        ):
+            row_seq_lens = input_batch.seq_lens[:num_reqs]
+
+            def refresh_group(index, block_table):
+                builder = refresh_builders.get(index)
+                if builder is not None:
+                    return builder.try_refresh_tree_group(block_table, row_seq_lens, tree, num_accepted_tokens)
+                return None
+
+        metadata = build_attn_metadata(
+            refresh_tree_group=refresh_group,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_actual_reqs=input_batch.num_reqs,
@@ -712,6 +744,10 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             tree_visibility=getattr(input_batch, "tree_visibility", None),
             for_cudagraph_capture=for_capture,
         )
+        tree = model_specific_metadata.shared_gdn_tree
+        if tree is not None and tree.page_batch is not None:
+            tree.page_batch.finish(tree.init_state_columns)
+        return metadata
 
 
 class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
@@ -721,6 +757,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
     # commit coordinator while verifying a draft tree (see ``tree.state_rollback``); ``None``
     # means the linear-chain convention (``num_sampled``) applies.
     _tree_resume_column: torch.Tensor | None = None
+    _gdn_page_pointers: GDNTreePagePointers | None = None
     # Accepted draft path of the step being committed, in batch order, plus its
     # sampled token count; kept per request so the next step can re-anchor the
     # short-conv history (``0`` marks a request without a fresh tree path).
@@ -884,6 +921,15 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
                 break
         if conv_width is None:
             return
+        page_batch = None
+        if (
+            not self.vllm_config.scheduler_config.async_scheduling
+            and metadata.tree_parents.device.type == "npu"
+            and metadata.tree_parents.shape[1] + 1 == GDNTreePageBatch.SLOTS
+        ):
+            if self._gdn_page_pointers is None:
+                self._gdn_page_pointers = GDNTreePagePointers()
+            page_batch = GDNTreePageBatch(self._gdn_page_pointers)
         metadata.shared_gdn_tree = SharedGDNTreeMetadata.create(
             metadata.tree_parents,
             metadata.tree_num_nodes,
@@ -894,4 +940,5 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             conv_width,
             request_id=metadata.tree_request_id,
             use_fused_topology=not self.vllm_config.scheduler_config.async_scheduling,
+            page_batch=page_batch,
         )

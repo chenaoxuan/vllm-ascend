@@ -549,6 +549,7 @@ def build_attn_metadata(
     tree_visibility: torch.Tensor | None = None,
     slot_positions: torch.Tensor | None = None,
     seq_lens_host_exact: bool = False,
+    refresh_tree_group: Callable[[int, torch.Tensor], Any] | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
     if skip_ring_state_update is None:
@@ -637,6 +638,12 @@ def build_attn_metadata(
             formatted_slot_mappings = plan.format_dsa_slot_mapping(slot_mappings[:, :num_input_tokens], block_sizes)
     for i, kv_cache_spec in enumerate(kv_cache_groups):
         block_table = block_tables[i]
+        if refresh_tree_group is not None and common_metadata_callback is None:
+            cached = refresh_tree_group(i, block_table)
+            if cached is not None:
+                for layer_name in attn_groups[i][0].layer_names:
+                    attn_metadata[layer_name] = cached
+                continue
         slot_mapping = slot_mappings[i]
         # Hybrid drafters can configure causality per KV cache group.
         group_causal = causal if isinstance(causal, bool) else causal.get(i, True)

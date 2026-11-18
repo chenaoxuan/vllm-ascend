@@ -2043,10 +2043,31 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._spec_verify_plan_views = None
         self._full_tree_metadata = None
 
+    def try_refresh_tree_group(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tree: "SharedGDNTreeMetadata",
+        accepted: torch.Tensor,
+    ) -> GDNAttentionMetadata | None:
+        """Refresh this group's warm descriptor for a prevalidated full row."""
+        if (
+            self._full_tree_metadata is None
+            or not self._using_full_tree_inputs
+            or self._full_tree_request_id != tree.request_id
+            or self.spec_tree_slots != tree.slots
+            or self.spec_conv_width != tree.conv_width
+            or block_table.shape[0] != 1
+            or seq_lens.shape[0] != 1
+        ):
+            return None
+        return self._refresh_full_tree_metadata(self._full_tree_metadata, block_table, seq_lens, tree, accepted)
+
     def _refresh_full_tree_metadata(
         self,
         metadata: GDNAttentionMetadata,
-        common: CommonAttentionMetadata,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
         tree: "SharedGDNTreeMetadata",
         accepted: torch.Tensor,
     ) -> GDNAttentionMetadata:
@@ -2054,15 +2075,11 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         # buffers. Refresh every data-dependent field from this group's pages.
         spec = metadata.spec_decode_metadata
         table = mamba_get_block_table_tensor(
-            common.block_table_tensor,
-            common.seq_lens,
+            block_table,
+            seq_lens,
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
-        pages = table[:1, : tree.slots]
-        init_pages = tree.bind_init_state_indices(pages)
-        metadata.spec_state_indices_tensor.copy_(pages)
-        spec.init_state_indices.copy_(init_pages)
         pool = id(self.num_accepted_tokens)
         if not self._using_full_tree_inputs or pool not in tree._written_graph_inputs:
             metadata.num_accepted_tokens.copy_(accepted)
@@ -2070,11 +2087,21 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             spec.conv_prefix_src.copy_(tree.conv_prefix_src)
             if self._using_full_tree_inputs:
                 tree._written_graph_inputs.add(pool)
+        spec.spec_causal_conv1d.cache_indices = metadata.spec_state_indices_tensor
+        if (
+            self._using_full_tree_inputs
+            and tree.page_batch is not None
+            and tree.page_batch.add(tree.init_state_columns, table, self, metadata)
+        ):
+            return metadata
+        pages = table[:1, : tree.slots]
+        init_pages = tree.bind_init_state_indices(pages)
+        metadata.spec_state_indices_tensor.copy_(pages)
+        spec.init_state_indices.copy_(init_pages)
         if not self._using_full_tree_inputs:
             chunk = spec.verify_plan.chunks[0]
             chunk.state_indices.copy_(pages[0])
             chunk.init_state_indices.copy_(init_pages[0])
-        spec.spec_causal_conv1d.cache_indices = metadata.spec_state_indices_tensor
         return self._finalize_metadata(metadata)
 
     def build(
@@ -2109,7 +2136,11 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             and self._full_tree_request_id == shared_gdn_tree.request_id
         ):
             return self._refresh_full_tree_metadata(
-                self._full_tree_metadata, common_attn_metadata, shared_gdn_tree, num_accepted_tokens
+                self._full_tree_metadata,
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens,
+                shared_gdn_tree,
+                num_accepted_tokens,
             )
         # A prefill, idle row or another graph shape can overwrite the same
         # stable buffers. Reinitialize them on the next complete verify.

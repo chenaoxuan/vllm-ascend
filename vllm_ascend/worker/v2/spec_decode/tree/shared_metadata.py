@@ -2,6 +2,7 @@
 """One verification step's logical GDN metadata, shared across cache groups."""
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,6 +14,9 @@ from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
     compute_tree_conv_rows,
     compute_tree_prefix_source,
 )
+
+if TYPE_CHECKING:
+    from vllm_ascend.ops.triton.spec_decode.tree.gdn_tree_pages import GDNTreePageBatch
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class SharedGDNTreeMetadata:
     _verify_geometry: dict[int, _VerifyGeometry] = field(default_factory=dict, repr=False, compare=False)
 
     request_id: str | None = None
+    page_batch: "GDNTreePageBatch | None" = field(default=None, repr=False, compare=False)
     _written_graph_inputs: set[int] = field(default_factory=set, init=False, repr=False, compare=False)
 
     @classmethod
@@ -55,6 +60,7 @@ class SharedGDNTreeMetadata:
         *,
         request_id: str | None = None,
         use_fused_topology: bool = False,
+        page_batch: "GDNTreePageBatch | None" = None,
     ) -> "SharedGDNTreeMetadata":
         if parents.ndim != 2 or parents.shape[0] != 1 or parents.shape[1] < 1:
             raise ValueError("Shared GDN tree metadata requires BS1 rootless parents [1, budget].")
@@ -85,13 +91,14 @@ class SharedGDNTreeMetadata:
             columns, windows, prefix = build_gdn_tree_topology(
                 parents, num_nodes, depths, num_accepted_tokens, prev_path_node_ids, prev_num_sampled, conv_width
             )
-            return cls(slots, conv_width, columns, windows, prefix, request_id=request_id)
+            return cls(slots, conv_width, columns, windows, prefix, request_id=request_id, page_batch=page_batch)
         chain_parents = torch.arange(slots - 1, device=device, dtype=torch.long)
         parent_columns = torch.where(num_nodes[:, None] > 0, parents.to(torch.long), chain_parents[None, :])
         root_column = (num_accepted_tokens.to(torch.long) - 1).clamp(min=0).unsqueeze(1)
         init_state_columns = torch.cat((root_column, parent_columns), dim=1)
         return cls(
             slots=slots,
+            page_batch=page_batch,
             conv_width=conv_width,
             request_id=request_id,
             init_state_columns=init_state_columns,

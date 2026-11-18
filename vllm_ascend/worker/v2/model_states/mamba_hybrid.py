@@ -109,6 +109,7 @@ class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
     tree_prev_num_sampled: torch.Tensor | None = None
     tree_depths: torch.Tensor | None = None
     share_tree_metadata: bool = False
+    tree_request_id: str | None = None
     shared_gdn_tree: "SharedGDNTreeMetadata | None" = None
 
     def get_extra_attn_kwargs(
@@ -159,6 +160,7 @@ class AscendMambaHybridAttnMetadata(MambaHybridAttnMetadata):
                     self.tree_prev_path,
                     self.tree_prev_num_sampled,
                     attn_metadata_builder.spec_conv_width,
+                    request_id=self.tree_request_id,
                 )
             if self.shared_gdn_tree.conv_width == attn_metadata_builder.spec_conv_width:
                 kwargs["shared_gdn_tree"] = self.shared_gdn_tree
@@ -189,6 +191,24 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
+
+    def _select_gdn_tree_graph_inputs(
+        self, attn_groups: list[list[AttentionGroup]], full_row: bool, tree_slots: int
+    ) -> None:
+        previous = getattr(self, "_gdn_tree_graph_groups", None)
+        if previous is not None and previous[0] is attn_groups and previous[1:] == (full_row, tree_slots):
+            return
+        from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBuilder
+
+        pools = getattr(self, "_gdn_tree_graph_pools", None)
+        if pools is None:
+            pools = self._gdn_tree_graph_pools = {}
+        for groups in attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder(0)
+                if type(builder) is AscendGDNHostMetadataBuilder:
+                    builder.select_full_tree_inputs(full_row and builder.spec_tree_slots == tree_slots, pools)
+        self._gdn_tree_graph_groups = (attn_groups, full_row, tree_slots)
 
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the
@@ -548,6 +568,21 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import tree_state_slot_count
 
         tree_slots = tree_state_slot_count(self.vllm_config)
+        if (
+            tree_slots is not None
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and self.vllm_config.scheduler_config.max_num_seqs == 1
+            and not self.vllm_config.scheduler_config.async_scheduling
+            and not getattr(self.vllm_config.speculative_config, "enable_adaptive_verification", False)
+        ):
+            full_row = (
+                not use_pcp_padding
+                and (for_capture or cudagraph_mode == CUDAGraphMode.FULL)
+                and input_batch.num_reqs_after_padding == 1
+                and input_batch.num_tokens_after_padding == tree_slots
+                and (input_batch.num_reqs == 0 or (input_batch.num_reqs == 1 and input_batch.num_tokens == tree_slots))
+            )
+            self._select_gdn_tree_graph_inputs(attn_groups, full_row, tree_slots)
         target_query_len = tree_slots or self.vllm_config.num_speculative_tokens + 1
         is_prefilling_np = input_batch.is_prefilling_np[: input_batch.num_reqs]
         if input_batch.prefill_runs_as_decode_np is not None:
@@ -640,6 +675,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             ),
         )
         if model_specific_metadata.share_tree_metadata:
+            model_specific_metadata.tree_request_id = input_batch.req_ids[0]
             self._prepare_shared_gdn_tree(model_specific_metadata, attn_groups)
         # Varlen graphs capture evenly split dummy rows (possibly one token
         # each), but must allow the descriptor's full K+1 replay query bound.
@@ -856,4 +892,6 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
             metadata.tree_prev_path,
             metadata.tree_prev_num_sampled,
             conv_width,
+            request_id=metadata.tree_request_id,
+            use_fused_topology=not self.vllm_config.scheduler_config.async_scheduling,
         )

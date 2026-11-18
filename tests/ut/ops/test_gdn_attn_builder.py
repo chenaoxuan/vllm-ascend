@@ -2080,3 +2080,148 @@ def test_checkpoint_rows_match_non_spec_prefill_inputs(speculative):
     assert metadata.num_prefills == len(expected_rows)
     assert metadata.prefill_state_indices.numel() == len(expected_rows)
     assert metadata.prefill_query_start_loc.tolist() == expected_starts
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_full_tree_graph_refresh_and_reentry(monkeypatch, async_scheduling):
+    from vllm_ascend.worker.v2.spec_decode.tree import state_rollback
+    from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
+
+    slots = 33
+    device = torch.device("cpu")
+    monkeypatch.setattr(state_rollback, "tree_state_slot_count", lambda _: slots)
+    monkeypatch.setattr(state_rollback, "validate_tree_state_slots", lambda *_: None)
+    monkeypatch.setattr(ascend_gdn_attn_builder, "_tree_conv_width", lambda *_: 4)
+    builder = _make_builder(
+        device=device,
+        num_heads=32,
+        num_speculative_tokens=15,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+        builder_cls=AscendGDNHostMetadataBuilder,
+    )
+    builder.vllm_config.parallel_config.pipeline_parallel_size = 1
+    builder.vllm_config.scheduler_config.async_scheduling = async_scheduling
+    common = create_common_attn_metadata(BatchSpec([64], [slots]), 16, device)
+    positions = torch.arange(slots)
+    widths = torch.tensor([slots - 1], dtype=torch.int32)
+
+    def verify(step, request_id="A"):
+        pages = (positions.to(torch.int32) + 100 * step)[None, :]
+        common.block_table_tensor = pages
+        accepted = torch.tensor([step + 1], dtype=torch.int32)
+        parent_columns = (positions // (step + 1))[None, :]
+        windows = torch.full((slots, 4), step, dtype=torch.int32)
+        prefix = torch.full((1, 3), step + 1, dtype=torch.int32)
+        tree = SharedGDNTreeMetadata(slots, 4, parent_columns, windows, prefix, request_id=request_id)
+        meta = builder.build(0, common, accepted, widths, num_actual_reqs=1, shared_gdn_tree=tree)
+        spec = meta.spec_decode_metadata
+        chunk = spec.verify_plan.chunks[0]
+        assert torch.equal(chunk.state_indices, pages[0])
+        assert torch.equal(chunk.init_state_indices, pages.gather(1, parent_columns)[0])
+        assert torch.equal(chunk.token_indices, positions)
+        assert torch.equal(chunk.out_indices, positions)
+        assert chunk.cu_seqlens.tolist() == [0, slots]
+        assert torch.equal(spec.conv_window_rows, windows)
+        assert torch.equal(spec.conv_prefix_src, prefix)
+        assert torch.equal(meta.num_accepted_tokens, accepted)
+        return meta
+
+    first = verify(1)
+    assert verify(2) is first
+    decode = create_common_attn_metadata(BatchSpec([64], [1]), 16, device)
+    decode.block_table_tensor = common.block_table_tensor
+    builder.build(0, decode, torch.tensor([1]), torch.tensor([-1]), num_actual_reqs=1)
+    assert first.spec_decode_metadata.verify_plan.chunks[0].cu_seqlens.tolist() == [0, 0]
+    next_a = verify(3)
+    assert next_a is not first
+    first_b = verify(4, "B")
+    assert first_b is not next_a
+    assert verify(5, "B") is first_b
+    if async_scheduling:
+        assert verify(6, None) is not verify(7, None)
+
+    # Each of these shapes can overwrite buffers retained by a complete
+    # row. Re-enter with the same request ID so the test checks shape
+    # invalidation independently of the request-switch guard.
+    for length, history, drafts, actual_reqs in ((9, 64, 8, 1), (3, 3, -1, 1), (0, 8, -1, 0)):
+        before = verify(8)
+        batch = create_common_attn_metadata(BatchSpec([history], [length]), 16, device)
+        batch.block_table_tensor = common.block_table_tensor
+        builder.build(
+            0,
+            batch,
+            torch.ones(1, dtype=torch.int32),
+            torch.tensor([drafts], dtype=torch.int32),
+            num_actual_reqs=actual_reqs,
+            tree_parents=torch.zeros(1, slots - 1, dtype=torch.int32),
+            tree_num_nodes=torch.tensor([slots - 1], dtype=torch.int32),
+            prev_path_node_ids=torch.zeros(1, slots - 1, dtype=torch.int32),
+            prev_num_sampled=torch.ones(1, dtype=torch.int32),
+        )
+        assert builder._full_tree_metadata is None
+        assert verify(9) is not before
+
+
+def test_full_tree_graph_inputs_across_cache_groups(monkeypatch):
+    from vllm_ascend.worker.v2.spec_decode.tree import state_rollback
+    from vllm_ascend.worker.v2.spec_decode.tree.shared_metadata import SharedGDNTreeMetadata
+
+    slots = 33
+    device = torch.device("cpu")
+    monkeypatch.setattr(state_rollback, "tree_state_slot_count", lambda _: slots)
+    monkeypatch.setattr(state_rollback, "validate_tree_state_slots", lambda *_: None)
+    monkeypatch.setattr(ascend_gdn_attn_builder, "_tree_conv_width", lambda *_: 4)
+    pools = {}
+    builders = [
+        _make_builder(
+            device=device,
+            num_heads=32,
+            num_speculative_tokens=15,
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+            builder_cls=AscendGDNHostMetadataBuilder,
+        )
+        for _ in range(2)
+    ]
+    for builder in builders:
+        builder.vllm_config.parallel_config.pipeline_parallel_size = 1
+        builder.vllm_config.scheduler_config.async_scheduling = False
+        builder.select_full_tree_inputs(True, pools)
+    left, right = builders
+    assert left.spec_conv_window_rows is right.spec_conv_window_rows
+    assert left.spec_conv_prefix_src is right.spec_conv_prefix_src
+    assert left.num_accepted_tokens is right.num_accepted_tokens
+    assert left.spec_state_indices_tensor.data_ptr() != right.spec_state_indices_tensor.data_ptr()
+
+    starts = torch.arange(slots)
+    common = create_common_attn_metadata(BatchSpec([64], [slots]), 16, device)
+    for step in range(1, 4):
+        cols = (starts // (step + 1))[None, :]
+        window = torch.full((slots, 4), step, dtype=torch.int32)
+        prefix = torch.full((1, 3), step + 1, dtype=torch.int32)
+        tree = SharedGDNTreeMetadata(slots, 4, cols, window, prefix, request_id="test")
+        accepted = torch.tensor([step], dtype=torch.int32)
+        for group, builder in enumerate(builders):
+            pages = (starts.to(torch.int32) + 100 * step + 1000 * group)[None, :]
+            common.block_table_tensor = pages
+            meta = builder.build(
+                0, common, accepted, torch.tensor([slots - 1]), num_actual_reqs=1, shared_gdn_tree=tree
+            )
+            spec = meta.spec_decode_metadata
+            chunk = spec.verify_plan.chunks[0]
+            assert chunk.state_indices.data_ptr() == meta.spec_state_indices_tensor.data_ptr()
+            assert chunk.init_state_indices.data_ptr() == spec.init_state_indices.data_ptr()
+            assert torch.equal(chunk.state_indices, pages[0])
+            assert torch.equal(chunk.init_state_indices, pages.gather(1, cols)[0])
+            assert torch.equal(meta.num_accepted_tokens, accepted)
+            assert torch.equal(spec.conv_window_rows, window)
+            assert torch.equal(spec.conv_prefix_src, prefix)
+
+    # A different descriptor gets the original plan destinations. Reentry
+    # must recover the captured addresses and rebuild any discarded metadata.
+    captured = left.spec_verify_plan_buffers
+    left.select_full_tree_inputs(False, pools)
+    assert left._full_tree_metadata is None
+    assert left.spec_verify_plan_buffers.state_indices.data_ptr() != left.spec_state_indices_tensor.data_ptr()
+    assert left.num_accepted_tokens is not right.num_accepted_tokens
+    left.select_full_tree_inputs(True, pools)
+    assert left.spec_verify_plan_buffers is captured

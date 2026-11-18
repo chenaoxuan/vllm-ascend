@@ -17,6 +17,7 @@ class TreeCommitCoordinator:
         self.qwen_query_graphs = None
         self.stage_model_state = None
         state = runner.model_state
+        self._model_state = state
         if isinstance(state, AscendMambaHybridModelState):
             self.stage_model_state = state.stage_tree_acceptance
             state.tree_graph_stats = runner.speculator.tree_graph_stats
@@ -27,6 +28,11 @@ class TreeCommitCoordinator:
                 self.qwen_query_graphs = QwenTreeQueryGraphs(runner, stats=state.tree_graph_stats)
 
     def commit(self, idx_mapping, acceptance: TreeAcceptance, *, num_rejected=None) -> None:
+        state = getattr(self, "_model_state", None)
+        if state is not None:
+            callback = getattr(state, "commit_tree_recoverssm", None)
+            if callable(callback):
+                callback(acceptance)
         if self.stage_model_state is not None:
             if num_rejected is None:
                 raise ValueError("GDN tree commitment requires the verifier's rejected-token counts")

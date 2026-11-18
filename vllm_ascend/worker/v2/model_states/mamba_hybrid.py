@@ -795,6 +795,17 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
         self._tree_num_sampled = acceptance.num_sampled
         self._tree_is_tree_row = tree_row_mask(acceptance.num_sampled, num_rejected)
 
+    def commit_tree_recoverssm(self, acceptance: "TreeAcceptance") -> None:
+        # Commit replay records before advancing the cursor.
+        metadata = getattr(self, "attn_metadata", None)
+        values = metadata.values() if isinstance(metadata, dict) else (metadata,)
+        for attn in values:
+            spec = getattr(attn, "spec_decode_metadata", None)
+            if spec is None or not getattr(spec, "tree_recoverssm", False):
+                continue
+            for callback in tuple(getattr(spec, "tree_recover_committers", ()) or ()):
+                callback(acceptance)
+
     def _tree_buffers(self, device) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-request storage of the previous step's accepted draft path.
 

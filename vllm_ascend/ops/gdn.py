@@ -937,7 +937,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
-        # 2. Recurrent attention
+        # 2. Recurrent attention. Keep raw a/b for opt-in tree RecoverSSM.
+        tree_meta = attn_metadata.spec_decode_metadata if spec_sequence_masks is not None else None
+        tree_recover_enabled = bool(
+            tree_meta is not None
+            and getattr(tree_meta, "tree_recoverssm", False)
+            and getattr(tree_meta, "tree_state_pages", None) is not None
+            and getattr(tree_meta, "tree_parent_slots", None) is not None
+        )
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -963,6 +970,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
+            raw_query_spec = query_spec
+            raw_key_spec = key_spec
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
             use_upstream_recurrent = attn_metadata.spec_decode_metadata.use_upstream_recurrent or (
@@ -971,7 +980,60 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             init_state_indices = attn_metadata.spec_decode_metadata.init_state_indices
             verify_plan = attn_metadata.spec_decode_metadata.verify_plan
-            if verify_plan is not None:
+            if tree_recover_enabled:
+                from vllm_ascend.ops.triton.spec_decode.tree.recover_ssm import (
+                    tree_recoverssm_commit,
+                    tree_recoverssm_verify,
+                )
+                meta = attn_metadata.spec_decode_metadata
+                state_pages = meta.tree_state_pages
+                parent_slots = meta.tree_parent_slots
+                root_pages = meta.tree_root_state_indices
+                query_start_loc = meta.tree_query_start_loc
+                rows, slots = state_pages.shape
+                hv, dv, dk = value_spec.shape[2], value_spec.shape[3], key_spec.shape[3]
+                replay = getattr(self, "_tree_recover_replay_cache", None)
+                if replay is None or tuple(replay.shape) != (rows, hv, slots, dv + dk + 1):
+                    replay = torch.zeros(
+                        (rows, hv, slots, dv + dk + 1),
+                        dtype=torch.float32,
+                        device=ssm_state.device,
+                    )
+                    self._tree_recover_replay_cache = replay
+                if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+                    raw_a_spec, raw_b_spec = a, b
+                else:
+                    raw_a_spec = a.index_select(1, spec_token_indx)
+                    raw_b_spec = b.index_select(1, spec_token_indx)
+                core_attn_out_spec = tree_recoverssm_verify(
+                    self.A_log,
+                    raw_a_spec,
+                    raw_b_spec,
+                    self.dt_bias,
+                    raw_query_spec.squeeze(0),
+                    raw_key_spec.squeeze(0),
+                    value_spec.squeeze(0),
+                    checkpoint_state=ssm_state,
+                    replay_cache=replay,
+                    query_start_loc=query_start_loc,
+                    root_state_indices=root_pages,
+                    parent_slots=parent_slots,
+                    scale=key_spec.shape[-1] ** -0.5,
+                    use_qk_l2norm_in_kernel=True,
+                ).unsqueeze(0)
+                meta.tree_replay_cache = replay
+                if meta.tree_recover_committers is not None:
+                    meta.tree_recover_committers.append(
+                        lambda acceptance, _meta=meta, _replay=replay, _state=ssm_state: tree_recoverssm_commit(
+                            checkpoint_state=_state,
+                            replay_cache=_replay,
+                            state_pages=_meta.tree_state_pages,
+                            path_node_ids=acceptance.path_node_ids,
+                            accepted_records=acceptance.num_sampled.to(torch.int32),
+                            tree_rows=_meta.tree_row_mask,
+                        )
+                    )
+            elif verify_plan is not None:
                 core_attn_out_spec = _chunked_tree_verify(
                     query_spec,
                     key_spec,

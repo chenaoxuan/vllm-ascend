@@ -295,6 +295,14 @@ class GDNSpecDecodeMetadata:
     conv_prefix_src: torch.Tensor | None = None
     # Draft-tree only: chunked verify for trees wider than one kernel call.
     verify_plan: "TreeVerifyPlan | None" = None
+    tree_recoverssm: bool = False
+    tree_state_pages: torch.Tensor | None = None
+    tree_root_state_indices: torch.Tensor | None = None
+    tree_parent_slots: torch.Tensor | None = None
+    tree_query_start_loc: torch.Tensor | None = None
+    tree_row_mask: torch.Tensor | None = None
+    tree_replay_cache: torch.Tensor | None = None
+    tree_recover_committers: list | None = None
 
 
 def _build_actual_seq_lengths(
@@ -512,6 +520,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        from vllm_ascend.ascend_config import get_ascend_config
+        self.tree_recoverssm = bool(getattr(get_ascend_config().tree_spec_config, "gdn_ssm_enabled", False))
         context = getattr(vllm_config.compilation_config, "static_forward_context", {}) or {}
         self._ascend_gdn_checkpoints = (
             bool(layer_names)
@@ -987,6 +997,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         conv_window_rows: torch.Tensor | None = None,
         conv_prefix_src: torch.Tensor | None = None,
         shared_gdn_tree: "SharedGDNTreeMetadata | None" = None,
+        tree_state_pages: torch.Tensor | None = None,
+        tree_parent_slots: torch.Tensor | None = None,
+        tree_root_state_indices: torch.Tensor | None = None,
+        tree_row_mask: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         attn_metadata.spec_decode_metadata = None
         if attn_metadata.spec_sequence_masks is None:
@@ -1070,6 +1084,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=conv_window_rows,
             conv_prefix_src=conv_prefix_src,
             verify_plan=verify_plan,
+            tree_recoverssm=bool(tree_state_pages is not None and self.tree_recoverssm),
+            tree_state_pages=tree_state_pages,
+            tree_root_state_indices=tree_root_state_indices,
+            tree_parent_slots=tree_parent_slots,
+            tree_query_start_loc=(
+                attn_metadata.spec_query_start_loc if tree_state_pages is not None else None
+            ),
+            tree_row_mask=tree_row_mask,
+            tree_replay_cache=None,
+            tree_recover_committers=[] if tree_state_pages is not None else None,
         )
         return attn_metadata
 
@@ -1492,6 +1516,30 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     0,
                     spec_sequence_indices,
                 )
+            tree_recover_state_pages = None
+            tree_recover_parent_slots = None
+            tree_recover_root_pages = None
+            tree_recover_rows = None
+            if self.spec_tree_slots is not None and spec_state_indices_tensor is not None:
+                if spec_state_indices_tensor.ndim == 2 and tree_parents is not None and tree_num_nodes is not None:
+                    tree_recover_state_pages = spec_state_indices_tensor
+                    selected_parents = torch.index_select(tree_parents, 0, spec_sequence_indices)
+                    selected_nodes = torch.index_select(tree_num_nodes, 0, spec_sequence_indices)
+                    tree_recover_parent_slots = torch.full(
+                        (selected_parents.shape[0], self.spec_tree_slots),
+                        -1, dtype=torch.int32, device=selected_parents.device,
+                    )
+                    tree_recover_parent_slots[:, 1:] = selected_parents[:, : self.spec_tree_slots - 1].to(torch.int32)
+                    chain = torch.arange(
+                        self.spec_tree_slots - 1, device=selected_parents.device, dtype=torch.int32
+                    ).unsqueeze(0).expand_as(tree_recover_parent_slots[:, 1:])
+                    tree_recover_parent_slots[:, 1:] = torch.where(
+                        selected_nodes[:, None] > 0,
+                        tree_recover_parent_slots[:, 1:],
+                        chain,
+                    )
+                    tree_recover_root_pages = tree_recover_state_pages[:, 0].contiguous()
+                    tree_recover_rows = (selected_nodes > 0).to(torch.bool)
             if self.spec_tree_slots is not None:
                 # Tokens each speculative request verifies; a row may be shorter
                 # than the tree width, see _build_tree_init_state_indices.
@@ -1687,6 +1735,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=spec_conv_window_rows,
             conv_prefix_src=spec_conv_prefix_src,
             shared_gdn_tree=shared_gdn_tree,
+            tree_state_pages=locals().get("tree_recover_state_pages"),
+            tree_parent_slots=locals().get("tree_recover_parent_slots"),
+            tree_root_state_indices=locals().get("tree_recover_root_pages"),
+            tree_row_mask=locals().get("tree_recover_rows"),
         )
         self._attach_non_spec_decode_metadata(attn_metadata, non_spec_conv1d_cache_indices)
         return self._finalize_metadata(attn_metadata)

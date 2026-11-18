@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -295,6 +295,14 @@ class GDNSpecDecodeMetadata:
     conv_prefix_src: torch.Tensor | None = None
     # Draft-tree only: chunked verify for trees wider than one kernel call.
     verify_plan: "TreeVerifyPlan | None" = None
+    tree_recoverssm: bool = False
+    tree_state_pages: torch.Tensor | None = None
+    tree_root_state_indices: torch.Tensor | None = None
+    tree_parent_slots: torch.Tensor | None = None
+    tree_query_start_loc: torch.Tensor | None = None
+    tree_row_mask: torch.Tensor | None = None
+    tree_replay_cache: torch.Tensor | None = None
+    tree_recover_committers: list | None = None
 
 
 def _build_actual_seq_lengths(
@@ -512,6 +520,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        from vllm_ascend.ascend_config import get_ascend_config
+        self.tree_recoverssm = bool(getattr(get_ascend_config().tree_spec_config, "gdn_ssm_enabled", False))
         context = getattr(vllm_config.compilation_config, "static_forward_context", {}) or {}
         self._ascend_gdn_checkpoints = (
             bool(layer_names)
@@ -987,6 +997,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         conv_window_rows: torch.Tensor | None = None,
         conv_prefix_src: torch.Tensor | None = None,
         shared_gdn_tree: "SharedGDNTreeMetadata | None" = None,
+        tree_state_pages: torch.Tensor | None = None,
+        tree_parent_slots: torch.Tensor | None = None,
+        tree_root_state_indices: torch.Tensor | None = None,
+        tree_row_mask: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         attn_metadata.spec_decode_metadata = None
         if attn_metadata.spec_sequence_masks is None:
@@ -1070,6 +1084,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=conv_window_rows,
             conv_prefix_src=conv_prefix_src,
             verify_plan=verify_plan,
+            tree_recoverssm=bool(tree_state_pages is not None and self.tree_recoverssm),
+            tree_state_pages=tree_state_pages,
+            tree_root_state_indices=tree_root_state_indices,
+            tree_parent_slots=tree_parent_slots,
+            tree_query_start_loc=(
+                attn_metadata.spec_query_start_loc if tree_state_pages is not None else None
+            ),
+            tree_row_mask=tree_row_mask,
+            tree_replay_cache=None,
+            tree_recover_committers=[] if tree_state_pages is not None else None,
         )
         return attn_metadata
 
@@ -1492,6 +1516,30 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     0,
                     spec_sequence_indices,
                 )
+            tree_recover_state_pages = None
+            tree_recover_parent_slots = None
+            tree_recover_root_pages = None
+            tree_recover_rows = None
+            if self.spec_tree_slots is not None and spec_state_indices_tensor is not None:
+                if spec_state_indices_tensor.ndim == 2 and tree_parents is not None and tree_num_nodes is not None:
+                    tree_recover_state_pages = spec_state_indices_tensor
+                    selected_parents = torch.index_select(tree_parents, 0, spec_sequence_indices)
+                    selected_nodes = torch.index_select(tree_num_nodes, 0, spec_sequence_indices)
+                    tree_recover_parent_slots = torch.full(
+                        (selected_parents.shape[0], self.spec_tree_slots),
+                        -1, dtype=torch.int32, device=selected_parents.device,
+                    )
+                    tree_recover_parent_slots[:, 1:] = selected_parents[:, : self.spec_tree_slots - 1].to(torch.int32)
+                    chain = torch.arange(
+                        self.spec_tree_slots - 1, device=selected_parents.device, dtype=torch.int32
+                    ).unsqueeze(0).expand_as(tree_recover_parent_slots[:, 1:])
+                    tree_recover_parent_slots[:, 1:] = torch.where(
+                        selected_nodes[:, None] > 0,
+                        tree_recover_parent_slots[:, 1:],
+                        chain,
+                    )
+                    tree_recover_root_pages = tree_recover_state_pages[:, 0].contiguous()
+                    tree_recover_rows = (selected_nodes > 0).to(torch.bool)
             if self.spec_tree_slots is not None:
                 # Tokens each speculative request verifies; a row may be shorter
                 # than the tree width, see _build_tree_init_state_indices.
@@ -1687,6 +1735,10 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=spec_conv_window_rows,
             conv_prefix_src=spec_conv_prefix_src,
             shared_gdn_tree=shared_gdn_tree,
+            tree_state_pages=locals().get("tree_recover_state_pages"),
+            tree_parent_slots=locals().get("tree_recover_parent_slots"),
+            tree_root_state_indices=locals().get("tree_recover_root_pages"),
+            tree_row_mask=locals().get("tree_recover_rows"),
         )
         self._attach_non_spec_decode_metadata(attn_metadata, non_spec_conv1d_cache_indices)
         return self._finalize_metadata(attn_metadata)
@@ -1760,6 +1812,10 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         device: torch.device,
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._full_tree_metadata: GDNAttentionMetadata | None = None
+        self._full_tree_request_id: str | None = None
+        self._using_full_tree_inputs = False
+        self._tree_input_layouts = None
         self._conv_layer_name = layer_names[0] if layer_names else None
         self._spec_conv_indices: torch.Tensor | None = None
         self._non_spec_conv_indices: torch.Tensor | None = None
@@ -1966,6 +2022,140 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
         self._attach_non_spec_decode_metadata(metadata, non_spec_states, non_spec_lengths)
         return self._finalize_metadata(metadata, fused=True)
 
+    def _can_reuse_full_tree_metadata(
+        self,
+        common: CommonAttentionMetadata,
+        tree: "SharedGDNTreeMetadata",
+        num_accepted_tokens: torch.Tensor | None,
+        draft_widths_cpu: torch.Tensor | None,
+        num_actual_reqs: int | None,
+    ) -> bool:
+        # The producer supplies shared topology only for a complete BS1 FULL
+        # decode. Other users of build(), including capture, may call it directly.
+        return (
+            self.use_full_cuda_graph
+            and self.use_spec_decode
+            and self.vllm_config.parallel_config.pipeline_parallel_size == 1
+            and (not self.vllm_config.scheduler_config.async_scheduling or tree.request_id is not None)
+            and not getattr(self.speculative_config, "enable_adaptive_verification", False)
+            and not getattr(common, "for_cudagraph_capture", False)
+            and getattr(common, "pcp_context", None) is None
+            and self.spec_tree_slots == tree.slots
+            and self.spec_conv_width == tree.conv_width
+            and num_actual_reqs == common.num_reqs == 1
+            and common.num_actual_tokens == common.max_query_len == tree.slots
+            and common.query_start_loc_cpu.shape == (2,)
+            and tuple(common.query_start_loc_cpu.numpy()) == (0, tree.slots)
+            and draft_widths_cpu is not None
+            and draft_widths_cpu.device.type == "cpu"
+            and draft_widths_cpu.shape == (1,)
+            and int(draft_widths_cpu.numpy()[0]) == tree.slots - 1
+            and num_accepted_tokens is not None
+            and num_accepted_tokens.shape == (1,)
+            and common.block_table_tensor.shape[0] == common.seq_lens.shape[0] == 1
+        )
+
+    def select_full_tree_inputs(self, active: bool, common_buffers: dict) -> None:
+        """Bind stable destinations before capture or replay of the uniform BS1 descriptor."""
+        if self._using_full_tree_inputs == active or self.spec_verify_plan_buffers is None:
+            return
+        if self._tree_input_layouts is None:
+            original = (
+                self.num_accepted_tokens,
+                self.spec_conv_prefix_src,
+                self.spec_conv_window_rows,
+                self.spec_verify_plan_buffers,
+            )
+            if any(t is None for t in original) or self.spec_init_state_indices is None:
+                return
+            if self.spec_verify_plan_buffers.state_indices.shape[0] != 1:
+                return
+            key = (
+                self.spec_tree_slots,
+                self.spec_conv_width,
+                tuple((t.shape, t.stride(), t.device, t.dtype) for t in original[:3]),
+            )
+            if key not in common_buffers:
+                common_buffers[key] = tuple(torch.empty_like(t) for t in original[:3])
+            # One complete row already has the chunk's exact packed token order.
+            # Every group keeps its own two physical page tables.
+            plan = replace(
+                self.spec_verify_plan_buffers,
+                state_indices=self.spec_state_indices_tensor[:1],
+                init_state_indices=self.spec_init_state_indices[:1],
+            )
+            self._tree_input_layouts = original, (*common_buffers[key], plan)
+        (
+            self.num_accepted_tokens,
+            self.spec_conv_prefix_src,
+            self.spec_conv_window_rows,
+            self.spec_verify_plan_buffers,
+        ) = self._tree_input_layouts[int(active)]
+        self._using_full_tree_inputs = active
+        self._spec_verify_plan_views = None
+        self._full_tree_metadata = None
+
+    def try_refresh_tree_group(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tree: "SharedGDNTreeMetadata",
+        accepted: torch.Tensor,
+    ) -> GDNAttentionMetadata | None:
+        """Refresh this group's warm descriptor for a prevalidated full row."""
+        if (
+            self._full_tree_metadata is None
+            or not self._using_full_tree_inputs
+            or self._full_tree_request_id != tree.request_id
+            or self.spec_tree_slots != tree.slots
+            or self.spec_conv_width != tree.conv_width
+            or block_table.shape[0] != 1
+            or seq_lens.shape[0] != 1
+        ):
+            return None
+        return self._refresh_full_tree_metadata(self._full_tree_metadata, block_table, seq_lens, tree, accepted)
+
+    def _refresh_full_tree_metadata(
+        self,
+        metadata: GDNAttentionMetadata,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tree: "SharedGDNTreeMetadata",
+        accepted: torch.Tensor,
+    ) -> GDNAttentionMetadata:
+        # All shape-only fields are still valid in the builder's capture
+        # buffers. Refresh every data-dependent field from this group's pages.
+        spec = metadata.spec_decode_metadata
+        table = mamba_get_block_table_tensor(
+            block_table,
+            seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        pool = id(self.num_accepted_tokens)
+        if not self._using_full_tree_inputs or pool not in tree._written_graph_inputs:
+            metadata.num_accepted_tokens.copy_(accepted)
+            spec.conv_window_rows.copy_(tree.conv_window_rows)
+            spec.conv_prefix_src.copy_(tree.conv_prefix_src)
+            if self._using_full_tree_inputs:
+                tree._written_graph_inputs.add(pool)
+        spec.spec_causal_conv1d.cache_indices = metadata.spec_state_indices_tensor
+        if (
+            self._using_full_tree_inputs
+            and tree.page_batch is not None
+            and tree.page_batch.add(tree.init_state_columns, table, self, metadata)
+        ):
+            return metadata
+        pages = table[:1, : tree.slots]
+        init_pages = tree.bind_init_state_indices(pages)
+        metadata.spec_state_indices_tensor.copy_(pages)
+        spec.init_state_indices.copy_(init_pages)
+        if not self._using_full_tree_inputs:
+            chunk = spec.verify_plan.chunks[0]
+            chunk.state_indices.copy_(pages[0])
+            chunk.init_state_indices.copy_(init_pages[0])
+        return self._finalize_metadata(metadata)
+
     def build(
         self,
         common_prefix_len: int,
@@ -1982,6 +2172,31 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
     ) -> GDNAttentionMetadata:
         self._ensure_conv_index_buffers()
         self._ensure_conv_output_buffer()
+        complete = (
+            common_prefix_len == 0
+            and shared_gdn_tree is not None
+            and self._can_reuse_full_tree_metadata(
+                common_attn_metadata, shared_gdn_tree, num_accepted_tokens, num_decode_draft_tokens_cpu, num_actual_reqs
+            )
+        )
+        # Worker dispatch enqueues the previous target, tree publication and
+        # these dynamic writes in order on the same compute stream, including
+        # when the scheduler has already queued the next 33-slot descriptor.
+        if (
+            complete
+            and self._full_tree_metadata is not None
+            and self._full_tree_request_id == shared_gdn_tree.request_id
+        ):
+            return self._refresh_full_tree_metadata(
+                self._full_tree_metadata,
+                common_attn_metadata.block_table_tensor,
+                common_attn_metadata.seq_lens,
+                shared_gdn_tree,
+                num_accepted_tokens,
+            )
+        # A prefill, idle row or another graph shape can overwrite the same
+        # stable buffers. Reinitialize them on the next complete verify.
+        self._full_tree_metadata = None
         metadata = super().build(
             common_prefix_len,
             common_attn_metadata,
@@ -1996,6 +2211,22 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
             shared_gdn_tree=shared_gdn_tree,
         )
         metadata.pcp_context = getattr(common_attn_metadata, "pcp_context", None)
+        if complete and metadata.spec_decode_metadata is not None:
+            spec = metadata.spec_decode_metadata
+            plan = spec.verify_plan
+            if (
+                metadata.num_spec_decodes == 1
+                and metadata.num_prefills == metadata.num_decodes == 0
+                and metadata.spec_state_indices_tensor.shape == (1, shared_gdn_tree.slots)
+                and spec.init_state_indices is not None
+                and spec.conv_window_rows is not None
+                and spec.conv_prefix_src is not None
+                and plan is not None
+                and plan.rows == plan.num_chunks == 1
+                and plan.slots == plan.width == shared_gdn_tree.slots
+            ):
+                self._full_tree_metadata = metadata
+                self._full_tree_request_id = shared_gdn_tree.request_id
         return metadata
 
     def _finalize_metadata(self, metadata: GDNAttentionMetadata, fused: bool = False) -> GDNAttentionMetadata:

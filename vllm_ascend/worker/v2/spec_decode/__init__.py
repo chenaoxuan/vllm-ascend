@@ -78,6 +78,13 @@ def init_speculator(
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
         if dflash_tree_spec_enabled(vllm_config):
+            tree_cfg = __import__("vllm_ascend.ascend_config", fromlist=["get_ascend_config"]).get_ascend_config().tree_spec_config
+            if getattr(tree_cfg, "gdn_ssm_enabled", False):
+                from vllm_ascend.worker.v2.spec_decode.tree.gdn_ssm_speculator import (
+                    AscendGdnSsmTreeSpeculator,
+                )
+
+                return AscendGdnSsmTreeSpeculator(vllm_config, device)
             from vllm_ascend.worker.v2.spec_decode.tree.speculator import (
                 AscendTreeSpeculator,
             )

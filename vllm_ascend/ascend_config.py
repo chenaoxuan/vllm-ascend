@@ -607,7 +607,8 @@ class AscendConfig:
                 "topk": null,
                 "candidate_size": 64,
                 "depth_penalty": null,
-                "keep_origin_chain": false
+                "keep_origin_chain": false,
+                "gdn_ssm_enabled": false
             },
             "sparse_kv_offload_config": {
                 "enabled": false,
@@ -1457,6 +1458,8 @@ class TreeSpecConfig:
     candidate_size: int | None = 64
     depth_penalty: float | None = None
     keep_origin_chain: bool = False
+    # Opt-in adapter for the GDN/SSM tree path. The original tree path stays unchanged.
+    gdn_ssm_enabled: bool = False
 
     @model_validator(mode="before")
     @classmethod

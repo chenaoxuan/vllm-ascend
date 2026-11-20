@@ -269,12 +269,11 @@ def _widen_mamba_spec_for_tree(spec: MambaSpec, vllm_config: VllmConfig) -> Mamb
     conv_dim = max(conv_shape)
     expected_columns = width - 1 + slots
     conv_shape = (conv_dim, expected_columns) if is_conv_state_dim_first() else (expected_columns, conv_dim)
-    expanded_page_size = spec.page_size_padded + extra_columns * conv_dim * get_dtype_size(spec.dtypes[0])
-    return replace(
-        spec,
-        shapes=(conv_shape, *spec.shapes[1:]),
-        page_size_padded=_align_tree_mamba_page_size(expanded_page_size, spec, vllm_config),
-    )
+    expanded = replace(spec, shapes=(conv_shape, *spec.shapes[1:]), page_size_padded=None)
+    # New conv columns can occupy padding already reserved for shared attention
+    # pages. Charge only the bytes beyond that floor, then align the block stride.
+    page_size = max(spec.page_size_bytes, expanded.page_size_bytes)
+    return replace(expanded, page_size_padded=_align_tree_mamba_page_size(page_size, expanded, vllm_config))
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:

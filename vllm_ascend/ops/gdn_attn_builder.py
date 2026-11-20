@@ -583,8 +583,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         ``GDNAttentionMetadataBuilder.__init__`` sizes every spec-sized buffer
         with ``1 + num_speculative_tokens``, the number of queries of a linear
         draft chain, but a draft tree verifies ``1 + budget`` tokens per request
-        (``tree_spec_config.budget >= num_speculative_tokens``) and caches one
-        state per node. ``MambaSpec`` is widened to the same width by
+        and caches one state per node. ``MambaSpec`` is widened as needed by
         ``attn_utils.get_kv_cache_spec``. The tensors allocated below mirror the
         upstream constructor and have to stay in sync with it.
         """

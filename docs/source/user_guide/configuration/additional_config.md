@@ -369,12 +369,30 @@ Small prefix match units can increase checkpoint traffic.
 
 Validate correctness, quality and performance on the deployment hardware before deploying in production.
 
-## DFlash2 MegaTree v0.1
+## DFlash2 MegaTree
 
 Set `additional_config.tree_spec_config.use_mega_tree` to `true` to enable
-best-first construction on a single-request DFlash2 tree with draft depth 15,
-candidate size 64, budget 32 or 48, zero depth penalty and no forced origin
-chain. Other shapes and policies keep the existing builder. The default is
-`false`. MegaTree normalizes over all 64 candidates and searches the best
-prefixes up to the budget, independently of the ordinary beam's `topk`.
-Its node ordering and generated sequences can differ from ordinary Tree.
+MegaTree for DFlash2. It fuses codebook gathering and operand preparation,
+normalizes scores over all 64 candidates, and uses a best-first cursor search
+to select the configured number of non-root nodes independently of the beam's
+`topk`.
+
+Set `tree_spec_config.budget` to any integer from 1 through 128. Each
+request gets that many nodes. For example, budget 48 gives the target 49
+query rows including the root. The draft still predicts 15 steps at budgets
+below, equal to, and above 15. The longest accepted draft path is bounded by
+both the draft depth and the budget.
+If `keep_origin_chain` is enabled, the budget must accommodate every step
+of that chain. A smaller budget raises a configuration error at startup.
+
+Asynchronous scheduling reserves one placeholder per proposed tree node. The
+draft forward keeps its own query width. When reusing an explicit graph size
+list, the platform adds the target and draft sizes within the configured
+capture and scheduler limits. With debug logging enabled, the worker reports
+the actual builder, draft depth, candidate count and budget.
+
+The kernel supports draft depth 15, candidate size 64, BF16 hidden states,
+contiguous rank-256 BF16 codebooks, zero depth penalty and no forced origin
+chain. Other shapes and policies use the ordinary DFlash2 beam builder.
+MegaTree defaults to `false`. Node ordering and generated sequences can differ
+between the two builders.

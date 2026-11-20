@@ -26,8 +26,8 @@ class TreeShape:
     topk: int
 
     def __post_init__(self) -> None:
-        if self.depth < 1 or self.budget < self.depth or self.topk < 1:
-            raise ValueError("Tree dimensions require depth >= 1, budget >= depth and topk >= 1")
+        if min(self.depth, self.budget, self.topk) < 1:
+            raise ValueError("Tree depth, budget and topk must be positive")
 
     @property
     def target_query_len(self) -> int:

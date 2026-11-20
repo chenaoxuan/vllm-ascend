@@ -606,6 +606,7 @@ class AscendConfig:
                 "budget": null,
                 "topk": null,
                 "candidate_size": 64,
+                "use_mega_tree": false,
                 "depth_penalty": null,
                 "keep_origin_chain": false
             },
@@ -1459,6 +1460,11 @@ class TreeSpecConfig:
     depth_penalty: float | None = None
     keep_origin_chain: bool = False
 
+    @property
+    def uses_branching(self) -> bool:
+        """MegaTree can select siblings even when the ordinary beam width is one."""
+        return self.use_mega_tree or (self.topk or 0) > 1
+
     @model_validator(mode="before")
     @classmethod
     def _reject_removed_options(cls, value):
@@ -1490,8 +1496,11 @@ class TreeSpecConfig:
             return
         if not (spec.use_dspark() or spec.use_dflash()):
             raise ValueError("Tree speculation requires a DSpark or DFlash draft model")
-        if self.budget < spec.num_speculative_tokens:
-            raise ValueError("tree_spec_config.budget must be >= num_speculative_tokens")
+        if self.keep_origin_chain and self.budget < spec.num_speculative_tokens:
+            raise ValueError(
+                f"keep_origin_chain requires budget >= num_speculative_tokens "
+                f"(got budget={self.budget}, num_speculative_tokens={spec.num_speculative_tokens})"
+            )
 
 
 @config

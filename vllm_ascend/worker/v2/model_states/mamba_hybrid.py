@@ -644,11 +644,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             path_buffer, num_sampled_buffer = self._tree_buffers(
                 self.num_accepted_tokens_gpu.device,
             )
-            tree_prev_path = torch.zeros(
-                (num_reqs, tree_slots - 1),
-                dtype=torch.int32,
-                device=path_buffer.device,
-            )
+            tree_prev_path = path_buffer.new_zeros((num_reqs, path_buffer.shape[1]))
             tree_prev_path[: input_batch.num_reqs] = path_buffer[input_batch.idx_mapping]
             tree_prev_num_sampled = torch.zeros(
                 (num_reqs,),
@@ -798,12 +794,8 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
     def _tree_buffers(self, device) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-request storage of the previous step's accepted draft path.
 
-        The buffers are sized by the tree width (``budget``, the widest path the
-        sampler can hand over) so that they survive the step: the sampler's
-        narrower path is copied into their leading columns by
-        ``postprocess_state``. Sizing them by that narrower path instead would
-        re-create (and zero) them on every step, which silently disables the
-        short-conv re-anchor.
+        Keep a stable row wide enough for the sampler's padded draft-depth
+        path and for the tree topology workspace, whichever is larger.
         """
         # Imported here to keep the model state import graph flat.
         from vllm_ascend.worker.v2.spec_decode.tree.state_rollback import (
@@ -812,7 +804,7 @@ class AscendTreeMambaHybridModelState(AscendMambaHybridModelState):
 
         slots = tree_state_slot_count(self.vllm_config)
         assert slots is not None, "draft-tree buffers need an active tree_spec_config"
-        path_width = slots - 1
+        path_width = max(slots - 1, self.vllm_config.speculative_config.num_speculative_tokens)
         # Per-request storage: ``idx_mapping`` values address the request slots
         # of the persistent spec-decode state.
         num_reqs = self.num_accepted_tokens_gpu.shape[0]

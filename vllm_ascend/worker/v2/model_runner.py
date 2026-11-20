@@ -1102,14 +1102,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         tree_depths = self.req_states.tree_depths if dflash_tree_spec_enabled(self.vllm_config) else None
-        # topk>1 packed tree: RoPE from depth, KV from unique slot_positions.
-        # Tree nodes use logical depth positions; linear positions make siblings
-        # look like a chain and tanks acceptance. topk=1 stays linear.
-        use_tree_pos = (
-            tree_depths is not None
-            and self.ascend_config.tree_spec_config.topk is not None
-            and self.ascend_config.tree_spec_config.topk > 1
-        )
+        # Siblings share a logical RoPE depth but need distinct KV slots.
+        use_tree_pos = tree_depths is not None and self.ascend_config.tree_spec_config.uses_branching
         # one fused triton launch replacing expand_idx_mapping +
         # prepare_tree_spec_pos_seq_lens + combine_sampled_and_draft_tokens
         # (plus the is_prefilling H2D) for decode-only tree-spec steps,

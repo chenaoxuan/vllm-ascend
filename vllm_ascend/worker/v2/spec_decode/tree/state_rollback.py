@@ -429,7 +429,7 @@ def compute_tree_prefix_source(
     chain op already left the history its root continues from.
 
     Args:
-        path_node_ids: ``[R, budget]`` accepted draft nodes of the tree walk.
+        path_node_ids: ``[R, path_capacity]`` accepted node IDs in depth order.
         num_sampled: ``[R]`` accepted token count including the resample.
         width: short-conv kernel width.
 

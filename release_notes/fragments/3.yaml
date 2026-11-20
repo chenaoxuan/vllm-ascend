@@ -1,5 +1,5 @@
 pr: 3
 entries:
   - category: performance
-    text: Added opt-in MegaTree v0.1 construction for single-request DFlash2 Tree decoding on Ascend.
+    text: Added opt-in MegaTree construction with fused scoring and cursor search for DFlash2 Tree decoding with configurable budgets of 1 to 128 nodes per request on Ascend.
     hardware: [A2]

@@ -102,12 +102,9 @@ class AscendTreeSpeculator(AscendDFlashSpeculator):
             dtype=self.dtype,
             device=device,
         )
-        if self.budget < self.num_speculative_steps:
-            raise ValueError(
-                "tree_spec_config.budget must be >= num_speculative_tokens "
-                f"({self.num_speculative_steps}), got {self.budget}"
-            )
-        if self.budget > self.draft_tokens.shape[1]:
+        # The draft forward still projects every depth. Its published tokens
+        # have exactly B columns, including when B is smaller than that depth.
+        if self.budget != self.draft_tokens.shape[1]:
             self.draft_tokens = torch.zeros(
                 self.max_num_reqs,
                 self.budget,

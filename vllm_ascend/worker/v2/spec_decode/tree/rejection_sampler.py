@@ -136,9 +136,10 @@ class TreeRejectionSampler(RejectionSampler):
         draft_logits: torch.Tensor | None = None,
         invalid_drafts: torch.Tensor | None = None,
     ) -> SamplerOutput:
-        # GDN's snapshot convolution needs the accepted path even for a
-        # single-branch tree. Other topk=1 paths keep upstream chain sampling.
-        if get_ascend_config().tree_spec_config.topk <= 1 and not self.preserve_tree_path:
+        # A truncated chain has fewer verifier rows than upstream's full-depth
+        # sampler expects. GDN also needs explicit path IDs for its snapshots.
+        config = get_ascend_config().tree_spec_config
+        if not config.uses_branching and config.budget >= self.num_speculative_steps and not self.preserve_tree_path:
             self.acceptance = None
             self.path_node_ids = None
             input_batch.path_node_ids = None

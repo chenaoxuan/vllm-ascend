@@ -444,6 +444,31 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults."""
+        from vllm.config.compilation import CUDAGraphMode
+
+        from vllm_ascend.worker.v2.spec_decode.tree.shape import TreeShape
+
+        compilation = vllm_config.compilation_config
+        tree = (getattr(vllm_config, "additional_config", None) or {}).get("tree_spec_config") or {}
+        if (
+            tree.get("enabled")
+            and tree.get("use_mega_tree")
+            and compilation.cudagraph_capture_sizes
+            and compilation.cudagraph_mode != CUDAGraphMode.NONE
+            and vllm_config.speculative_config is not None
+        ):
+            # The target verifies B+1 rows and the parallel draft runs D+1.
+            # Keep both gears when a deployment reuses its previous size list.
+            # An explicitly configured ceiling and the scheduler limit still apply.
+            limit = vllm_config.scheduler_config.max_num_batched_tokens
+            if compilation.max_cudagraph_capture_size is not None:
+                limit = min(limit, compilation.max_cudagraph_capture_size)
+            shape = TreeShape.from_config(vllm_config)
+            assert shape is not None
+            widths = (shape.target_query_len, shape.depth + 1)
+            compilation.cudagraph_capture_sizes = sorted(
+                set(compilation.cudagraph_capture_sizes).union(w for w in widths if w <= limit)
+            )
 
         # TODO: Remove this memory-saving capture-size override and its ceiling
         # restoration once MC2 is no longer used.
@@ -1963,9 +1988,9 @@ def _get_reduced_cg_cap(vllm_config: VllmConfig) -> int | None:
         # Platform defaults precede AscendConfig initialization. Shape resolution
         # reads this VllmConfig directly, so capture and runtime use one rule.
         tree_shape = TreeShape.from_config(vllm_config)
-        decode_query_len = (
-            tree_shape.target_query_len if tree_shape is not None else 1 + speculative_config.num_speculative_tokens
-        )
+        decode_query_len = 1 + speculative_config.num_speculative_tokens
+        if tree_shape is not None:
+            decode_query_len = max(decode_query_len, tree_shape.target_query_len)
 
     return min(max_num_seqs * decode_query_len, 512)
 

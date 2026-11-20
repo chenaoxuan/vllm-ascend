@@ -264,17 +264,16 @@ def create_tree_builder(
         if correction_scorer is not None:
             scorer = DominoScorer(correction_scorer, prefix_len, candidate_size)
         elif draft_model is not None and hasattr(getattr(draft_model, "model", draft_model), "candidate_selector"):
-            # The DFlash2 beam keeps a wider pool than its next frontier.
-            # Import here because its subclass reuses TreeBuilder workspaces.
-            from vllm_ascend.worker.v2.spec_decode.tree.dflash2_builder import DFlash2BeamTreeBuilder
-
             shortlist_size = topk if candidate_size is None else candidate_size
             scorer = DFlash2Scorer(draft_model, shortlist_size)
+            # These builders inherit TreeBuilder, so import them at model load.
             if use_mega_tree:
                 from vllm_ascend.worker.v2.spec_decode.tree.mega_tree_builder import MegaTreeBuilder
 
                 builder_type = MegaTreeBuilder
             else:
+                from vllm_ascend.worker.v2.spec_decode.tree.dflash2_builder import DFlash2BeamTreeBuilder
+
                 builder_type = DFlash2BeamTreeBuilder
         else:
             scorer = IndependentScorer()

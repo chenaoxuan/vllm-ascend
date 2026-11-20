@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Dense Ascend attention using flash-attention-npu's device-side FA3 tiling.
+"""DFlash2 draft attention using flash-attention-npu's device-side FA3 tiling.
 
-Ported from vllm-project/vllm-ascend PR #20167 (flash_attention_v3.py) and
-rebased onto PR #21444's Qwen DFlash2 target/draft support, adapted for this
-fork:
+Ported from vllm-project/vllm-ascend PR #20167 (flash_attention_v3.py),
+with metadata updates from PR #21444, adapted for this fork:
   - CUDAGraphMode import path (vllm.config.compilation on this base).
   - Backend name stays "CUSTOM" like the dense and fa_v1 backends: the
     registry resolves names against AttentionBackendEnum, and this fork
@@ -23,9 +22,7 @@ The tiling itself follows the PRs: computed by an AICPU
 ``get_scheduler_metadata`` task on device lengths before the forward, cached
 in graph-stable buffers keyed by (input addresses, token bound, causality),
 and refreshed in place so replayed graphs keep their recorded addresses.
-PR #21444's speculative flags route draft and target groups through the same
-retention logic, so one backend class serves the DFlash2 draft and the
-Qwen3.5 target's full attention.
+Target Tree verification uses attention_v1 for its custom ancestor mask.
 """
 
 from dataclasses import dataclass, field
@@ -138,13 +135,10 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         self.capture_sizes = set(vllm_config.compilation_config.cudagraph_capture_sizes or [])
         speculative = vllm_config.speculative_config
         self.is_speculative = speculative is not None
-        self.is_speculative_target = self.is_speculative and not all(
-            vllm_config.compilation_config.static_forward_context[name].is_draft_layer for name in layer_names
-        )
         self.use_graph_buffers = (
             self.is_speculative
             and vllm_config.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
-            and (self.is_speculative_target or not speculative.enforce_eager)
+            and not speculative.enforce_eager
         )
         self.capture_query_len = None
         if vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
@@ -192,7 +186,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         # Its CPU offsets identify the active prefix without a device sync.
         # Keep one empty request for dummy forwards: the operator requires B > 0.
         offsets_cpu = common.query_start_loc_cpu[: num_reqs + 1]
-        # Draft token counts can include padding; target offsets can include
+        # Draft token counts can include padding; offsets can include
         # dummy requests. Limit the active prefix by both host-side counts.
         query_extent = min(common.num_actual_tokens, int(offsets_cpu[-1]))
         active_reqs = max(1, int(torch.searchsorted(offsets_cpu, query_extent)))
@@ -217,9 +211,6 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
             # Draft query lengths can produce buckets outside capture_sizes.
             is_graph_capture_size = self.use_graph_buffers
             max_query_len = common.max_query_len
-            if self.is_speculative_target and is_graph_capture_size:
-                bound = self.capture_query_len
-                max_query_len = num_input_tokens if bound is None else max(max_query_len, bound)
         if is_graph_capture_size:
             # Distinct input buffers (including draft steps) and token buckets
             # must retain independent tiling storage even for identical specs.

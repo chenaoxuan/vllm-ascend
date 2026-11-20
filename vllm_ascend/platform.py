@@ -326,6 +326,18 @@ class NPUPlatform(Platform):
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
+        # DFlash2 target backbone (PR #21444): device-length FA3 tiling for
+        # the Qwen3.5 target's full attention, keeping GDN for linear layers.
+        # flash_attn_npu 0.5.1 removed the host length reads that broke graph
+        # capture at KV capacity >= 1024, so the default window applies.
+        if (
+            not attn_selector_config.use_pcp
+            and backend_key == (False, False, False)
+            and _validate_target_fa3_backend(attn_selector_config)
+        ):
+            # vLLM resolves this import path to the backend class.
+            return "vllm_ascend.attention.flash_attention_v3.AscendFlashAttentionBackend"
+
         # DFlash2 draft attention: device-side FA3 tiling replaces the dense
         # backend's host-side FIA tiling (Python length lists) on the propose
         # path, removing the per-step host block from the draft loop.
@@ -1795,6 +1807,55 @@ def _validate_draft_fa3_backend(selector) -> bool:
         and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
         and not (
             selector.use_dcp
+            or selector.use_mm_prefix
+            or selector.use_rswa
+            or selector.use_batch_invariant
+            or selector.use_per_head_quant_scales
+        )
+    )
+
+
+def _validate_target_fa3_backend(selector) -> bool:
+    """Select the device-tiling FA3 backend for the DFlash2 target backbone.
+
+    Mirrors upstream PR #21444: the dense ``Qwen3_5ForConditionalGeneration``
+    target's full attention consumes exact device lengths after rejection,
+    replacing attention_v1's host-side FIA tiling on the verify path. Linear
+    attention keeps GDN. Encoder (vision) layers stay on their own backend:
+    only DECODER attention selects FA3 here.
+    """
+    from vllm.compilation import backends
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.v1.attention.backend import AttentionType
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    if backends.model_tag != "backbone":
+        return False
+    spec = config.speculative_config
+    if spec is None or spec.draft_model_config is None:
+        return False
+    if (
+        spec.method != "dflash"
+        or getattr(spec.target_model_config, "architecture", None) != "Qwen3_5ForConditionalGeneration"
+        or not getattr(config, "use_v2_model_runner", False)
+        or "DFlash2DraftModel" not in (spec.draft_model_config.architectures or [])
+    ):
+        return False
+    return (
+        # FA3 requires FP16/BF16 Q and unquantized KV with matching dtypes.
+        selector.attn_type == AttentionType.DECODER
+        and selector.dtype in (torch.float16, torch.bfloat16)
+        and 0 < selector.head_size <= 256
+        and not (
+            (selector.kv_cache_dtype == "float16" and selector.dtype != torch.float16)
+            or (selector.kv_cache_dtype == "bfloat16" and selector.dtype != torch.bfloat16)
+        )
+        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
+        and not (
+            selector.has_sink
+            or selector.use_sparse
             or selector.use_mm_prefix
             or selector.use_rswa
             or selector.use_batch_invariant

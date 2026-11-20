@@ -22,7 +22,7 @@ import logging
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import deepcopy
 from typing import Any
-
+import sys
 import numpy as np
 import torch
 from vllm.compilation import breakable_cudagraph
@@ -55,7 +55,7 @@ from vllm.v1.worker.gpu.model_runner import (
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
-from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import (
     MoECommType,
     get_mc2_tokens_capacity,
@@ -70,6 +70,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
 )
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend
+from vllm_ascend.attention.flash_attention_v3 import AscendFlashAttentionBackend as AscendFA3Backend
 from vllm_ascend.attention.flashmla import prepare_flashmla_batch_req_state
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
@@ -102,6 +103,7 @@ from vllm_ascend.observability.runtime_guard.hooks import (
     runtime_guard_step,
 )
 from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProcessor
+from vllm_ascend.ops.gdn_attn_builder import AscendGDNFusedAttentionBackend
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.utils import (
     create_hccl_pg_options,
@@ -1561,6 +1563,44 @@ class NPUModelRunner(GPUModelRunner):
             and "DFlash2DraftModel" in (spec.draft_model_config.architectures or [])
         ):
             return True
+
+        if (
+            spec is not None
+            and self.speculator is not None
+            and spec.method == "dflash"
+            and getattr(self.model_config, "architecture", None) == "Qwen3_5ForConditionalGeneration"
+            and spec.draft_model_config is not None
+            and "DFlash2DraftModel" in (spec.draft_model_config.architectures or ())
+        ):
+            # If the selector used FA3, its optional backend is already loaded.
+            fa3_backend = getattr(
+                sys.modules.get("vllm_ascend.attention.flash_attention_v3"), "AscendFlashAttentionBackend", None
+            )
+            if fa3_backend is None:
+                return False
+            draft_backends = getattr(self.speculator, "attn_backends", {})
+            # A runner group can contain both target and draft layers.
+            target_backends = {
+                group.backend
+                for groups in getattr(self, "attn_groups", [])
+                for group in groups
+                if any(name not in draft_backends for name in group.layer_names)
+            }
+            parallel = self.parallel_config
+            return (
+                spec.parallel_drafting
+                and isinstance(getattr(self, "model_state", None), MambaHybridModelState)
+                and bool(draft_backends)
+                and all(backend is fa3_backend for backend in draft_backends.values())
+                and target_backends == {fa3_backend, AscendGDNFusedAttentionBackend}
+                and parallel.pipeline_parallel_size == 1
+                and parallel.prefill_context_parallel_size == 1
+                and parallel.decode_context_parallel_size == 1
+                and self.ascend_config.kvpp_config.size == 1
+                and self.vllm_config.kv_transfer_config is None
+                and not self.ascend_config.sparse_kv_offload_config.enabled
+                and not spec.enable_adaptive_verification
+            )
 
         if (
             spec is None

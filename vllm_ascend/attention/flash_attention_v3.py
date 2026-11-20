@@ -3,8 +3,9 @@
 
 """Dense Ascend attention using flash-attention-npu's device-side FA3 tiling.
 
-Ported from vllm-project/vllm-ascend PR #20167 (flash_attention_v3.py),
-adapted for this fork:
+Ported from vllm-project/vllm-ascend PR #20167 (flash_attention_v3.py) and
+rebased onto PR #21444's Qwen DFlash2 target/draft support, adapted for this
+fork:
   - CUDAGraphMode import path (vllm.config.compilation on this base).
   - Backend name stays "CUSTOM" like the dense and fa_v1 backends: the
     registry resolves names against AttentionBackendEnum, and this fork
@@ -12,17 +13,25 @@ adapted for this fork:
   - Sliding windows match upstream: causal layers look left, while
     non-causal draft layers use the same radius on both sides.
   - Layer scale assertions use getattr fallbacks (older AttentionLayer).
-The tiling itself is unchanged from the PR: computed by an AICPU
+  - The optional flash_attn_npu extension imports lazily inside
+    build()/forward(), so only workers that select this backend need the
+    package installed (PR #21444).
+  - Draft groups keep the fork's per-replay in-place tiling refresh
+    (update_draft_decode_metadata), letting the tree speculator skip its
+    eager draft metadata rebuild in FULL graph mode.
+The tiling itself follows the PRs: computed by an AICPU
 ``get_scheduler_metadata`` task on device lengths before the forward, cached
 in graph-stable buffers keyed by (input addresses, token bound, causality),
 and refreshed in place so replayed graphs keep their recorded addresses.
+PR #21444's speculative flags route draft and target groups through the same
+retention logic, so one backend class serves the DFlash2 draft and the
+Qwen3.5 target's full attention.
 """
 
 from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
-from flash_attn_npu_3 import flash_attn_with_kvcache, get_scheduler_metadata  # type: ignore[import-not-found]
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import logger
@@ -40,6 +49,16 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, notify_kv_cache_written
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
+
+
+def _get_window_size(sliding_window: int | None, causal: bool) -> tuple[int, int]:
+    """Convert the configured token count to FA's inclusive left/right distances."""
+    if sliding_window is None:
+        return (-1, -1)
+    radius = sliding_window - 1
+    # Causal layers look left; non-causal draft layers use the same radius on
+    # both sides, matching the dense backend's FIA contract.
+    return (radius, 0 if causal else radius)
 
 
 class AscendFlashAttentionBackend(AttentionBackend):
@@ -117,9 +136,18 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         self.device = device
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.capture_sizes = set(vllm_config.compilation_config.cudagraph_capture_sizes or [])
+        speculative = vllm_config.speculative_config
+        self.is_speculative = speculative is not None
+        self.is_speculative_target = self.is_speculative and not all(
+            vllm_config.compilation_config.static_forward_context[name].is_draft_layer for name in layer_names
+        )
+        self.use_graph_buffers = (
+            self.is_speculative
+            and vllm_config.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and (self.is_speculative_target or not speculative.enforce_eager)
+        )
         self.capture_query_len = None
         if vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
-            speculative = vllm_config.speculative_config
             self.capture_query_len = 1 + (speculative.num_speculative_tokens if speculative else 0)
         self.block_size = kv_cache_spec.block_size
         # Deduplicate layer parameters so identical layers share one tiling call.
@@ -163,12 +191,13 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         # The runner can append zero-length or dummy requests for graph padding.
         # Its CPU offsets identify the active prefix without a device sync.
         # Keep one empty request for dummy forwards: the operator requires B > 0.
-        active_reqs = max(
-            1,
-            int(torch.searchsorted(common.query_start_loc_cpu[: num_reqs + 1], common.num_actual_tokens)),
-        )
-        # Device tiling limits reads to active_reqs, so padding rows need
-        # neither copying nor sanitizing.
+        offsets_cpu = common.query_start_loc_cpu[: num_reqs + 1]
+        # Draft token counts can include padding; target offsets can include
+        # dummy requests. Limit the active prefix by both host-side counts.
+        query_extent = min(common.num_actual_tokens, int(offsets_cpu[-1]))
+        active_reqs = max(1, int(torch.searchsorted(offsets_cpu, query_extent)))
+        # The runner owns graph-stable buffers. Device tiling limits reads to
+        # active_reqs, so padding rows need neither copying nor sanitizing.
         query_start_loc = common.query_start_loc[: active_reqs + 1]
         seq_lens = common.seq_lens[:active_reqs]
         block_tables = common.block_table_tensor[:active_reqs]
@@ -176,44 +205,51 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         is_graph_capture_size = num_input_tokens in self.capture_sizes and (
             self.capture_query_len is None or common.max_query_len <= self.capture_query_len
         )
-        # FA3 sizes split workspace from the per-request query bound. Prefill
-        # can share a token bucket but must retain its own query length.
+        # FA3 sizes split workspace from the per-request query bound. Using the
+        # entire batch token count for decode overallocates by the batch size.
+        # Prefill can share a token bucket but must retain its own query length.
         max_query_len = (
             min(num_input_tokens, self.capture_query_len or num_input_tokens)
             if is_graph_capture_size
             else common.max_query_len
         )
-        # Always retain tiling in the graph-keyed cache. A captured draft
-        # ACLGraph records the tiling buffer's address, and this fork's
-        # speculator rebuilds draft attention metadata eagerly every step
-        # (no in-place update support) while capturing the draft graph at
-        # token counts outside the runner's capture_sizes -- so an
-        # unretained tiling tensor would be freed and its memory reused
-        # between capture and replay, and the graph would read stale bytes
-        # (device error 507057). graph_key bounds the cache (input buffer
-        # addresses, token count, causality); each entry is a 2376-byte
-        # tiling plus a small per-request reserve.
-        source_key = (query_start_loc.data_ptr(), seq_lens.data_ptr(), block_tables.data_ptr())
-        graph_key = (source_key, num_input_tokens, max_query_len, common.causal)
-        # Select the inner spec -> tensor dictionary. Writing
-        # scheduler_metadata[spec] also updates scheduler_buffers[graph_key].
-        scheduler_metadata = self.scheduler_buffers.setdefault(graph_key, {})
+        if self.is_speculative:
+            # Draft query lengths can produce buckets outside capture_sizes.
+            is_graph_capture_size = self.use_graph_buffers
+            max_query_len = common.max_query_len
+            if self.is_speculative_target and is_graph_capture_size:
+                bound = self.capture_query_len
+                max_query_len = num_input_tokens if bound is None else max(max_query_len, bound)
+        if is_graph_capture_size:
+            # Distinct input buffers (including draft steps) and token buckets
+            # must retain independent tiling storage even for identical specs.
+            source_key = (query_start_loc.data_ptr(), seq_lens.data_ptr(), block_tables.data_ptr())
+            graph_key = (source_key, num_input_tokens, max_query_len, common.causal)
+            # Select the inner spec -> tensor dictionary. The assignment below
+            # to scheduler_metadata[spec] also updates scheduler_buffers[graph_key].
+            scheduler_metadata = self.scheduler_buffers.setdefault(graph_key, {})
+        else:
+            scheduler_metadata = {}
         for spec in self.scheduler_specs:
-            # Match the layer configuration used by forward. Causality is a
-            # runtime property and is also part of the graph storage key.
-            tiling = self._compute_tiling(spec, query_start_loc, seq_lens, block_tables, max_query_len, common.causal)
+            # Inactive slots must not participate in FlashDecode's min-Q/task
+            # count, even when runner buffers include padding.
+            tiling = self._compute_tiling(
+                spec, active_reqs, query_start_loc, seq_lens, block_tables, max_query_len, common.causal
+            )
             if spec in scheduler_metadata:
                 buffer = scheduler_metadata[spec]
                 if tiling.numel() * tiling.element_size() > buffer.untyped_storage().nbytes():
                     raise RuntimeError("FA3 scheduler metadata exceeds its graph-stable buffer capacity")
                 buffer.resize_(tiling.shape).copy_(tiling)
-            else:
+            elif is_graph_capture_size:
                 # Scheduler metadata may append per-request tail entries.
                 # Reserve that tail once so changing active batch size keeps
                 # the address.
                 reserve = self.max_num_reqs * common.seq_lens.element_size()
                 buffer = tiling.new_empty(tiling.numel() + reserve)
                 scheduler_metadata[spec] = buffer[: tiling.numel()].copy_(tiling)
+            else:
+                scheduler_metadata[spec] = tiling
         metadata = AscendFlashAttentionMetadata(
             num_actual_tokens=common.num_actual_tokens,
             query_start_loc=query_start_loc,
@@ -224,12 +260,14 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
             causal=common.causal,
             scheduler_metadata=scheduler_metadata,
         )
-        self._graph_metadata[graph_key] = metadata
+        if is_graph_capture_size:
+            self._graph_metadata[graph_key] = metadata
         return metadata
 
     def _compute_tiling(
         self,
         spec: tuple,
+        batch_size: int,
         query_start_loc: torch.Tensor,
         seq_lens: torch.Tensor,
         block_tables: torch.Tensor,
@@ -237,9 +275,12 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
         causal: bool,
     ) -> torch.Tensor:
         """AICPU tiling for one layer spec; consumes device lengths async."""
+        # Load the optional extension only in workers selecting this backend.
+        from flash_attn_npu_3 import get_scheduler_metadata
+
         num_heads, num_kv_heads, head_size, dtype, scale, softcap, sliding_window = spec
         return get_scheduler_metadata(
-            batch_size=seq_lens.shape[0],
+            batch_size=batch_size,
             max_seqlen_q=max_query_len,
             max_seqlen_k=block_tables.shape[1] * self.block_size,
             num_heads_q=num_heads,
@@ -250,7 +291,7 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
             cu_seqlens_q=query_start_loc,
             page_size=self.block_size,
             causal=causal,
-            window_size=self._window_size(sliding_window, causal),
+            window_size=_get_window_size(sliding_window, causal),
             has_softcap=softcap != 0.0,
             num_splits=0,
         )
@@ -272,19 +313,17 @@ class AscendFlashAttentionMetadataBuilder(AttentionMetadataBuilder[AscendFlashAt
                 continue
             for spec, buffer in scheduler_metadata.items():
                 tiling = self._compute_tiling(
-                    spec, m.query_start_loc, m.seq_lens, m.block_tables, m.max_query_len, m.causal
+                    spec,
+                    m.seq_lens.shape[0],
+                    m.query_start_loc,
+                    m.seq_lens,
+                    m.block_tables,
+                    m.max_query_len,
+                    m.causal,
                 )
                 if tiling.numel() * tiling.element_size() > buffer.untyped_storage().nbytes():
                     raise RuntimeError("FA3 scheduler metadata exceeds its graph-stable buffer capacity")
                 buffer.resize_(tiling.shape).copy_(tiling)
-
-    @staticmethod
-    def _window_size(sliding_window: int | None, causal: bool) -> tuple[int, int]:
-        """Use symmetric windows for non-causal drafts, matching FIA."""
-        if sliding_window is None:
-            return (-1, -1)
-        radius = sliding_window - 1
-        return (radius, 0 if causal else radius)
 
     def build_for_graph_capture(
         self,
@@ -314,7 +353,7 @@ class AscendFlashAttentionImpl(AttentionImpl[AscendFlashAttentionMetadata]):
         sinks: torch.Tensor = None,
         **kwargs,
     ):
-        logger.info("Using Ascend FA3 attention backend for draft attention.")
+        logger.info_once("Using Ascend FA3 attention backend.", scope="process")
         self.num_heads = num_heads
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.head_size = head_size
@@ -389,6 +428,9 @@ class AscendFlashAttentionImpl(AttentionImpl[AscendFlashAttentionMetadata]):
         # Both runners can profile the model before attention metadata exists.
         if attn_metadata is None:
             return output.fill_(0)
+
+        from flash_attn_npu_3 import flash_attn_with_kvcache
+
         if key is not None and value is not None:
             num_tokens = attn_metadata.num_actual_tokens
             self.do_kv_cache_update(
@@ -418,7 +460,7 @@ class AscendFlashAttentionImpl(AttentionImpl[AscendFlashAttentionMetadata]):
                 max_seqlen_q=attn_metadata.max_query_len,
                 softmax_scale=self.scale,
                 causal=attn_metadata.causal,
-                window_size=AscendFlashAttentionMetadataBuilder._window_size(self.sliding_window, attn_metadata.causal),
+                window_size=_get_window_size(self.sliding_window, attn_metadata.causal),
                 softcap=self.logits_soft_cap,
                 scheduler_metadata=attn_metadata.scheduler_metadata[scheduler_key],
                 num_splits=0,

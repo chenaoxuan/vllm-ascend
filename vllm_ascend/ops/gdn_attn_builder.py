@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.hardware_profile import get_current_hardware_profile
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
@@ -295,6 +296,9 @@ class GDNSpecDecodeMetadata:
     conv_prefix_src: torch.Tensor | None = None
     # Draft-tree only: chunked verify for trees wider than one kernel call.
     verify_plan: "TreeVerifyPlan | None" = None
+    # DFlash2 beam trees keep siblings adjacent. Reuse is independent of batch
+    # size; FULL graphs capture the same choice for single and multiple requests.
+    reuse_parent_state: bool = False
 
 
 def _build_actual_seq_lengths(
@@ -523,6 +527,7 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # Draft-tree state layout, filled in by _resize_spec_buffers_for_tree;
         # ``None`` means the linear MTP chain (default).
         self.spec_tree_slots: int | None = None
+        self._tree_reuse_parent_state = False
         self.spec_init_state_indices: torch.Tensor | None = None
         self.spec_conv_width: int | None = None
         self.spec_conv_window_rows: torch.Tensor | None = None
@@ -595,6 +600,13 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         slots = tree_state_slot_count(self.vllm_config)
         if slots is None:
             return
+        tree_config = get_ascend_config().tree_spec_config
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        draft_config = getattr(spec_config, "draft_model_config", None)
+        draft_architectures = getattr(draft_config, "architectures", ()) or ()
+        self._tree_reuse_parent_state = (
+            "DFlash2DraftModel" in draft_architectures and not tree_config.use_mega_tree and (tree_config.topk or 0) > 1
+        )
         mamba_type = getattr(self.kv_cache_spec, "mamba_type", None)
         if mamba_type is not None:
             validate_tree_state_slots(slots, mamba_type)
@@ -1069,6 +1081,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             conv_window_rows=conv_window_rows,
             conv_prefix_src=conv_prefix_src,
             verify_plan=verify_plan,
+            reuse_parent_state=bool(
+                init_state_indices is not None and getattr(self, "_tree_reuse_parent_state", False)
+            ),
         )
         return attn_metadata
 

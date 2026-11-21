@@ -483,9 +483,10 @@ class TreeVerifyChunk:
             (``scratch_base``), so their undefined output cannot reach a token.
         cu_seqlens: ``[rows + 1]`` int32 token count of every row, in the kernel's
             ``actual_seq_lengths`` convention: entry 0 is an unused base and entry
-            ``row + 1`` is how many tokens row ``row`` verifies (the kernel
-            accumulates them into token offsets itself).
-        width: node columns this chunk covers (the kernel's call width).
+            ``row + 1`` is how many tokens row ``row`` verifies. Row starts
+            use ``width``, independently of the live token counts.
+        width: node columns this chunk covers; passed to the kernel as
+            ``metadata_row_stride`` for the fixed-width index tables.
     """
 
     token_indices: torch.Tensor

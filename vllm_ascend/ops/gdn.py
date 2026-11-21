@@ -32,7 +32,7 @@ from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator, is_conv_state_dim_first
 from vllm.model_executor.utils import replace_parameter
 from vllm.third_party.flash_linear_attention.ops.fused_recurrent import fused_recurrent_gated_delta_rule
-from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.l2norm import USE_DEFAULT_FLA_NORM, l2norm_fwd
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
@@ -54,6 +54,7 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_varlen, extract_last_width
+from vllm_ascend.ops.triton.mamba.gdn_tree_qkv import prepare_tree_qkv
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
 from vllm_ascend.ops.triton.spec_decode.tree.conv_state import scatter_tree_conv_pages_
 from vllm_ascend.ops.triton.spec_decode.tree.tree_conv import (
@@ -361,6 +362,7 @@ def _chunked_tree_verify(
     scale: float,
     plan,
     num_actual_tokens: int,
+    reuse_parent_state: bool = False,
 ) -> torch.Tensor:
     """Verify a draft tree through one whole-tree indexed Triton call.
 
@@ -415,6 +417,8 @@ def _chunked_tree_verify(
             state=ssm_state,
             scale=scale,
             actual_seq_lengths=chunk.cu_seqlens,
+            metadata_row_stride=chunk.width,
+            REUSE_PARENT=reuse_parent_state,
             ssm_state_indices=chunk.state_indices,
             num_accepted_tokens=num_accepted_tokens,
             init_state_indices=chunk.init_state_indices,
@@ -433,6 +437,8 @@ def _chunked_tree_verify(
         state=ssm_state,
         scale=scale,
         actual_seq_lengths=chunk.cu_seqlens,
+        metadata_row_stride=chunk.width,
+        REUSE_PARENT=reuse_parent_state,
         ssm_state_indices=chunk.state_indices,
         num_accepted_tokens=num_accepted_tokens,
         init_state_indices=chunk.init_state_indices,
@@ -910,14 +916,30 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
+        tree_qkv_prepared = False
         if mixed_qkv_spec is not None:
-            query_spec, key_spec, value_spec = _rearrange_decode_qkv(
-                mixed_qkv_spec,
-                self.key_dim // self.tp_size,
-                self.value_dim // self.tp_size,
-                self.head_k_dim,
-                self.head_v_dim,
+            tree_qkv_prepared = (
+                attn_metadata.spec_decode_metadata.init_state_indices is not None
+                and mixed_qkv_spec.dtype == torch.bfloat16
+                and mixed_qkv_spec.device.type == "npu"
+                and not USE_DEFAULT_FLA_NORM
             )
+            if tree_qkv_prepared:
+                query_spec, key_spec, value_spec = prepare_tree_qkv(
+                    mixed_qkv_spec,
+                    self.key_dim // self.tp_size // self.head_k_dim,
+                    self.value_dim // self.tp_size // self.head_v_dim,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
+            else:
+                query_spec, key_spec, value_spec = _rearrange_decode_qkv(
+                    mixed_qkv_spec,
+                    self.key_dim // self.tp_size,
+                    self.value_dim // self.tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
         else:
             query_spec, key_spec, value_spec = None, None, None
         if attn_metadata.num_prefills > 0 and mixed_qkv_non_spec is not None and conv_head_num:
@@ -963,8 +985,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
-            query_spec = l2norm_fwd(query_spec)
-            key_spec = l2norm_fwd(key_spec)
+            if not tree_qkv_prepared:
+                query_spec = l2norm_fwd(query_spec)
+                key_spec = l2norm_fwd(key_spec)
             use_upstream_recurrent = attn_metadata.spec_decode_metadata.use_upstream_recurrent or (
                 spec_state_indices_tensor.ndim == 2 and spec_state_indices_tensor.shape[1] > _MAX_RECURRENT_GDN_TOKENS
             )
@@ -984,6 +1007,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     scale=key_spec.shape[-1] ** -0.5,
                     plan=verify_plan,
                     num_actual_tokens=num_actual_tokens,
+                    reuse_parent_state=attn_metadata.spec_decode_metadata.reuse_parent_state,
                 ).unsqueeze(0)
             elif init_state_indices is not None:
                 recurrent_kwargs = dict(
@@ -999,6 +1023,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
                 )
                 recurrent_kwargs["init_state_indices"] = init_state_indices.reshape(-1)
+                recurrent_kwargs["REUSE_PARENT"] = attn_metadata.spec_decode_metadata.reuse_parent_state
                 core_attn_out_spec = _gdn_tree_op(
                     query=query_spec.squeeze(0),
                     key=key_spec.squeeze(0),
